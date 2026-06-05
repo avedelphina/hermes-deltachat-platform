@@ -10,9 +10,3 @@ def register(ctx):
     """Register Delta Chat platform adapter and bundled skills."""
     register_platform(ctx)
     register_rpc_tools(ctx)
-
-    # Register bundled webxdc-converter skill
-    skills_dir = Path(__file__).parent / "skills"
-    webxdc_skill = skills_dir / "webxdc-converter" / "SKILL.md"
-    if webxdc_skill.exists():
-        ctx.register_skill("webxdc-converter", webxdc_skill)

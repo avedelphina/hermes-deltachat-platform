@@ -111,7 +111,7 @@ personal gateway start
 ### Phase 2: Webxdc Support
 - Send .xdc files via `send_file()` RPC call
 - Bundled `webxdc-converter` skill
-- Access via `skill_view("deltachat-platform:webxdc-converter")`
+- Access via `skill_view("plugin:deltachat-platform:webxdc-converter")`
 
 ### Raw RPC Access (Experimental, opt-in)
 

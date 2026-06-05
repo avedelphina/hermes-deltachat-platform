@@ -102,38 +102,96 @@ Optionally add `source_code_url = "https://..."` if the user provides one.
 
 ### Generate icon
 
-If the user supplies an icon, use it. Otherwise, create a good-looking one:
+If the user supplies an icon, use it. Otherwise create a small SVG inline — icons are optional but improve the app's appearance in chat:
 
 ```bash
-python3 /path/to/skill/scripts/generate_icon.py "App Name" /path/to/output/icon.png
+cat > /workspace/myapp/icon.svg << 'EOF'
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128">
+  <rect width="128" height="128" rx="20" fill="#4ECDC4"/>
+  <text x="64" y="84" font-size="64" font-family="sans-serif" text-anchor="middle" fill="white">AB</text>
+</svg>
+EOF
 ```
 
-The script generates a clean icon with the app's initials on a colored background. If Pillow is available it produces PNG directly; otherwise it creates an SVG that should be converted to PNG. Put effort into the icon — it's what users see in the chat before they open the app.
+Replace `AB` with the app's initials and choose a fitting background color.
 
 ### Create the .xdc file
 
+A `.xdc` file is a ZIP archive. Use Python's `zipfile` — it is always available, unlike `zip` which may not be installed:
+
 ```bash
-python3 /path/to/skill/scripts/package_xdc.py \
-  --name "app-name" \
-  --html /path/to/index.html \
-  --manifest /path/to/manifest.toml \
-  --icon /path/to/icon.png \
-  --output /mnt/user-data/outputs/app-name.xdc
+# Single-file app
+python3 -c "
+import zipfile
+with zipfile.ZipFile('/workspace/myapp.xdc', 'w', zipfile.ZIP_DEFLATED) as zf:
+    zf.write('/workspace/myapp/index.html', 'index.html')
+    zf.write('/workspace/myapp/manifest.toml', 'manifest.toml')
+    zf.write('/workspace/myapp/icon.svg', 'icon.svg')
+"
+
+# Multi-file app — walk the entire app directory
+python3 -c "
+import zipfile, os
+base = '/workspace/myapp'
+with zipfile.ZipFile('/workspace/myapp.xdc', 'w', zipfile.ZIP_DEFLATED) as zf:
+    for root, dirs, files in os.walk(base):
+        for f in files:
+            path = os.path.join(root, f)
+            zf.write(path, os.path.relpath(path, base))
+"
+
+# React/bundled app — build first, then zip the dist output
+npm run build   # produces dist/index.html, dist/assets/, etc.
+python3 -c "
+import zipfile, os
+base = '/workspace/myapp/dist'
+with zipfile.ZipFile('/workspace/myapp.xdc', 'w', zipfile.ZIP_DEFLATED) as zf:
+    for root, dirs, files in os.walk(base):
+        for f in files:
+            path = os.path.join(root, f)
+            zf.write(path, os.path.relpath(path, base))
+"
 ```
 
-For multi-file apps, use `--extra` to include additional files/directories, or package manually:
+`index.html` MUST be at the root of the archive (arcname `'index.html'`, not a subdirectory path). All output files must go to `/workspace/` — **not** `/tmp/`. The `/tmp/` directory is container-local tmpfs and the host cannot read it.
+
+### Validate before sending
+
+Always verify the archive before delivering. This catches wrong arcnames, missing `index.html`, and corrupt zips early:
+
 ```bash
-cd /path/to/app-directory
-zip -r /mnt/user-data/outputs/app-name.xdc index.html manifest.toml icon.png styles/ scripts/ assets/
+python3 -c "
+import zipfile, sys
+path = '/workspace/myapp.xdc'
+with zipfile.ZipFile(path) as zf:
+    names = zf.namelist()
+    print('Files in archive:', names)
+    if 'index.html' not in names:
+        print('ERROR: index.html missing from archive root!')
+        sys.exit(1)
+    print('OK — index.html present, size:', zf.getinfo('index.html').file_size, 'bytes')
+"
 ```
+
+If `index.html` is missing or listed as e.g. `myapp/index.html`, re-package with the correct arcname before sending.
 
 ### Size guidance
 
 Aim for under 1 MB. Under 10 MB is the practical ceiling — beyond that it becomes impractical as a chat attachment. Actual hard limits vary by messenger.
 
-### Present the file
+### Deliver the file
 
-Use `present_files` to deliver the `.xdc`. Let the user know they can share it in a Delta Chat conversation (or any webxdc-compatible messenger) and recipients tap "Start" to launch it.
+Write the `.xdc` to `/workspace/`, then emit a MEDIA directive in your response — the adapter maps `/workspace/` paths to the host and calls `send_document`, exactly like Telegram does for any other file. DC core auto-detects `.xdc` and delivers it as a webxdc mini app.
+
+```
+Here's your mini app! Tap Start to launch it.
+MEDIA:/workspace/myapp.xdc
+```
+
+The same works for any other output file type:
+```
+Here is your report. MEDIA:/workspace/report.pdf
+```
 
 **For Level 0 apps, you're done here.** The sections below are only for apps that need shared state.
 

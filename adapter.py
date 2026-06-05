@@ -561,24 +561,14 @@ body {{
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send a file (e.g., .xdc) to a Delta Chat chat.
+        """Send a file to a Delta Chat chat via send_msg.
 
-        Args:
-            chat_id: Delta Chat chat ID
-            file_path: Path to file on disk
-            caption: Optional caption for the file
-            reply_to: Optional message ID to reply to
-            metadata: Optional metadata
-
-        Returns:
-            SendResult with success status and message ID
+        DC core auto-detects the viewtype from the extension — .xdc files
+        are delivered as webxdc apps without any special handling here.
         """
         try:
             if not self.rpc or not self.account_id:
-                return SendResult(
-                    success=False,
-                    error="Delta Chat not connected",
-                )
+                return SendResult(success=False, error="Delta Chat not connected")
 
             from deltachat2.types import MsgData
 
@@ -587,19 +577,36 @@ body {{
                 int(chat_id),
                 MsgData(file=file_path, text=caption or "", quoted_message_id=int(reply_to) if reply_to else None),
             )
-
             logger.debug(f"Sent file {file_path} as message {msg_id} to chat {chat_id}")
-            return SendResult(
-                success=True,
-                message_id=str(msg_id),
-            )
+            return SendResult(success=True, message_id=str(msg_id))
 
         except Exception as e:
             logger.error(f"Error sending file {file_path} to chat {chat_id}: {e}")
-            return SendResult(
-                success=False,
-                error=str(e),
-            )
+            return SendResult(success=False, error=str(e))
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a document/file attachment to a Delta Chat chat.
+
+        Delegates to send_file; file_name is ignored because DC derives the
+        display name from the blob path.  DC core auto-detects viewtype from
+        the file extension (.xdc → webxdc, .pdf → document, etc.).
+        """
+        return await self.send_file(
+            chat_id=chat_id,
+            file_path=file_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
 
     async def send_image_file(
         self,
@@ -774,6 +781,147 @@ body {{
                 success=False,
                 error=str(e),
             )
+
+    # ------------------------------------------------------------------
+    # Container-to-host file path mapping
+    # ------------------------------------------------------------------
+    # The Docker LLM sandbox mounts /workspace inside the container to
+    #   ~/.hermes/sandboxes/docker/default/workspace/   on the host.
+    # When the agent writes output files to /workspace/ and emits MEDIA
+    # directives or bare paths, Hermes's path validator runs on the HOST
+    # and can't find container-local paths.  These overrides remap any
+    # /workspace/<rel> path to the host sandbox path, copy the file to
+    # the Hermes documents cache (a validated safe root), and return the
+    # cache path so the base-class validator accepts it.
+    #
+    # The same pattern works for any output file type (.pdf, .html, .zip,
+    # .xdc, etc.) — just write to /workspace/ in the container.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _container_workspace_to_host(container_path: str) -> Optional[str]:
+        """Map a /workspace/<rel> container path to its host-side sandbox path.
+
+        Returns None when the path is not under /workspace/.
+        """
+        from pathlib import Path
+
+        p = str(container_path)
+        if not p.startswith("/workspace/"):
+            return None
+        rel = p[len("/workspace/"):]
+        try:
+            from tools.environments.base import get_sandbox_dir
+            sandbox_workspace = get_sandbox_dir() / "docker" / "default" / "workspace"
+        except ImportError:
+            from gateway.config import get_hermes_home
+            sandbox_workspace = Path(get_hermes_home()) / "sandboxes" / "docker" / "default" / "workspace"
+        return str(sandbox_workspace / rel)
+
+    def _copy_container_file_to_cache(self, container_path: str) -> Optional[str]:
+        """Copy a /workspace/ container file to the Hermes docs cache.
+
+        Returns the cache path on success, None if the file doesn't exist.
+        Same pattern as _copy_to_hermes_cache for DC audio blobs.
+        """
+        import shutil
+        from pathlib import Path
+        from gateway.config import get_hermes_home
+
+        host_path_str = self._container_workspace_to_host(container_path)
+        if host_path_str is None:
+            return None
+
+        host_path = Path(host_path_str)
+        if not host_path.is_file():
+            logger.warning("Container output file not found on host: %s", host_path)
+            return None
+
+        docs_dir = Path(get_hermes_home()) / "cache" / "documents"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        dest = docs_dir / host_path.name
+        shutil.copy2(str(host_path), str(dest))
+        logger.info("Copied container output %s → %s", host_path.name, dest)
+        return str(dest)
+
+    def extract_media(self, content: str):
+        """Extend base extract_media to also handle .xdc MEDIA tags.
+
+        .xdc is not in Hermes's MEDIA_DELIVERY_EXTS so the base staticmethod
+        misses it.  We catch those tags here so they flow through the normal
+        filter_media_delivery_paths → send_document pipeline, exactly like
+        Telegram handles any other document type.
+        """
+        import re
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media_files, remaining = BasePlatformAdapter.extract_media(content)
+
+        xdc_re = re.compile(
+            r'[`"\']?MEDIA:\s*[`"\']?((?:~/|/)[\w./\- ]+\.xdc)[`"\']?',
+            re.IGNORECASE,
+        )
+        for match in xdc_re.finditer(content):
+            path = match.group(1).strip()
+            if not any(p == path for p, _ in media_files):
+                media_files.append((path, False))
+            remaining = remaining.replace(match.group(0), "").strip()
+
+        return media_files, remaining
+
+    def extract_local_files(self, content: str):
+        """Extend base to also pick up bare /workspace/*.xdc paths.
+
+        The base staticmethod checks os.path.isfile() on the host — container
+        paths like /workspace/app.xdc don't exist there, so we add them
+        explicitly.  filter_local_delivery_paths then does the host mapping.
+        """
+        import re
+        from gateway.platforms.base import BasePlatformAdapter
+
+        files, remaining = BasePlatformAdapter.extract_local_files(content)
+
+        xdc_re = re.compile(r'(?<![/:\w.])(/workspace/[\w./\-]+\.xdc)\b', re.IGNORECASE)
+        for match in xdc_re.finditer(content):
+            path = match.group(1)
+            if path not in files:
+                files.append(path)
+                remaining = remaining.replace(match.group(0), "").strip()
+
+        return files, remaining
+
+    def filter_media_delivery_paths(self, media_files):
+        """Remap /workspace/ container paths to host cache before validation."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        remapped = []
+        for media_path, is_voice in media_files or []:
+            p = str(media_path)
+            if p.startswith("/workspace/"):
+                cached = self._copy_container_file_to_cache(p)
+                if cached:
+                    remapped.append((cached, is_voice))
+                    continue
+                logger.warning("Could not resolve container path for delivery: %s", p)
+            remapped.append((media_path, is_voice))
+        return BasePlatformAdapter.filter_media_delivery_paths(remapped)
+
+    def filter_local_delivery_paths(self, file_paths):
+        """Remap /workspace/ container paths to host cache before validation."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        remapped = []
+        for file_path in file_paths or []:
+            p = str(file_path)
+            if p.startswith("/workspace/"):
+                cached = self._copy_container_file_to_cache(p)
+                if cached:
+                    remapped.append(cached)
+                    continue
+                logger.warning("Could not resolve container path for delivery: %s", p)
+            else:
+                remapped.append(file_path)
+        return BasePlatformAdapter.filter_local_delivery_paths(remapped)
 
     async def _event_listener(self) -> None:
         """Listen for Delta Chat events and forward to Hermes."""
@@ -1389,7 +1537,13 @@ def register_platform(ctx):
             "You CAN send voice messages (use send_voice tool), videos, images, files, and delete messages. "
             "When a user sends a voice message, it is automatically transcribed — just respond to the transcribed content normally. "
             "Location messages can be sent to share points of interest on a map. "
-            "You can send webxdc mini apps for interactive responses. "
+            "You CAN build and send webxdc mini apps and other files (PDF, HTML, etc.). "
+            "MANDATORY: before attempting to build any webxdc app, you MUST first call "
+            "skill_view('plugin:deltachat-platform:webxdc-converter') to load the build instructions. "
+            "For file delivery from the Docker sandbox: write output files to /workspace/ (NOT /tmp/), "
+            "then use a MEDIA directive — e.g. 'MEDIA:/workspace/app.xdc'. "
+            "The adapter maps /workspace/ paths to the host and sends via send_document. "
+            "DC core auto-detects .xdc as webxdc — just send it as a regular file. "
             "Each message ends with a [dc:chat=<token>] metadata tag. "
             "IGNORE this tag during normal conversation — it is only needed if you call dc_safe_rpc_call. "
             "Do NOT call dc_safe_rpc_call, dc_chat_rpc_spec, or dc_rpc_spec unless the user explicitly "
@@ -1397,6 +1551,22 @@ def register_platform(ctx):
         ),
         max_message_length=3200,
     )
+
+    # Register bundled skills so skill_view('deltachat-platform:<name>') resolves them.
+    from pathlib import Path as _Path
+    skills_dir = _Path(_plugin_dir) / "skills"
+    logger.info(f"Checking for skills in: {skills_dir}")
+    if skills_dir.is_dir():
+        for skill_dir in skills_dir.iterdir():
+            skill_md = skill_dir / "SKILL.md"
+            if skill_md.is_file():
+                try:
+                    ctx.register_skill(skill_dir.name, skill_md)
+                    logger.info("Registered plugin skill: %s from %s", skill_dir.name, skill_md)
+                except Exception as e:
+                    logger.warning("Could not register skill %s: %s", skill_dir.name, e)
+    else:
+        logger.warning("Skills directory not found: %s", skills_dir)
 
 
 def register_rpc_tools(ctx) -> None:
