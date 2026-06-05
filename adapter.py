@@ -644,11 +644,6 @@ body {{
                 message_type=MessageType.TEXT,
                 source=source,
                 message_id=str(msg_id),
-                metadata={
-                    "chat_id": str(chat_id),
-                    "from_id": user_id,
-                    "timestamp": msg.get("timestamp"),
-                },
             )
             await self.handle_message(message_event)
 
@@ -878,7 +873,8 @@ def register_rpc_tools(ctx) -> None:
                     "type": "array",
                     "description": (
                         "Positional parameters as a JSON array. "
-                        "Account-scoped methods take account_id as the first param."
+                        "account_id is always 1. "
+                        "chat_id is available in the message source metadata Hermes provides in your context."
                     ),
                     "default": [],
                 },

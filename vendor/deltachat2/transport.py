@@ -35,9 +35,8 @@ class _Result(Event):
         self._value = value
         super().set()
 
-    def wait(self, timeout: float = 60.0) -> Any:  # noqa
-        if not super().wait(timeout=timeout):
-            raise TimeoutError("RPC call timed out after %ss" % timeout)
+    def wait(self) -> Any:  # noqa
+        super().wait()
         return self._value
 
 
@@ -124,6 +123,12 @@ class IOTransport:
         except Exception:
             # Log an exception if the reader loop dies.
             self.logger.exception("Exception in the reader loop")
+        finally:
+            # Wake any callers still waiting so they don't block forever.
+            error = {"error": {"code": -1, "message": "RPC server disconnected"}}
+            for pending in list(self.pending_results.values()):
+                pending.set(error)
+            self.pending_results.clear()
 
     def _writer_loop(self) -> None:
         """Writer loop ensuring only a single thread writes requests."""
