@@ -3,6 +3,7 @@
 Integrates Delta Chat as a messaging platform using deltachat2 (direct JSON-RPC).
 """
 
+import functools
 import html
 import os
 import sys
@@ -62,8 +63,8 @@ def _parse_version(version_str: str) -> tuple:
         Tuple of (major, minor, patch) integers
     """
     try:
-        # Remove any suffixes like -dev, -rc1, etc.
-        base_version = version_str.split("-")[0]
+        # Remove any suffixes like -dev, -rc1, etc. and leading 'v'
+        base_version = version_str.lstrip("v").split("-")[0]
         parts = base_version.split(".")
         # Pad with zeros if needed
         while len(parts) < 3:
@@ -85,7 +86,7 @@ async def _check_dc_version(rpc) -> bool:
     try:
         # Get system info which includes version
         system_info = await rpc.get_system_info()
-        dc_version_str = system_info.get("deltachat_version", "0.0.0")
+        dc_version_str = system_info.get("deltachat_core_version", "0.0.0")
         dc_version = _parse_version(dc_version_str)
         min_version = _parse_version(MIN_DC_VERSION)
 
@@ -109,6 +110,31 @@ async def _check_dc_version(rpc) -> bool:
         logger.warning(f"Could not check Delta Chat version: {e}")
         # Don't block connection for version check failures
         return True
+
+
+class _AsyncRpc:
+    """Wraps synchronous deltachat2.Rpc so every call runs in a thread executor.
+
+    deltachat2.Rpc.transport.call() blocks on a threading.Event until the
+    RPC server responds.  Calling it directly from an async function would
+    freeze the asyncio event loop.  This wrapper makes every attribute access
+    return an async function that runs the underlying sync call in the default
+    ThreadPoolExecutor, keeping the event loop free.
+    """
+
+    def __init__(self, rpc) -> None:
+        object.__setattr__(self, "_rpc", rpc)
+
+    def __getattr__(self, name: str):
+        method = getattr(object.__getattribute__(self, "_rpc"), name)
+        async def _async_call(*args):
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, method, *args)
+        return _async_call
+
+
+# Tracks the currently connected adapter instance; used by RPC tools.
+_active_adapter = None
 
 
 class DeltaChatAdapter(BasePlatformAdapter):
@@ -198,7 +224,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
             os.environ["DC_ACCOUNTS_PATH"] = dc_accounts_path
             self._transport = IOTransport(accounts_dir=dc_accounts_path, rpc_server=rpc_server_path)
             self._transport.start()
-            self.rpc = deltachat2.Rpc(self._transport)
+            self.rpc = _AsyncRpc(deltachat2.Rpc(self._transport))
 
             # Wait for RPC server to be ready
             await asyncio.sleep(1)
@@ -222,7 +248,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 return False
 
             # Start IO for the account to receive events
-            self.rpc.start_io(self.account_id)
+            await self.rpc.start_io(self.account_id)
             logger.debug(f"Started IO for account {self.account_id}")
 
             # Start event listener
@@ -230,6 +256,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
             self._event_loop_task = asyncio.create_task(self._event_listener())
 
             self._mark_connected()
+            global _active_adapter
+            _active_adapter = self
 
             # Log the bot's address for reference
             addr = await self.get_my_address()
@@ -246,6 +274,9 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
     def _cleanup(self) -> None:
         """Clean up resources."""
+        global _active_adapter
+        if _active_adapter is self:
+            _active_adapter = None
         self._running = False
         if self._event_loop_task:
             self._event_loop_task.cancel()
@@ -518,8 +549,9 @@ body {{
         while self._running:
             try:
                 if self.account_id:
-                    event = await self.rpc.get_next_event(self.account_id)
-                    await self._handle_dc_event(event)
+                    envelope = await self.rpc.get_next_event()
+                    if envelope.get("context_id") == self.account_id:
+                        await self._handle_dc_event(envelope.get("event", {}))
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -774,4 +806,91 @@ def register_platform(ctx):
             "Location messages can be sent to share points of interest on a map."
         ),
         max_message_length=3200,
+    )
+
+
+def register_rpc_tools(ctx) -> None:
+    """Register raw RPC tools when DELTACHAT_ENABLE_RAW_RPC is set.
+
+    Exposes two tools to the LLM:
+      - dc_rpc_spec: fetches the OpenRPC spec from the running server
+      - dc_rpc_call: calls any Delta Chat RPC method by name and params
+
+    These are opt-in because dc_rpc_call has unrestricted access to the
+    Delta Chat core, including destructive operations.
+    """
+    if not os.getenv("DELTACHAT_ENABLE_RAW_RPC"):
+        return
+
+    async def _spec_handler() -> str:
+        rpc_server = (
+            _active_adapter._get_rpc_server_path()
+            if _active_adapter is not None
+            else os.getenv("DELTACHAT_RPC_SERVER", "deltachat-rpc-server")
+        )
+        proc = await asyncio.create_subprocess_exec(
+            rpc_server, "--openrpc",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            return f"Error: {stderr.decode().strip()}"
+        return stdout.decode()
+
+    async def _call_handler(method: str, params: Optional[list] = None) -> Any:
+        if _active_adapter is None or _active_adapter.rpc is None:
+            return {"error": "Delta Chat is not connected"}
+        try:
+            result = await getattr(_active_adapter.rpc, method)(*(params or []))
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    ctx.register_tool(
+        name="dc_rpc_spec",
+        toolset="deltachat",
+        schema={"type": "object", "properties": {}},
+        handler=_spec_handler,
+        is_async=True,
+        description=(
+            "Fetch the OpenRPC specification of the running Delta Chat RPC server. "
+            "Lists all available methods with parameter types and descriptions. "
+            "Use this to discover what dc_rpc_call can do."
+        ),
+        emoji="📋",
+    )
+
+    ctx.register_tool(
+        name="dc_rpc_call",
+        toolset="deltachat",
+        schema={
+            "type": "object",
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "description": (
+                        "RPC method name in camelCase (e.g. 'getAccountInfo'). "
+                        "Use dc_rpc_spec to see all available methods."
+                    ),
+                },
+                "params": {
+                    "type": "array",
+                    "description": (
+                        "Positional parameters as a JSON array. "
+                        "Account-scoped methods take account_id as the first param."
+                    ),
+                    "default": [],
+                },
+            },
+            "required": ["method"],
+        },
+        handler=_call_handler,
+        is_async=True,
+        description=(
+            "Call any Delta Chat RPC method directly by name. "
+            "Use dc_rpc_spec first to discover available methods and their signatures. "
+            "CAUTION: unrestricted access — can modify or delete account data."
+        ),
+        emoji="⚡",
     )
