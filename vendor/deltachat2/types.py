@@ -69,6 +69,10 @@ class EventType(str, Enum):
     SELFAVATAR_CHANGED = "SelfavatarChanged"
     WEBXDC_STATUS_UPDATE = "WebxdcStatusUpdate"
     WEBXDC_INSTANCE_DELETED = "WebxdcInstanceDeleted"
+    INCOMING_CALL = "IncomingCall"
+    INCOMING_CALL_ACCEPTED = "IncomingCallAccepted"
+    OUTGOING_CALL_ACCEPTED = "OutgoingCallAccepted"
+    CALL_ENDED = "CallEnded"
 
 
 class ChatType(str, Enum):

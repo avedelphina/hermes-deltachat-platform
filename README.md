@@ -1,34 +1,131 @@
-# Delta Chat Platform Plugin for Hermes Agent
+# Delta Chat × Hermes — Your AI Assistant
 
-A Hermes platform plugin that integrates Delta Chat as a messaging channel.
-Uses **deltachat2** for direct JSON-RPC access (not abstracted away).
+A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that adds **Delta Chat** as a gateway channel — so you can reach your AI by text, voice message, or live voice call from a decentralized encrypted messenger that needs no phone number or sign-up.
+
+---
+
+## Why Delta Chat?
+
+Delta Chat is a decentralized private messenger with end-to-end encryption, and a great choice for running a personal AI assistant:
+
+- **Private** — instant onboarding with no phone number, email, or other personal data required
+- **No API key dance** — no BotFather, no token registration, no webhook setup; you own the account
+- **End-to-end encrypted** — audited encryption safe against network and server attacks
+- **Every platform** — Android, iOS, macOS, Windows, Linux (even mobile Linux phones and FreeBSD)
+- **Sovereign** — run it with your own email address or server, or use a public [chatmail relay](https://delta.chat/en/chatmail)
+- **FOSS** — fully open source, built on internet standards
+
+## What can you do with it?
+
+**Talk to your AI like a person:**
+- Send text messages and get AI replies
+- Send voice clips — automatically transcribed; the AI responds in text
+- Share images and files for the AI to analyze or process
+- Have full **voice calls** — call the AI, speak naturally, get a spoken response in real-time (WebRTC, Whisper STT, TTS)
+
+**Let the AI reach out to you:**
+- Hermes has built-in cron scheduling — set this chat as your home channel and scheduled tasks deliver here: daily briefings, reminders, status updates, without any user prompt
+- The AI can **place outgoing voice calls** from those scheduled tasks — it will literally call you
+
+**Build things together:**
+- Ask the AI to build an interactive **webxdc mini-app** (.xdc) and it delivers it straight into the chat — no app store, no install, runs locally inside Delta Chat
+- Send PDFs, HTML pages, or any file and the AI will handle them
+
+**Advanced:**
+- Drop the agent into a **group chat** to assist everyone
+- Run **multiple independent agents** with their own Delta Chat accounts
+- Give the AI sandboxed access to the full **Delta Chat JSON-RPC API** to automate your messaging directly
+
+---
 
 ## Quick Start
 
+**Prerequisite:** [Hermes Agent](https://github.com/NousResearch/hermes-agent) must be installed first.
+
 ```bash
-# Install deltachat-rpc-server binary
+# 1. Install deltachat-rpc-server
 pip install deltachat-rpc-server
 
-# Clone plugin to Hermes
+# 2. Install aiortc (required for voice calls)
+pip install aiortc
+
+# 3. Clone plugin to Hermes
 git clone https://github.com/Simon-Laux/hermes-deltachat-platform ~/.hermes/plugins/deltachat-platform
 
-# Enable plugin
+# 4. Enable plugin
 hermes plugins enable deltachat-platform
 
-# Start gateway
+# 5. Run setup — auto-detects your Hermes profiles, creates a Delta Chat account
+python ~/.hermes/plugins/deltachat-platform/setup.py
+
+# 6. Start gateway
 hermes gateway start
 ```
 
+The setup script prints an **invite link** for your new agent. Scan or tap it in the Delta Chat app on your phone — this is required because Delta Chat enforces end-to-end encryption, and the invite link carries the key fingerprint needed to establish an encrypted session. Adding the address alone won't work.
+
+---
+
+## Features
+
+Deep integration with Delta Chat's native features — voice messages, voice calls, mini-apps, and group chats all work out of the box.
+
+### Messaging
+- Bidirectional text, voice messages (auto-transcribed via Hermes STT), images, files, locations
+- Group chat support — drop the agent into any group
+- Read receipts
+- Bot mode: auto-accepts contact requests, no manual approval needed
+
+### Voice Calls (WebRTC)
+- **Incoming calls**: auto-answer, live speech-to-text → AI → text-to-speech pipeline
+- **Outgoing calls**: the AI can call you from a scheduled task (`dc_start_call` tool)
+- Barge-in support: interrupt the AI mid-sentence and it adapts
+- Per-call isolated AI session with optional model override and system prompt
+- Optional Voxtral cloud STT for fast (~1–2s) transcription
+
+### Proactive Messaging & Cron
+Hermes has built-in cron scheduling. To route scheduled task delivery to a Delta Chat chat, set it as the home channel. From within the chat, type:
+
+```
+/sethome
+```
+
+Or set it manually via env var:
+
+```bash
+echo 'DELTACHAT_HOME_CHANNEL=<chat_id>' >> ~/.hermes/.env
+```
+
+From there you can schedule daily briefings, reminders, or any recurring task — and the AI can also place outgoing voice calls from those tasks.
+
+### Webxdc Mini-Apps
+Ask the AI to build a small interactive app (a game, a form, a calculator, a data viewer) and it delivers a `.xdc` file straight into the chat. The app runs locally inside Delta Chat — no server, no install. Built-in `webxdc-converter` skill handles the packaging.
+
+### Raw Delta Chat API (Advanced)
+Three tools are always available once the plugin is loaded:
+
+| Tool | Description |
+|------|-------------|
+| `dc_rpc_spec` | Full OpenRPC spec from the running server — all methods, params, types |
+| `dc_chat_rpc_spec` | Spec filtered to chat-scoped methods, destructive ops removed |
+| `dc_safe_rpc_call` | Call a chat-scoped method safely — `accountId` and `chatId` are injected from an opaque per-chat token; the AI cannot address a different chat |
+
+Set `DELTACHAT_ENABLE_RAW_RPC=1` to also unlock `dc_rpc_call` (unrestricted access — only for trusted deployments).
+
+---
+
 ## Installation
 
-### 1. Install deltachat-rpc-server
+### 1. Install dependencies
 
-**Option A: pip (recommended for most systems)**
+#### deltachat-rpc-server
+
+**pip (recommended):**
 ```bash
 pip install deltachat-rpc-server
 ```
 
-**Option B: From source**
+**From source:**
 ```bash
 git clone https://github.com/chatmail/core
 cd core
@@ -36,21 +133,31 @@ cargo build -p deltachat-rpc-server --release
 # Binary: target/release/deltachat-rpc-server
 ```
 
-**Option C: NixOS**
+**NixOS:**
 ```bash
 nix profile install nixpkgs#deltachat-rpc-server
 echo 'DELTACHAT_RPC_SERVER=/home/work/.nix-profile/bin/deltachat-rpc-server' >> ~/.hermes/.env
 ```
 
+#### aiortc (required for voice calls)
+
+**pip:**
+```bash
+pip install aiortc
+```
+
+**NixOS** (add to your `python3.withPackages` in flake.nix):
+```nix
+(python3.withPackages (ps: with ps; [ deltachat2 aiortc ]))
+```
+
+aiortc brings in `av` (PyAV/libav for audio resampling), `aioice`, and Opus support — all required for the WebRTC call pipeline.
+
 ### 2. (Optional) Configure RPC server path
 
-If binary is not in PATH:
+If the binary is not in PATH:
 ```bash
-# For default profile
 echo 'DELTACHAT_RPC_SERVER=/path/to/deltachat-rpc-server' >> ~/.hermes/.env
-
-# For named profile
-hermes -p my-profile config set env.DELTACHAT_RPC_SERVER /path/to/deltachat-rpc-server
 ```
 
 ### 3. Enable Plugin
@@ -61,121 +168,60 @@ hermes plugins enable deltachat-platform
 
 ### 4. Create Account
 
-Run the setup script. It will **auto-detect your Hermes profiles** and let you select one:
-
 ```bash
 python ~/.hermes/plugins/deltachat-platform/setup.py
 ```
 
-The script will:
-1. List all available Hermes profiles
-2. Let you select which profile to configure
-3. Create the account and display its **Delta Chat address** (e.g., `mybot@nine.testrun.org`)
-4. Save the account in that profile's `deltachat-platform/` directory
+The script auto-detects your Hermes profiles, lets you pick one, creates the DC account, and prints an **invite link**. Scan or tap it in Delta Chat — do not just add the email address manually, as the invite link is required for encrypted key exchange.
 
 ### 5. Start the gateway
 ```bash
-# Start gateway (automatically connects to first DC account)
 hermes gateway start
 ```
 
-## Usage
-
-### Multiple Agents
-
-Each Hermes profile = one Delta Chat account:
-
-```bash
-# Create profiles
-hermes profile create work
-hermes profile create personal
-
-# Each gets its own DC config at:
-# ~/.hermes/profiles/work/deltachat-platform/
-# ~/.hermes/profiles/personal/deltachat-platform/
-
-# Start gateways
-work gateway start
-personal gateway start
-```
-
-## Features
-
-### Phase 1: Messaging Adapter
-- Bidirectional text messaging via direct JSON-RPC
-- Multi-agent support via Hermes profiles
-- Automatic account selection (first available)
-- Chat metadata (name, type, user info)
-- Version guard: blocks older than 2.51.0, warns on newer
-
-### Phase 2: Webxdc Support
-- Send .xdc files via `send_file()` RPC call
-- Bundled `webxdc-converter` skill
-- Access via `skill_view("plugin:deltachat-platform:webxdc-converter")`
-
-### Raw RPC Access (Experimental, opt-in)
-
-Three tools are always available once the plugin is loaded:
-
-| Tool | Description |
-|------|-------------|
-| `dc_rpc_spec` | Full OpenRPC spec from the running server — all methods, params, types |
-| `dc_chat_rpc_spec` | Spec filtered to chat-scoped methods only, destructive ops removed |
-| `dc_safe_rpc_call` | Call a chat-scoped method safely: `accountId` and `chatId` are injected from an opaque per-chat token the LLM receives in each message (`[dc:chat=<token>]`), so it cannot address a different chat. Destructive methods are blocked. |
-
-The chat token is stored in Delta Chat UI config (`ui.hermes.chat_token.<chat_id>`) so it survives restarts — the same chat always gets the same token.
-
-Set `DELTACHAT_ENABLE_RAW_RPC=1` to also unlock:
-
-| Tool | Description |
-|------|-------------|
-| `dc_rpc_call` | Call **any** RPC method by name and params — unrestricted |
-
-```bash
-echo 'DELTACHAT_ENABLE_RAW_RPC=1' >> ~/.hermes/.env
-```
-
-> **Warning:** `dc_rpc_call` has unrestricted access to the Delta Chat core, including destructive operations (delete accounts, wipe messages, change config). Only enable in trusted deployments.
-
-The combination lets Hermes use the full Delta Chat API without adapter code: it can read the spec to discover new features and invoke them directly.
-
-### Phase 3: Voice Messages (Planned)
-- Audio attachment detection
-- Automatic transcription via Hermes STT
-- Forward transcription as text to AI
-
-### Phase 4: Voice Calls (Planned)
-- Incoming call detection via `IncomingCall` event
-- WebRTC bridge via aiortc
-- Uses `iceServers()` and `acceptIncomingCall()` RPC methods
-- Real-time audio processing
+---
 
 ## Configuration
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `DELTACHAT_RPC_SERVER` | No | `deltachat-rpc-server` | Path to RPC binary |
-| `DELTACHAT_HOME_CHANNEL` | No | - | Default chat for cron delivery |
-| `DELTACHAT_ENABLE_RAW_RPC` | No | - | Enable raw RPC tools (see below) |
+| `DELTACHAT_HOME_CHANNEL` | No | — | Chat ID for cron/proactive delivery (or use `/sethome` in chat) |
+| `DELTACHAT_ENABLE_RAW_RPC` | No | — | Enable unrestricted `dc_rpc_call` tool |
+
+### Multiple Agents
+
+Each Hermes profile gets its own Delta Chat account:
+
+```bash
+hermes profile create work
+hermes profile create personal
+
+hermes -p work gateway start
+hermes -p personal gateway start
+```
+
+---
 
 ## Documentation
 
-- [Version Compatibility](docs/version-compatibility.md) - Version requirements
-- [File Structure](docs/file-structure.md) - Directory layout
-- [Troubleshooting](docs/troubleshooting.md) - Common issues
+- [Voice Calls](docs/voice-calls.md) — setup, tuning, TURN servers, Voxtral STT
+- [Version Compatibility](docs/version-compatibility.md) — version requirements
+- [File Structure](docs/file-structure.md) — directory layout
+- [NixOS Installation](docs/nixos-installation.md) — NixOS-specific setup
+- [Troubleshooting](docs/troubleshooting.md) — common issues
+
+---
 
 ## Development
 
-### Vendored Dependencies
+The `deltachat2` Python package is vendored in `vendor/` to avoid a manual install step. To update it:
+1. Fetch the latest from [adbenitez/deltachat2](https://github.com/adbenitez/deltachat2)
+2. Copy `deltachat2/` contents to `vendor/deltachat2/`
+3. Test thoroughly — API changes can affect compatibility
+4. Update the minimum version check in `adapter.py` if needed
 
-The `deltachat2` Python package is vendored in the `vendor/` directory for simplified
-installation. This avoids requiring users to manually install the package.
-
-**Note:** If you need to update the vendored `deltachat2` package:
-1. Fetch the latest version from [adbenitez/deltachat2](https://github.com/adbenitez/deltachat2)
-2. Copy the `deltachat2/` directory contents to `vendor/deltachat2/`
-3. Test thoroughly as API changes may affect compatibility
-4. Update the minimum version in `adapter.py` if needed
+---
 
 ## License
 
@@ -183,14 +229,18 @@ Mozilla Public License 2.0 (MPL-2.0)
 
 ---
 
+## Vibecoding
+
+This project was built with heavy AI assistance — a mix of Claude, Mistral, and OpenCode models did most of the heavy lifting, with Mistral Medium 3.5 and Claude Opus doing the bulk of the work. The human role was management and quality assurance: directing, testing features, and catching what broke. It should be reasonably stable — but this is an experimental community project provided as-is, with no guarantees.
+
+---
+
 ## References
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent)
-- [Hermes Profiles](https://hermes-agent.nousresearch.com/docs/user-guide/profiles)
 - [Delta Chat](https://delta.chat/)
 - [deltachat2 PyPI](https://pypi.org/project/deltachat2/)
 - [deltachat-rpc-server](https://github.com/chatmail/core/tree/main/deltachat-rpc-server)
 - [Delta Chat JSON-RPC API](https://github.com/chatmail/core/blob/main/deltachat-jsonrpc/src/api.rs)
-- [Delta Chat Core](https://github.com/chatmail/core)
 - [Webxdc](https://webxdc.org/)
 - [aiortc](https://aiortc.readthedocs.io/)

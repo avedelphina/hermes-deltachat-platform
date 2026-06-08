@@ -15,6 +15,8 @@ from typing import Optional, Dict, Any
 
 # Add vendor directory to sys.path so vendored deltachat2 can be imported
 _plugin_dir = os.path.dirname(os.path.abspath(__file__))
+if _plugin_dir not in sys.path:
+    sys.path.insert(0, _plugin_dir)
 _vendor_dir = os.path.join(_plugin_dir, "vendor")
 if os.path.exists(_vendor_dir) and _vendor_dir not in sys.path:
     sys.path.insert(0, _vendor_dir)
@@ -257,6 +259,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._event_loop_task: Optional[asyncio.Task] = None
         self._running = False
         self._dc_config_dir: Optional[str] = None
+        self._call_manager = None
 
 
 
@@ -349,6 +352,13 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 self._cleanup()
                 return False
 
+            # Enable bot mode: auto-accept contact requests
+            try:
+                await self.rpc.set_config(self.account_id, "bot", "1")
+                logger.debug("Bot mode enabled: contact requests will be auto-accepted")
+            except Exception as e:
+                logger.warning(f"Could not set bot config: {e}")
+
             # Start IO for the account to receive events
             await self.rpc.start_io(self.account_id)
             logger.debug(f"Started IO for account {self.account_id}")
@@ -360,6 +370,9 @@ class DeltaChatAdapter(BasePlatformAdapter):
             self._mark_connected()
             global _active_adapter
             _active_adapter = self
+
+            from call_handler import CallManager
+            self._call_manager = CallManager(self)
 
             # Log the bot's address for reference
             addr = await self.get_my_address()
@@ -394,6 +407,9 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Delta Chat."""
+        if self._call_manager:
+            await self._call_manager.teardown()
+            self._call_manager = None
         self._cleanup()
         self._mark_disconnected()
         logger.info("Delta Chat disconnected")
@@ -501,15 +517,28 @@ body {{
     ) -> SendResult:
         """Send a text message to a Delta Chat chat.
 
-        Args:
-            chat_id: Delta Chat chat ID (string representation of integer)
-            content: Message text to send
-            reply_to: Message ID to reply to (optional)
-            metadata: Additional metadata (optional)
-
-        Returns:
-            SendResult with success status and message ID
+        When a voice call is active for this chat the response is routed to
+        TTS and played into the call instead of being sent as a DC message.
         """
+        if self._call_manager and self._call_manager.has_active_call(chat_id):
+            thread_id = (metadata or {}).get("thread_id")
+            if self._call_manager.is_call_thread(thread_id):
+                # Reply belongs to the call conversation — speak it into the call.
+                # In shared-history mode the placing agent's "call connected" ack
+                # also lands here (same session), so drop that one line.
+                if self._call_manager.consume_call_ack(chat_id):
+                    return SendResult(success=True, message_id=None)
+                asyncio.create_task(self._call_manager.play_response(chat_id, content))
+                return SendResult(success=True, message_id=None)
+            # Reply from the text/chat thread while a call is active (e.g. the
+            # agent's "calling you now" line in separate-thread mode, or a
+            # concurrent DM) — deliver it as a normal Delta Chat message instead
+            # of speaking it into the call. Falls through to the normal send path.
+        # Suppress the AI's reply to the internal "call ended" note so we don't
+        # text the user a stray message after a call.
+        if self._call_manager and self._call_manager.consume_drop_response(chat_id):
+            return SendResult(success=True, message_id=None)
+
         try:
             if not self.rpc or not self.account_id:
                 return SendResult(
@@ -953,6 +982,17 @@ body {{
             logger.debug(f"Message delivered: {event.get('msg_id')}")
         elif event_kind == EventType.MSG_FAILED:
             logger.warning(f"Message failed: {event.get('msg_id')}")
+        elif event_kind == EventType.INCOMING_CALL:
+            if self._call_manager:
+                asyncio.create_task(self._call_manager.handle_incoming_call(event))
+        elif event_kind == EventType.CALL_ENDED:
+            if self._call_manager:
+                asyncio.create_task(self._call_manager.handle_call_ended(event))
+        elif event_kind == EventType.OUTGOING_CALL_ACCEPTED:
+            if self._call_manager:
+                asyncio.create_task(self._call_manager.handle_outgoing_call_accepted(event))
+        elif event_kind == EventType.INCOMING_CALL_ACCEPTED:
+            logger.info("Incoming call accepted msg_id=%s", event.get("msg_id"))
         else:
             logger.debug(f"Unhandled event type: {event_kind}")
 
@@ -1242,6 +1282,11 @@ body {{
                 media_types=[file_mime or "application/octet-stream"],
             )
             await self.handle_message(message_event)
+
+        elif view_type == "Call":
+            # DC sends a Call info message (Missed call / Call ended) after calls.
+            # The actual call is handled via IncomingCall/CallEnded events — ignore this.
+            logger.debug("Ignoring Call info message msg_id=%s text=%r", msg_id, msg.get("text"))
 
         else:
             logger.debug(f"Unhandled view_type={view_type}, file={filename}")
@@ -1590,6 +1635,8 @@ def register_rpc_tools(ctx) -> None:
     async def _call_handler(args: dict, **kwargs) -> str:
         method = (args or {}).get("method")
         params = (args or {}).get("params") or []
+        if not method or not isinstance(method, str):
+            return json.dumps({"error": "Missing 'method' (snake_case RPC name)."})
         if _active_adapter is None or _active_adapter.rpc is None:
             return json.dumps({"error": "Delta Chat is not connected"})
         try:
@@ -1617,6 +1664,8 @@ def register_rpc_tools(ctx) -> None:
         method = (args or {}).get("method")
         chat_token = (args or {}).get("chat_token")
         params = (args or {}).get("params") or []
+        if not method or not isinstance(method, str):
+            return json.dumps({"error": "Missing 'method' (snake_case RPC name). Use dc_chat_rpc_spec to find one."})
         adapter = _active_adapter
         if adapter is None or adapter.rpc is None:
             return {"error": "Delta Chat is not connected"}
@@ -1656,6 +1705,49 @@ def register_rpc_tools(ctx) -> None:
             return json.dumps(result, default=str)
         except Exception as e:
             return json.dumps({"error": str(e)})
+
+    async def _end_call_handler(args: dict, **kwargs) -> str:
+        adapter = _active_adapter
+        if adapter is None or adapter._call_manager is None:
+            return json.dumps({"error": "No active call"})
+
+        # The AI is in a call — find the active session.
+        # There is typically only one active call at a time.
+        chat_ids = list(adapter._call_manager._chat_to_msg.keys())
+        if not chat_ids:
+            return json.dumps({"error": "No active call"})
+
+        success = await adapter._call_manager.request_hangup(chat_ids[0])
+        if success:
+            return json.dumps({"success": True, "message": "Call ended"})
+        return json.dumps({"error": "Failed to end call"})
+
+    async def _start_call_handler(args: dict, **kwargs) -> str:
+        args = args or {}
+        chat_token = args.get("chat_token")
+        # `opening` is the exact line spoken on connect; accept `topic` as alias.
+        opening = (args.get("opening") or args.get("topic") or "").strip()
+        adapter = _active_adapter
+        if adapter is None or adapter._call_manager is None:
+            return json.dumps({"error": "Delta Chat not connected"})
+
+        if not opening:
+            return json.dumps({"error": "Provide 'opening' — the exact words to say when they pick up."})
+
+        real_chat_id = await _resolve_chat_token(adapter.rpc, adapter.account_id, chat_token)
+        if real_chat_id is None:
+            return json.dumps({"error": "Unknown chat_token — use the [dc:chat=...] value"})
+
+        try:
+            msg_id = await adapter._call_manager.start_call(str(real_chat_id), opening=opening)
+            return json.dumps({"success": True, "msg_id": msg_id,
+                               "message": "Call connected — the opening line is being "
+                                          "spoken and the conversation is live."})
+        except asyncio.TimeoutError:
+            return json.dumps({"error": "Call was not answered"})
+        except Exception as e:
+            logger.error("start_call failed: %s", e, exc_info=True)
+            return json.dumps({"error": f"Failed to start call: {e}"})
 
     ctx.register_tool(
         name="dc_rpc_spec",
@@ -1771,4 +1863,66 @@ def register_rpc_tools(ctx) -> None:
         handler=_safe_call_handler,
         is_async=True,
         emoji="🔒",
+    )
+
+    ctx.register_tool(
+        name="dc_end_call",
+        toolset="deltachat",
+        schema={
+            "description": (
+                "End the active voice call. "
+                "The goodbye message is spoken first (via normal send), then this "
+                "tool waits until TTS finishes playing before disconnecting. "
+                "Only use this when the user explicitly says goodbye or asks to end the call. "
+                "No parameters needed — there is only one active call at a time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        handler=_end_call_handler,
+        is_async=True,
+        emoji="📞",
+    )
+
+    ctx.register_tool(
+        name="dc_start_call",
+        toolset="deltachat",
+        schema={
+            "description": (
+                "Place an outgoing voice call to a Delta Chat contact and talk to them. "
+                "Use this to proactively call someone — e.g. from a scheduled/cron task "
+                "(a reminder, an alert, a check-in). Creates the WebRTC offer, rings the "
+                "contact, and blocks until they answer (or times out if unanswered). "
+                "Once connected you speak normally; the conversation runs like an incoming "
+                "call. Identify the recipient with the chat_token from one of their messages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_token": {
+                        "type": "string",
+                        "description": (
+                            "The opaque chat token from the [dc:chat=...] line in a message "
+                            "from the person to call. Never use a token from another conversation."
+                        ),
+                    },
+                    "opening": {
+                        "type": "string",
+                        "description": (
+                            "The EXACT words to say the instant they pick up "
+                            "(e.g. \"Hi Simon, quick reminder to take your medication.\"). "
+                            "Synthesized while the phone is still ringing and played "
+                            "immediately on answer — no startup delay. Write it as natural "
+                            "speech, not a topic label."
+                        ),
+                    },
+                },
+                "required": ["chat_token", "opening"],
+            },
+        },
+        handler=_start_call_handler,
+        is_async=True,
+        emoji="📞",
     )

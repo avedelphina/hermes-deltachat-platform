@@ -26,7 +26,7 @@
             # Delta Chat
             deltachat-rpc-server
             # Python package for development/testing
-            (python3.withPackages (ps: with ps; [ deltachat2 ]))
+            (python3.withPackages (ps: with ps; [ deltachat2 aiortc ]))
           ];
 
           shellHook = ''
