@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-07-02
+
+### Added
+- Graceful shutdown on `SIGTERM`/`SIGINT` with signal-handler registration in `connect()` and removal in `disconnect()`.
+- `get_status()` health/metrics snapshot (connection state, account address, crash count, internal stats).
+- Internal stats counters (`_bump_stat`) wired into inbound gating and outbound sending.
+- Event-listener crash recovery: `_event_supervisor()` restarts the listener after a crash and disables the adapter after 3 crashes in 60 seconds.
+- Cached bot address (`_self_addr`) for synchronous status reporting.
+
+### Tests
+- Added `TestStatusAndStats`, `TestSignalHandling`, and `TestEventSupervisor` integration tests.
+
 ## [1.1.0] - 2026-07-02
 
 ### Added
