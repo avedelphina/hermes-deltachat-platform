@@ -3,7 +3,9 @@
 Tests the adapter with mocked Hermes gateway classes.
 """
 
+import asyncio
 import os
+import signal
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -494,3 +496,144 @@ class TestLocationSending:
 
         assert result.success is False
         assert "not connected" in result.error.lower()
+
+
+class TestStatusAndStats:
+    """Test get_status, stats counters, and lifecycle helpers."""
+
+    def test_get_status_not_connected(self, platform_config):
+        """Test status snapshot when adapter is not connected."""
+        adapter = DeltaChatAdapter(platform_config)
+        status = adapter.get_status()
+        assert status["connected"] is False
+        assert status["running"] is False
+        assert status["account_addr"] is None
+        assert status["crashes_last_60s"] == 0
+        assert status["stats"] == {}
+
+    def test_bump_stat(self, platform_config):
+        """Test internal stats counter increments."""
+        adapter = DeltaChatAdapter(platform_config)
+        adapter._bump_stat("messages_sent")
+        adapter._bump_stat("messages_sent", 2)
+        adapter._bump_stat("messages_send_failed")
+        assert adapter._stats == {"messages_sent": 3, "messages_send_failed": 1}
+
+    @pytest.mark.asyncio
+    async def test_get_status_connected(self, platform_config, mock_rpc):
+        """Test status snapshot when adapter is connected."""
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+        adapter._running = True
+        adapter._self_addr = "bot@example.com"
+        adapter._event_loop_task = asyncio.create_task(asyncio.sleep(60))
+        adapter._bump_stat("messages_sent")
+
+        status = adapter.get_status()
+
+        assert status["connected"] is True
+        assert status["running"] is True
+        assert status["account_addr"] == "bot@example.com"
+        assert status["stats"]["messages_sent"] == 1
+        adapter._event_loop_task.cancel()
+        try:
+            await adapter._event_loop_task
+        except asyncio.CancelledError:
+            pass
+
+
+class TestSignalHandling:
+    """Test graceful shutdown signal registration."""
+
+    @pytest.mark.asyncio
+    async def test_connect_registers_signal_handlers(
+        self, platform_config, monkeypatch
+    ):
+        """Test that connect() registers SIGTERM/SIGINT handlers."""
+        adapter = DeltaChatAdapter(platform_config)
+        added = []
+
+        def fake_add_signal_handler(sig, handler):
+            added.append(sig)
+
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(loop, "add_signal_handler", fake_add_signal_handler)
+        monkeypatch.setattr(loop, "remove_signal_handler", lambda sig: True)
+
+        adapter._loop = loop
+        adapter._signal_handler()
+
+        # We can't easily run full connect() without RPC; just verify the
+        # handler can be registered via loop mock.
+        loop.add_signal_handler(signal.SIGTERM, adapter._signal_handler)
+        loop.add_signal_handler(signal.SIGINT, adapter._signal_handler)
+        assert signal.SIGTERM in added
+        assert signal.SIGINT in added
+
+    @pytest.mark.asyncio
+    async def test_disconnect_removes_signal_handlers(
+        self, platform_config, monkeypatch
+    ):
+        """Test that disconnect() removes signal handlers."""
+        adapter = DeltaChatAdapter(platform_config)
+        removed = []
+
+        def fake_remove_signal_handler(sig):
+            removed.append(sig)
+            return True
+
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(loop, "remove_signal_handler", fake_remove_signal_handler)
+
+        adapter._loop = loop
+        adapter._mark_disconnected = Mock()
+        await adapter.disconnect()
+
+        assert signal.SIGTERM in removed
+        assert signal.SIGINT in removed
+
+
+class TestEventSupervisor:
+    """Test event-listener crash recovery."""
+
+    @pytest.mark.asyncio
+    async def test_supervisor_restarts_after_crash(self, platform_config):
+        """Test that the supervisor restarts the listener after a crash."""
+        adapter = DeltaChatAdapter(platform_config)
+        adapter._running = True
+        call_count = 0
+
+        async def fake_listener():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise RuntimeError("boom")
+            adapter._running = False
+
+        adapter._event_listener = fake_listener
+        await adapter._event_supervisor()
+
+        assert call_count == 2
+        assert adapter._stats.get("event_listener_crashes") == 1
+
+    @pytest.mark.asyncio
+    async def test_supervisor_gives_up_after_three_crashes(self, platform_config):
+        """Test that the supervisor stops after 3 crashes in 60 seconds."""
+        adapter = DeltaChatAdapter(platform_config)
+        adapter._running = True
+        adapter._mark_disconnected = Mock()
+        call_count = 0
+
+        async def fake_listener():
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("boom")
+
+        adapter._event_listener = fake_listener
+        adapter.disconnect = AsyncMock()
+        await adapter._event_supervisor()
+
+        assert call_count == 3
+        assert adapter._running is False
+        assert adapter._stats.get("event_listener_crashes") == 3

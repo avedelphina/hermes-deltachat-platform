@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import sys
 import asyncio
 import logging
@@ -552,6 +553,18 @@ class DeltaChatAdapter(BasePlatformAdapter):
             )
         )
 
+        # Runtime state for observability and crash recovery
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._crash_times: list[float] = []
+        self._stats: dict[str, int] = {}
+        self._lock = threading.RLock()
+        self._self_addr: Optional[str] = None
+
+    def _bump_stat(self, key: str, count: int = 1) -> None:
+        """Increment an internal counter under the adapter lock."""
+        with self._lock:
+            self._stats[key] = self._stats.get(key, 0) + count
+
     def _check_dm(self, sender_email: str, is_verified: bool) -> Optional[str]:
         if self._dm_policy == "disabled":
             return "Sorry, this bot does not accept direct messages."
@@ -584,6 +597,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
         """
         if not self._seen_ids.add(str(msg_id)):
             logger.debug("Ignoring duplicate message %s", msg_id)
+            self._bump_stat("duplicate_messages_dropped")
             return False
 
         sender_email = ""
@@ -598,10 +612,12 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
         if sender_email and not self._rate_limiter.is_allowed(sender_email):
             logger.warning("Rate limit exceeded for %s", sender_email)
+            self._bump_stat("messages_rate_limited")
             return False
 
         if self._allowed_users and sender_email not in self._allowed_users:
             logger.warning("Rejected %s (not in allowed_users)", sender_email)
+            self._bump_stat("messages_rejected")
             if self._send_rejection_replies:
                 await self.send(
                     str(chat_id), "Sorry, you are not authorized to use this bot."
@@ -620,6 +636,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
             reason = self._check_dm(sender_email, is_verified)
             if reason:
                 logger.warning("dm_policy rejected %s", sender_email)
+                self._bump_stat("messages_rejected")
                 if self._send_rejection_replies:
                     await self.send(str(chat_id), reason)
                 return False
@@ -633,6 +650,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
             reason = self._check_group(sender_email)
             if reason:
                 logger.warning("group_policy rejected %s", sender_email)
+                self._bump_stat("messages_rejected")
                 if is_request:
                     try:
                         await self.rpc.leave_group(self.account_id, int(chat_id))
@@ -647,6 +665,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 except Exception as e:
                     logger.warning("accept_chat failed: %s", e)
 
+        self._bump_stat("messages_received")
         return True
 
     def _get_dc_config_dir(self) -> str:
@@ -690,6 +709,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
         Returns:
             True if connection successful, False otherwise
         """
+        self._loop = asyncio.get_running_loop()
+
         if not _check_dc2_available():
             logger.error("deltachat2 is not installed. Run: pip install deltachat2")
             return False
@@ -751,9 +772,16 @@ class DeltaChatAdapter(BasePlatformAdapter):
             await self.rpc.start_io(self.account_id)
             logger.debug(f"Started IO for account {self.account_id}")
 
-            # Start event listener
+            # Register graceful shutdown signals.
+            try:
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    self._loop.add_signal_handler(sig, self._signal_handler)
+            except (NotImplementedError, ValueError, RuntimeError):
+                pass  # Signals may not be supported on this platform.
+
+            # Start event listener with crash recovery.
             self._running = True
-            self._event_loop_task = asyncio.create_task(self._event_listener())
+            self._event_loop_task = asyncio.create_task(self._event_supervisor())
 
             self._mark_connected()
             global _active_adapter
@@ -763,10 +791,12 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
             self._call_manager = CallManager(self)
 
-            # Log the bot's address for reference
-            addr = await self.get_my_address()
-            if addr:
-                logger.info(f"Delta Chat connected successfully. Bot address: {addr}")
+            # Log the bot's address for reference and cache it for status.
+            self._self_addr = await self.get_my_address()
+            if self._self_addr:
+                logger.info(
+                    f"Delta Chat connected successfully. Bot address: {self._self_addr}"
+                )
             else:
                 logger.info("Delta Chat connected successfully")
             return True
@@ -793,15 +823,51 @@ class DeltaChatAdapter(BasePlatformAdapter):
             self._transport = None
         self.rpc = None
         self.account_id = None
+        self._self_addr = None
+
+    def _signal_handler(self):
+        """Handle SIGTERM/SIGINT by scheduling disconnect on the event loop."""
+        logger.info("DeltaChat: received shutdown signal")
+        if self._loop and not self._loop.is_closed():
+            try:
+                asyncio.run_coroutine_threadsafe(self.disconnect(), self._loop)
+            except Exception as e:
+                logger.warning("DeltaChat: could not schedule disconnect: %s", e)
 
     async def disconnect(self) -> None:
         """Disconnect from Delta Chat."""
+        # Remove signal handlers.
+        if self._loop and not self._loop.is_closed():
+            try:
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    self._loop.remove_signal_handler(sig)
+            except (NotImplementedError, ValueError, RuntimeError):
+                pass
+
         if self._call_manager:
             await self._call_manager.teardown()
             self._call_manager = None
         self._cleanup()
         self._mark_disconnected()
         logger.info("Delta Chat disconnected")
+
+    def get_status(self) -> dict:
+        """Return a snapshot of adapter health and metrics."""
+        with self._lock:
+            running = self._running
+            thread_alive = (
+                self._event_loop_task is not None and not self._event_loop_task.done()
+            )
+            crashes = list(self._crash_times)
+            stats = dict(self._stats)
+        return {
+            "connected": self.rpc is not None and thread_alive,
+            "running": running,
+            "account_addr": self._self_addr,
+            "crashes_last_60s": len(crashes),
+            "last_crash": crashes[-1] if crashes else None,
+            "stats": stats,
+        }
 
     async def get_my_address(self) -> Optional[str]:
         """Get the Delta Chat account address or SecureJoin link.
@@ -982,6 +1048,7 @@ body {{
 
             msg_id = await _async_retry(_do_send, max_attempts=3, base_delay=1.0)
             logger.debug(f"Sent message {msg_id} to chat {chat_id}")
+            self._bump_stat("messages_sent")
             return SendResult(
                 success=True,
                 message_id=str(msg_id) if msg_id is not None else None,
@@ -989,6 +1056,7 @@ body {{
 
         except Exception as e:
             logger.error(f"Error sending message to chat {chat_id}: {e}")
+            self._bump_stat("messages_send_failed")
             return SendResult(
                 success=False,
                 error=str(e),
@@ -1027,10 +1095,12 @@ body {{
 
             msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
             logger.debug(f"Sent file {file_path} as message {msg_id} to chat {chat_id}")
+            self._bump_stat("files_sent")
             return SendResult(success=True, message_id=str(msg_id))
 
         except Exception as e:
             logger.error(f"Error sending file {file_path} to chat {chat_id}: {e}")
+            self._bump_stat("files_send_failed")
             return SendResult(success=False, error=str(e))
 
     async def send_document(
@@ -1100,9 +1170,11 @@ body {{
             logger.debug(
                 f"Sent image {image_path} as message {msg_id} to chat {chat_id}"
             )
+            self._bump_stat("images_sent")
             return SendResult(success=True, message_id=str(msg_id))
         except Exception as e:
             logger.error(f"Error sending image {image_path} to chat {chat_id}: {e}")
+            self._bump_stat("images_send_failed")
             return SendResult(success=False, error=str(e))
 
     async def send_voice(
@@ -1186,6 +1258,7 @@ body {{
             logger.info(
                 f"Sent voice message {msg_id} to chat {chat_id}, file={audio_path}, size={file_size}"
             )
+            self._bump_stat("voices_sent")
             return SendResult(
                 success=True,
                 message_id=str(msg_id),
@@ -1196,6 +1269,7 @@ body {{
 
             logger.error(f"Error in send_voice: {e}")
             logger.debug(f"send_voice exception traceback:\n{traceback.format_exc()}")
+            self._bump_stat("voices_send_failed")
             return SendResult(
                 success=False,
                 error=str(e),
@@ -1243,6 +1317,7 @@ body {{
 
             msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
             logger.debug(f"Sent location to chat {chat_id}")
+            self._bump_stat("locations_sent")
             return SendResult(
                 success=True,
                 message_id=str(msg_id),
@@ -1250,6 +1325,7 @@ body {{
 
         except Exception as e:
             logger.error(f"Error sending location to chat {chat_id}: {e}")
+            self._bump_stat("locations_send_failed")
             return SendResult(
                 success=False,
                 error=str(e),
@@ -1417,6 +1493,39 @@ body {{
             except Exception as e:
                 logger.error(f"Event listener error: {e}")
                 await asyncio.sleep(1)
+
+    async def _event_supervisor(self) -> None:
+        """Run the event listener and restart it on crash.
+
+        If the listener crashes 3 times within 60 seconds, the adapter gives up
+        and disconnects.
+        """
+        while self._running:
+            try:
+                await self._event_listener()
+                break  # Clean exit
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not self._running:
+                    break
+                now = time.monotonic()
+                with self._lock:
+                    self._crash_times = [t for t in self._crash_times if now - t < 60]
+                    self._crash_times.append(now)
+                    recent_crashes = len(self._crash_times)
+                self._bump_stat("event_listener_crashes")
+                if recent_crashes >= 3:
+                    logger.error(
+                        "DeltaChat: 3 event listener crashes in 60s — disabling"
+                    )
+                    self._running = False
+                    asyncio.create_task(self.disconnect())
+                    break
+                logger.error(
+                    "DeltaChat: event listener crashed (%s), restarting in 5s", e
+                )
+                await asyncio.sleep(5)
 
     async def _handle_dc_event(self, event: Dict[str, Any]) -> None:
         """Handle a Delta Chat event and convert to Hermes MessageEvent.
