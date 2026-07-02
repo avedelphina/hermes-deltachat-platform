@@ -30,13 +30,13 @@ _vendor_dir = os.path.join(_plugin_dir, "vendor")
 if os.path.exists(_vendor_dir) and _vendor_dir not in sys.path:
     sys.path.insert(0, _vendor_dir)
 
-from gateway.platforms.base import (
+from gateway.platforms.base import (  # noqa: E402
     BasePlatformAdapter,
     SendResult,
     MessageEvent,
     MessageType,
 )
-from gateway.config import Platform, PlatformConfig
+from gateway.config import Platform, PlatformConfig  # noqa: E402
 
 # Must use "hermes_plugins.*" prefix so records appear in gateway.log.
 # __name__ resolves to "adapter" (standalone module), which only goes to agent.log.
@@ -1203,7 +1203,8 @@ body {{
         import os
 
         logger.info(
-            f"send_voice called: chat_id={chat_id}, audio_path={audio_path}, caption={caption[:50] if caption else None}"
+            f"send_voice called: chat_id={chat_id}, audio_path={audio_path}, "
+            f"caption={caption[:50] if caption else None}"
         )
         logger.debug(f"send_voice kwargs: {kwargs}")
 
@@ -1256,7 +1257,8 @@ body {{
 
             msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
             logger.info(
-                f"Sent voice message {msg_id} to chat {chat_id}, file={audio_path}, size={file_size}"
+                f"Sent voice message {msg_id} to chat {chat_id}, "
+                f"file={audio_path}, size={file_size}"
             )
             self._bump_stat("voices_sent")
             return SendResult(
@@ -1757,7 +1759,8 @@ body {{
                 )
 
         logger.info(
-            f"_handle_non_text_message: view_type={view_type}, chat_id={chat_id}, msg_id={msg_id}, filename={filename[:100] if filename else None}"
+            f"_handle_non_text_message: view_type={view_type}, chat_id={chat_id}, "
+            f"msg_id={msg_id}, filename={filename[:100] if filename else None}"
         )
 
         # Resolve sender and chat info (shared by all branches)
@@ -1930,7 +1933,8 @@ body {{
             logger.info(f"Absolute path: {os.path.abspath(filename)}")
             logger.info(f"Filename basename: {os.path.basename(filename)}")
         logger.info(
-            f"Message data: msg_type={msg.get('msg_type')}, from_id={msg.get('from_id')}, timestamp={msg.get('timestamp')}"
+            f"Message data: msg_type={msg.get('msg_type')}, "
+            f"from_id={msg.get('from_id')}, timestamp={msg.get('timestamp')}"
         )
 
         if not filename:
@@ -1961,7 +1965,8 @@ body {{
                         dc_blob_dir, os.path.splitext(os.path.basename(filename))[0]
                     )
                     logger.info(
-                        f"Trying blob path (no ext): {blob_path_no_ext}, exists: {os.path.exists(blob_path_no_ext)}"
+                        f"Trying blob path (no ext): {blob_path_no_ext}, "
+                        f"exists: {os.path.exists(blob_path_no_ext)}"
                     )
                     if os.path.exists(blob_path_no_ext):
                         filename = blob_path_no_ext
@@ -2064,7 +2069,8 @@ body {{
                     if transcription_result and transcription_result.get("text"):
                         transcribed_text = transcription_result["text"]
                         logger.info(
-                            f"_handle_audio_message: Transcribed text (first 200 chars): {transcribed_text[:200]}"
+                            "_handle_audio_message: Transcribed text (first 200 chars): "
+                            f"{transcribed_text[:200]}"
                         )
                     else:
                         logger.warning(
@@ -2081,7 +2087,8 @@ body {{
                     f"_handle_audio_message: llm.transcribe_audio_file failed: {e}"
                 )
                 logger.debug(
-                    f"_handle_audio_message: llm.transcribe_audio_file traceback:\n{traceback.format_exc()}"
+                    "_handle_audio_message: llm.transcribe_audio_file traceback:\n"
+                    f"{traceback.format_exc()}"
                 )
         except Exception as e:
             import traceback
@@ -2116,7 +2123,9 @@ body {{
                 )
             else:
                 logger.warning(
-                    "_handle_audio_message: NO TRANSCRIPTION - llm.transcribe_audio_file not available, file will be forwarded as notification only"
+                    "_handle_audio_message: NO TRANSCRIPTION - "
+                    "llm.transcribe_audio_file not available, "
+                    "file will be forwarded as notification only"
                 )
 
         logger.debug(f"_handle_audio_message: Final message text: {full_text[:150]}")
@@ -2327,19 +2336,25 @@ def register_platform(ctx):
             "Delta Chat does NOT support markdown formatting or message editing. "
             "Messages longer than 40 lines will be automatically formatted with HTML. "
             "For very long content, consider sending as a document file instead. "
-            "You CAN send voice messages (use send_voice tool), videos, images, files, and delete messages. "
-            "When a user sends a voice message, it is automatically transcribed — just respond to the transcribed content normally. "
+            "You CAN send voice messages (use send_voice tool), videos, images, "
+            "files, and delete messages. "
+            "When a user sends a voice message, it is automatically transcribed — "
+            "just respond to the transcribed content normally. "
             "Location messages can be sent to share points of interest on a map. "
             "You CAN build and send webxdc mini apps and other files (PDF, HTML, etc.). "
             "MANDATORY: before attempting to build any webxdc app, you MUST first call "
-            "skill_view('plugin:deltachat-platform:webxdc-converter') to load the build instructions. "
-            "For file delivery from the Docker sandbox: write output files to /workspace/ (NOT /tmp/), "
+            "skill_view('plugin:deltachat-platform:webxdc-converter') "
+            "to load the build instructions. "
+            "For file delivery from the Docker sandbox: write output files "
+            "to /workspace/ (NOT /tmp/), "
             "then use a MEDIA directive — e.g. 'MEDIA:/workspace/app.xdc'. "
             "The adapter maps /workspace/ paths to the host and sends via send_document. "
             "DC core auto-detects .xdc as webxdc — just send it as a regular file. "
             "Each message ends with a [dc:chat=<token>] metadata tag. "
-            "IGNORE this tag during normal conversation — it is only needed if you call dc_safe_rpc_call. "
-            "Do NOT call dc_safe_rpc_call, dc_chat_rpc_spec, or dc_rpc_spec unless the user explicitly "
+            "IGNORE this tag during normal conversation — it is only needed "
+            "if you call dc_safe_rpc_call. "
+            "Do NOT call dc_safe_rpc_call, dc_chat_rpc_spec, or dc_rpc_spec "
+            "unless the user explicitly "
             "asks for a Delta Chat-specific operation that cannot be done with the standard tools."
         ),
         max_message_length=DC_MESSAGE_MAX_LEN,
@@ -2419,7 +2434,10 @@ def register_rpc_tools(ctx) -> None:
         if not method or not isinstance(method, str):
             return json.dumps(
                 {
-                    "error": "Missing 'method' (snake_case RPC name). Use dc_chat_rpc_spec to find one."
+                    "error": (
+                        "Missing 'method' (snake_case RPC name). "
+                        "Use dc_chat_rpc_spec to find one."
+                    )
                 }
             )
         adapter = _active_adapter
@@ -2457,7 +2475,10 @@ def register_rpc_tools(ctx) -> None:
         if method_entry is None:
             return json.dumps(
                 {
-                    "error": f"Unknown method '{method}' — use dc_chat_rpc_spec to browse available methods"
+                    "error": (
+                        f"Unknown method '{method}' — "
+                        "use dc_chat_rpc_spec to browse available methods"
+                    )
                 }
             )
 
@@ -2465,7 +2486,10 @@ def register_rpc_tools(ctx) -> None:
         if "chatId" not in param_names:
             return json.dumps(
                 {
-                    "error": f"'{method}' has no chatId parameter — use dc_rpc_call for non-chat methods"
+                    "error": (
+                        f"'{method}' has no chatId parameter — "
+                        "use dc_rpc_call for non-chat methods"
+                    )
                 }
             )
 
@@ -2560,8 +2584,8 @@ def register_rpc_tools(ctx) -> None:
             "description": (
                 "Fetch the OpenRPC spec filtered to methods that accept a chatId parameter, "
                 "excluding all destructive operations. "
-                "Only call this when you are about to use dc_safe_rpc_call for an explicit user request "
-                "that cannot be handled by normal messaging tools."
+                "Only call this when you are about to use dc_safe_rpc_call for an "
+                "explicit user request that cannot be handled by normal messaging tools."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -2612,11 +2636,13 @@ def register_rpc_tools(ctx) -> None:
             "description": (
                 "Call a chat-scoped Delta Chat RPC method safely. "
                 "Only use this when the user explicitly asks for a Delta Chat-specific operation "
-                "that cannot be done with the normal send, send_file, send_voice, or delete_message tools. "
-                "Do NOT call this for routine message handling, reading messages, or sending replies — "
-                "those go through the standard tools. "
+                "that cannot be done with the normal send, send_file, send_voice, "
+                "or delete_message tools. "
+                "Do NOT call this for routine message handling, reading messages, "
+                "or sending replies — those go through the standard tools. "
                 "accountId and chatId are injected automatically from the chat_token. "
-                "Destructive methods are blocked. Use dc_chat_rpc_spec first to find the method name."
+                "Destructive methods are blocked. "
+                "Use dc_chat_rpc_spec first to find the method name."
             ),
             "parameters": {
                 "type": "object",
@@ -2632,7 +2658,8 @@ def register_rpc_tools(ctx) -> None:
                         "type": "string",
                         "description": (
                             "The opaque chat token from the [dc:chat=...] line "
-                            "in the current message. Never use a token from a different conversation."
+                            "in the current message. Never use a token from a "
+                            "different conversation."
                         ),
                     },
                     "params": {
