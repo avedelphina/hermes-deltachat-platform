@@ -89,6 +89,53 @@ class TestSplitMessage:
         assert all(len(p) <= 40 for p in parts)
         assert "".join(parts) == text
 
+    def test_zero_or_negative_max_len_uses_default(self):
+        text = "a" * (DC_MESSAGE_MAX_LEN + 100)
+        for bad_max in (0, -1, -1000):
+            parts = _split_message(text, max_len=bad_max)
+            assert all(len(p) <= DC_MESSAGE_MAX_LEN for p in parts)
+            assert "".join(parts) == text
+
+
+class TestWorkspacePathMapping:
+    def test_rejects_dotdot(self):
+        assert (
+            DeltaChatAdapter._container_workspace_to_host("/workspace/../etc/passwd")
+            is None
+        )
+        assert (
+            DeltaChatAdapter._container_workspace_to_host(
+                "/workspace/subdir/../../etc/passwd"
+            )
+            is None
+        )
+
+    def test_rejects_symlink_escape(self, tmp_path, monkeypatch):
+        from gateway.config import get_hermes_home
+
+        hermes_home = tmp_path / "home"
+        hermes_home.mkdir()
+        workspace = hermes_home / "sandboxes" / "docker" / "default" / "workspace"
+        workspace.mkdir(parents=True)
+        secret = tmp_path / "secret.txt"
+        secret.write_text("secret")
+        (workspace / "link").symlink_to(secret)
+
+        monkeypatch.setattr("gateway.config.get_hermes_home", lambda: str(hermes_home))
+        assert DeltaChatAdapter._container_workspace_to_host("/workspace/link") is None
+
+    def test_maps_normal_workspace_path(self, tmp_path, monkeypatch):
+        from gateway.config import get_hermes_home
+
+        hermes_home = tmp_path / "home"
+        workspace = hermes_home / "sandboxes" / "docker" / "default" / "workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "file.txt").write_text("ok")
+
+        monkeypatch.setattr("gateway.config.get_hermes_home", lambda: str(hermes_home))
+        result = DeltaChatAdapter._container_workspace_to_host("/workspace/file.txt")
+        assert result == str(workspace / "file.txt")
+
 
 class TestEmailValidation:
     def test_valid(self):

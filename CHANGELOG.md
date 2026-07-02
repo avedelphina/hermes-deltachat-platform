@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.1] - 2026-07-02
+
+### Security / Hardening
+- Workspace file delivery is now sandbox-escape-proof: `/workspace/` paths are resolved and verified to stay inside the sandbox; `..` and symlink escapes are rejected.
+- Raw RPC is filtered: `dc_rpc_call` logs every invocation at `WARNING`, blocks destructive methods (`delete_*`, `remove_*`), and supports `DELTACHAT_RAW_RPC_ALLOWLIST` / `DELTACHAT_RAW_RPC_BLOCKLIST`.
+- Account passwords are cleared from memory immediately after configuration succeeds or fails.
+- Inbound access control is fail-closed: chat-info RPC failures now reject the message instead of bypassing policy checks.
+- Delta Chat version check failures now reject the connection instead of falling through.
+- Voice-call incoming audio buffer is capped at a 60-second utterance ceiling to prevent unbounded growth.
+- Cross-loop call-manager state (`_sessions`, `_chat_to_msg`, drop counters) is now protected by a `threading.Lock`.
+- Removed ~240 lines of dead code (`_handle_audio_message_UNUSED`).
+
+### Fixed
+- `DELTACHAT_MAX_MESSAGE_LENGTH <= 0` no longer causes an infinite split loop; values outside 100–10000 are clamped to the default.
+
+### Tests
+- Added `TestWorkspacePathMapping`, `TestSplitMessage::test_zero_or_negative_max_len_uses_default`, and `TestOnboarding::test_configure_account_clears_password_on_configure_failure`.
+
 ## [1.4.0] - 2026-07-02
 
 ### Added

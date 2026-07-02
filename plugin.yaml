@@ -1,7 +1,7 @@
 name: deltachat-platform
 label: Delta Chat
 kind: platform
-version: 1.4.0
+version: 1.4.1
 description: Delta Chat messaging platform adapter for Hermes Agent. Supports text, webxdc mini apps, voice messages, images, and videos.
 author: Simon Laux
 requires_env:
@@ -73,7 +73,7 @@ optional_env:
     prompt: "Send rejection replies? (true/false)"
     password: false
   - name: DELTACHAT_MAX_MESSAGE_LENGTH
-    description: "Character limit for automatic message splitting (default: 3600)"
+    description: "Character limit for automatic message splitting (default: 3600, min: 100, max: 10000)"
     prompt: "Max message length"
     password: false
   - name: DELTACHAT_RATE_LIMIT_MAX
@@ -83,4 +83,16 @@ optional_env:
   - name: DELTACHAT_RATE_LIMIT_WINDOW
     description: "Rate-limit window in seconds (default: 60)"
     prompt: "Rate limit window"
+    password: false
+  - name: DELTACHAT_ENABLE_RAW_RPC
+    description: "Set to '1' to register the unrestricted dc_rpc_call tool (use with caution)"
+    prompt: "Enable raw RPC access? (1/0)"
+    password: false
+  - name: DELTACHAT_RAW_RPC_ALLOWLIST
+    description: "Comma-separated list of methods allowed for dc_rpc_call (empty = all non-destructive methods)"
+    prompt: "Raw RPC allowlist (optional)"
+    password: false
+  - name: DELTACHAT_RAW_RPC_BLOCKLIST
+    description: "Comma-separated list of additional methods to block from dc_rpc_call"
+    prompt: "Raw RPC blocklist (optional)"
     password: false

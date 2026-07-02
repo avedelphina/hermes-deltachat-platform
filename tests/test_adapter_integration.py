@@ -654,9 +654,7 @@ class TestOnboarding:
         assert config_dir == custom_dir
         assert os.path.isdir(custom_dir)
 
-    def test_data_dir_extra_overrides_hermes_home(
-        self, platform_config, tmp_path
-    ):
+    def test_data_dir_extra_overrides_hermes_home(self, platform_config, tmp_path):
         """config.extra.data_dir is honoured when set."""
         custom_dir = str(tmp_path / "dc-data-extra")
         platform_config.extra = {"data_dir": custom_dir}
@@ -690,9 +688,7 @@ class TestOnboarding:
         assert avatar_call[0][2] == str(avatar)
 
     @pytest.mark.asyncio
-    async def test_apply_profile_skips_missing_avatar(
-        self, platform_config, mock_rpc
-    ):
+    async def test_apply_profile_skips_missing_avatar(self, platform_config, mock_rpc):
         """_apply_profile skips avatar when the file does not exist."""
         platform_config.extra = {
             "display_name": "TestBot",
@@ -753,11 +749,30 @@ class TestOnboarding:
             2, {"addr": "bot@example.com", "password": "secret"}
         )
         mock_rpc.configure.assert_awaited_once_with(2)
+        assert adapter._password is None
 
     @pytest.mark.asyncio
-    async def test_configure_account_chatmail_auto(
+    async def test_configure_account_clears_password_on_configure_failure(
         self, platform_config, mock_rpc
     ):
+        """Password must not be retained if configuration fails."""
+        platform_config.extra = {
+            "email": "bot@example.com",
+            "password": "secret",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        mock_rpc.get_all_accounts = AsyncMock(return_value=[])
+        mock_rpc.add_account = AsyncMock(return_value=2)
+        mock_rpc.set_config = AsyncMock()
+        mock_rpc.add_or_update_transport = AsyncMock()
+        mock_rpc.configure = AsyncMock(side_effect=RuntimeError("configure failed"))
+
+        with pytest.raises(RuntimeError, match="configure failed"):
+            await adapter._configure_account(mock_rpc)
+        assert adapter._password is None
+
+    @pytest.mark.asyncio
+    async def test_configure_account_chatmail_auto(self, platform_config, mock_rpc):
         """_configure_account creates a chatmail account when email is auto."""
         adapter = DeltaChatAdapter(platform_config)
         mock_rpc.get_all_accounts = AsyncMock(return_value=[])
@@ -781,7 +796,9 @@ class TestOnboarding:
         self, platform_config, mock_rpc
     ):
         """_configure_account tries chatmail servers in order."""
-        platform_config.extra = {"chatmail_servers": "first.example.org,second.example.org"}
+        platform_config.extra = {
+            "chatmail_servers": "first.example.org,second.example.org"
+        }
         adapter = DeltaChatAdapter(platform_config)
         mock_rpc.get_all_accounts = AsyncMock(return_value=[])
         mock_rpc.add_account = AsyncMock(return_value=4)
@@ -806,7 +823,9 @@ class TestOnboarding:
         self, platform_config, mock_rpc
     ):
         """_configure_account raises when every chatmail server fails."""
-        platform_config.extra = {"chatmail_servers": "bad1.example.org,bad2.example.org"}
+        platform_config.extra = {
+            "chatmail_servers": "bad1.example.org,bad2.example.org"
+        }
         adapter = DeltaChatAdapter(platform_config)
         mock_rpc.get_all_accounts = AsyncMock(return_value=[])
         mock_rpc.add_account = AsyncMock(return_value=5)
@@ -818,9 +837,7 @@ class TestOnboarding:
             await adapter._configure_account(mock_rpc)
 
     @pytest.mark.asyncio
-    async def test_connect_generates_invite_link(
-        self, platform_config, monkeypatch
-    ):
+    async def test_connect_generates_invite_link(self, platform_config, monkeypatch):
         """connect() configures an account and caches a SecureJoin invite link."""
         from unittest.mock import MagicMock
 
@@ -846,7 +863,9 @@ class TestOnboarding:
             "deltachat2.transport.IOTransport", return_value=fake_transport
         ), patch("deltachat2.Rpc", return_value=sync_rpc), patch(
             "adapter._check_dc_version", return_value=True
-        ), patch("asyncio.sleep", new_callable=AsyncMock):
+        ), patch(
+            "asyncio.sleep", new_callable=AsyncMock
+        ):
             adapter.get_my_address = AsyncMock(return_value="bot@example.com")
             adapter._mark_disconnected = Mock()
             result = await adapter.connect()
@@ -885,9 +904,7 @@ class TestMentions:
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Group", "name": "Test Group"}
         )
-        mock_rpc.get_contact = AsyncMock(
-            return_value={"address": "user@example.com"}
-        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
 
         await adapter._handle_incoming_message(group_event)
 
@@ -915,9 +932,7 @@ class TestMentions:
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Group", "name": "Test Group"}
         )
-        mock_rpc.get_contact = AsyncMock(
-            return_value={"address": "user@example.com"}
-        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
 
         await adapter._handle_incoming_message(group_event)
 
@@ -942,9 +957,7 @@ class TestMentions:
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Group", "name": "Test Group"}
         )
-        mock_rpc.get_contact = AsyncMock(
-            return_value={"address": "user@example.com"}
-        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
 
         await adapter._handle_incoming_message(group_event)
 
@@ -970,9 +983,7 @@ class TestMentions:
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Group", "name": "Test Group"}
         )
-        mock_rpc.get_contact = AsyncMock(
-            return_value={"address": "user@example.com"}
-        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
         adapter._resolve_blob_path = lambda x: x
         adapter._copy_to_hermes_cache = lambda src, kind: src
 
@@ -985,9 +996,7 @@ class TestMetadata:
     """Test incoming/outgoing metadata enrichment."""
 
     @pytest.mark.asyncio
-    async def test_message_event_has_metadata(
-        self, platform_config, mock_rpc
-    ):
+    async def test_message_event_has_metadata(self, platform_config, mock_rpc):
         platform_config.extra = {"dm_policy": "open"}
         adapter = DeltaChatAdapter(platform_config)
         adapter.rpc = mock_rpc
@@ -1003,9 +1012,7 @@ class TestMetadata:
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Single", "name": "DM"}
         )
-        mock_rpc.get_contact = AsyncMock(
-            return_value={"address": "user@example.com"}
-        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
 
         await adapter._handle_incoming_message(
             {"kind": "IncomingMsg", "chat_id": 7, "msg_id": 42}
@@ -1020,9 +1027,7 @@ class TestMetadata:
         assert "dc_token" in event.metadata
 
     @pytest.mark.asyncio
-    async def test_send_result_includes_metadata(
-        self, platform_config, mock_rpc
-    ):
+    async def test_send_result_includes_metadata(self, platform_config, mock_rpc):
         from adapter import _chat_id_to_token
 
         _chat_id_to_token[7] = "abc123"
@@ -1073,9 +1078,7 @@ class TestUrlImageSending:
         return client_cm
 
     @pytest.mark.asyncio
-    async def test_send_image_file_with_url_success(
-        self, platform_config, mock_rpc
-    ):
+    async def test_send_image_file_with_url_success(self, platform_config, mock_rpc):
         adapter = DeltaChatAdapter(platform_config)
         adapter.rpc = mock_rpc
         adapter.account_id = 1
@@ -1083,9 +1086,7 @@ class TestUrlImageSending:
 
         client_cm = self._mock_httpx_stream("image/png", b"pngdata", 7)
         with patch("httpx.AsyncClient", return_value=client_cm):
-            result = await adapter.send_image_file(
-                "7", "https://example.com/photo.png"
-            )
+            result = await adapter.send_image_file("7", "https://example.com/photo.png")
 
         assert result.success is True
         assert result.message_id == "123"
@@ -1105,18 +1106,14 @@ class TestUrlImageSending:
 
         client_cm = self._mock_httpx_stream("text/plain", b"not an image", 12)
         with patch("httpx.AsyncClient", return_value=client_cm):
-            result = await adapter.send_image_file(
-                "7", "https://example.com/file.txt"
-            )
+            result = await adapter.send_image_file("7", "https://example.com/file.txt")
 
         assert result.success is False
         assert "image" in result.error.lower()
         mock_rpc.send_msg.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_send_image_file_with_url_size_limit(
-        self, platform_config, mock_rpc
-    ):
+    async def test_send_image_file_with_url_size_limit(self, platform_config, mock_rpc):
         adapter = DeltaChatAdapter(platform_config)
         adapter.rpc = mock_rpc
         adapter.account_id = 1
@@ -1125,9 +1122,7 @@ class TestUrlImageSending:
             "image/png", b"x", content_length=50 * 1024 * 1024
         )
         with patch("httpx.AsyncClient", return_value=client_cm):
-            result = await adapter.send_image_file(
-                "7", "https://example.com/huge.png"
-            )
+            result = await adapter.send_image_file("7", "https://example.com/huge.png")
 
         assert result.success is False
         assert "25" in result.error or "limit" in result.error.lower()
