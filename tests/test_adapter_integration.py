@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 
 # The conftest.py already installs the mocks, so we can import adapter now
+import adapter
 from adapter import (
     DeltaChatAdapter,
     _parse_version,
@@ -371,6 +372,7 @@ class TestDC2Availability:
 
         # Save original state
         original_modules = sys.modules.get("deltachat2")
+        original_cache = adapter._DC2_AVAILABLE
 
         # Ensure deltachat2 is not in sys.modules
         if "deltachat2" in sys.modules:
@@ -380,8 +382,6 @@ class TestDC2Availability:
         monkeypatch.setitem(sys.modules, "deltachat2", None)
 
         # Reset the cache
-        import adapter
-
         adapter._DC2_AVAILABLE = None
 
         result = _check_dc2_available()
@@ -390,6 +390,7 @@ class TestDC2Availability:
         # Restore original state
         if original_modules is not None:
             sys.modules["deltachat2"] = original_modules
+        adapter._DC2_AVAILABLE = original_cache
 
 
 class TestHTMLFormatting:
@@ -637,3 +638,221 @@ class TestEventSupervisor:
         assert call_count == 3
         assert adapter._running is False
         assert adapter._stats.get("event_listener_crashes") == 3
+
+
+class TestOnboarding:
+    """Test account onboarding: data dir, profile, manual/auto accounts."""
+
+    def test_data_dir_env_overrides_hermes_home(
+        self, platform_config, monkeypatch, tmp_path
+    ):
+        """DELTACHAT_DATA_DIR is honoured when set."""
+        custom_dir = str(tmp_path / "dc-data")
+        monkeypatch.setenv("DELTACHAT_DATA_DIR", custom_dir)
+        adapter = DeltaChatAdapter(platform_config)
+        config_dir = adapter._get_dc_config_dir()
+        assert config_dir == custom_dir
+        assert os.path.isdir(custom_dir)
+
+    def test_data_dir_extra_overrides_hermes_home(
+        self, platform_config, tmp_path
+    ):
+        """config.extra.data_dir is honoured when set."""
+        custom_dir = str(tmp_path / "dc-data-extra")
+        platform_config.extra = {"data_dir": custom_dir}
+        adapter = DeltaChatAdapter(platform_config)
+        config_dir = adapter._get_dc_config_dir()
+        assert config_dir == custom_dir
+        assert os.path.isdir(custom_dir)
+
+    @pytest.mark.asyncio
+    async def test_apply_profile_sets_displayname_avatar_and_bot(
+        self, platform_config, mock_rpc, tmp_path
+    ):
+        """_apply_profile sets display name, bot mode, and avatar."""
+        avatar = tmp_path / "bot.png"
+        avatar.write_bytes(b"fake png")
+        platform_config.extra = {
+            "display_name": "TestBot",
+            "avatar_path": str(avatar),
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        mock_rpc.set_config = AsyncMock()
+        adapter.rpc = mock_rpc
+
+        await adapter._apply_profile(adapter.rpc, 1)
+
+        calls = [c.args for c in mock_rpc.set_config.await_args_list]
+        assert (1, "displayname", "TestBot") in calls
+        assert (1, "bot", "1") in calls
+        avatar_call = [c for c in calls if c[1] == "selfavatar"]
+        assert len(avatar_call) == 1
+        assert avatar_call[0][2] == str(avatar)
+
+    @pytest.mark.asyncio
+    async def test_apply_profile_skips_missing_avatar(
+        self, platform_config, mock_rpc
+    ):
+        """_apply_profile skips avatar when the file does not exist."""
+        platform_config.extra = {
+            "display_name": "TestBot",
+            "avatar_path": "/nonexistent/avatar.png",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        mock_rpc.set_config = AsyncMock()
+
+        await adapter._apply_profile(adapter.rpc, 1)
+
+        calls = [c.args for c in mock_rpc.set_config.await_args_list]
+        assert (1, "displayname", "TestBot") in calls
+        assert (1, "bot", "1") in calls
+        assert not any(c[1] == "selfavatar" for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_configure_account_reuses_existing_account(
+        self, platform_config, mock_rpc
+    ):
+        """_configure_account reuses the first existing account."""
+        adapter = DeltaChatAdapter(platform_config)
+        mock_rpc.get_all_accounts = AsyncMock(return_value=[{"id": 7}])
+        mock_rpc.set_config = AsyncMock()
+
+        result = await adapter._configure_account(mock_rpc)
+
+        assert result is True
+        assert adapter.account_id == 7
+        mock_rpc.get_all_accounts.assert_awaited_once()
+        mock_rpc.add_account.assert_not_called()
+        calls = [c.args for c in mock_rpc.set_config.await_args_list]
+        assert (7, "displayname", adapter._display_name) in calls
+        assert (7, "bot", "1") in calls
+
+    @pytest.mark.asyncio
+    async def test_configure_account_manual_email_password(
+        self, platform_config, mock_rpc
+    ):
+        """_configure_account creates and configures a manual email account."""
+        platform_config.extra = {
+            "email": "bot@example.com",
+            "password": "secret",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        mock_rpc.get_all_accounts = AsyncMock(return_value=[])
+        mock_rpc.add_account = AsyncMock(return_value=2)
+        mock_rpc.set_config = AsyncMock()
+        mock_rpc.add_or_update_transport = AsyncMock()
+        mock_rpc.configure = AsyncMock()
+
+        result = await adapter._configure_account(mock_rpc)
+
+        assert result is True
+        assert adapter.account_id == 2
+        mock_rpc.add_account.assert_awaited_once()
+        mock_rpc.add_or_update_transport.assert_awaited_once_with(
+            2, {"addr": "bot@example.com", "password": "secret"}
+        )
+        mock_rpc.configure.assert_awaited_once_with(2)
+
+    @pytest.mark.asyncio
+    async def test_configure_account_chatmail_auto(
+        self, platform_config, mock_rpc
+    ):
+        """_configure_account creates a chatmail account when email is auto."""
+        adapter = DeltaChatAdapter(platform_config)
+        mock_rpc.get_all_accounts = AsyncMock(return_value=[])
+        mock_rpc.add_account = AsyncMock(return_value=3)
+        mock_rpc.set_config = AsyncMock()
+        mock_rpc.set_config_from_qr = AsyncMock()
+        mock_rpc.configure = AsyncMock()
+        mock_rpc.get_config = AsyncMock(return_value="bot@nine.testrun.org")
+
+        result = await adapter._configure_account(mock_rpc)
+
+        assert result is True
+        assert adapter.account_id == 3
+        mock_rpc.set_config_from_qr.assert_awaited_once_with(
+            3, "DCACCOUNT:https://nine.testrun.org/new"
+        )
+        mock_rpc.configure.assert_awaited_once_with(3)
+
+    @pytest.mark.asyncio
+    async def test_configure_account_chatmail_fallback_servers(
+        self, platform_config, mock_rpc
+    ):
+        """_configure_account tries chatmail servers in order."""
+        platform_config.extra = {"chatmail_servers": "first.example.org,second.example.org"}
+        adapter = DeltaChatAdapter(platform_config)
+        mock_rpc.get_all_accounts = AsyncMock(return_value=[])
+        mock_rpc.add_account = AsyncMock(return_value=4)
+        mock_rpc.set_config = AsyncMock()
+        mock_rpc.set_config_from_qr = AsyncMock(
+            side_effect=[RuntimeError("first down"), None]
+        )
+        mock_rpc.configure = AsyncMock()
+        mock_rpc.get_config = AsyncMock(return_value="bot@second.example.org")
+
+        result = await adapter._configure_account(mock_rpc)
+
+        assert result is True
+        assert adapter.account_id == 4
+        assert mock_rpc.set_config_from_qr.await_count == 2
+        second_call = mock_rpc.set_config_from_qr.await_args_list[1]
+        assert second_call.args == (4, "DCACCOUNT:https://second.example.org/new")
+        mock_rpc.configure.assert_awaited_once_with(4)
+
+    @pytest.mark.asyncio
+    async def test_configure_account_chatmail_all_servers_fail(
+        self, platform_config, mock_rpc
+    ):
+        """_configure_account raises when every chatmail server fails."""
+        platform_config.extra = {"chatmail_servers": "bad1.example.org,bad2.example.org"}
+        adapter = DeltaChatAdapter(platform_config)
+        mock_rpc.get_all_accounts = AsyncMock(return_value=[])
+        mock_rpc.add_account = AsyncMock(return_value=5)
+        mock_rpc.set_config = AsyncMock()
+        mock_rpc.set_config_from_qr = AsyncMock(side_effect=RuntimeError("down"))
+        mock_rpc.configure = AsyncMock()
+
+        with pytest.raises(RuntimeError):
+            await adapter._configure_account(mock_rpc)
+
+    @pytest.mark.asyncio
+    async def test_connect_generates_invite_link(
+        self, platform_config, monkeypatch
+    ):
+        """connect() configures an account and caches a SecureJoin invite link."""
+        from unittest.mock import MagicMock
+
+        adapter = DeltaChatAdapter(platform_config)
+
+        # Build a synchronous RPC mock whose methods the _AsyncRpc wrapper can
+        # run in the default executor.
+        sync_rpc = MagicMock()
+        sync_rpc.get_all_accounts = lambda: [{"id": 1}]
+        sync_rpc.set_config = lambda *args, **kwargs: None
+        sync_rpc.start_io = lambda *args, **kwargs: None
+        sync_rpc.get_chat_securejoin_qr_code_svg = lambda *args, **kwargs: (
+            "https://delta.chat/s?pk=abc",
+            "<svg></svg>",
+        )
+        sync_rpc.get_config = lambda *args, **kwargs: "bot@example.com"
+
+        fake_transport = MagicMock()
+        fake_transport.start = lambda: None
+        fake_transport.close = lambda: None
+
+        with patch(
+            "deltachat2.transport.IOTransport", return_value=fake_transport
+        ), patch("deltachat2.Rpc", return_value=sync_rpc), patch(
+            "adapter._check_dc_version", return_value=True
+        ), patch("asyncio.sleep", new_callable=AsyncMock):
+            adapter.get_my_address = AsyncMock(return_value="bot@example.com")
+            adapter._mark_disconnected = Mock()
+            result = await adapter.connect()
+
+        assert result is True
+        assert adapter.account_id == 1
+        assert adapter._invite_link == "https://delta.chat/s?pk=abc"
+        if adapter._event_loop_task:
+            adapter._event_loop_task.cancel()

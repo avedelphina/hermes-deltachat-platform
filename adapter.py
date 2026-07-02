@@ -553,12 +553,29 @@ class DeltaChatAdapter(BasePlatformAdapter):
             )
         )
 
+        # Onboarding / profile settings
+        self._email = g("DELTACHAT_EMAIL", "email", "auto").strip() or "auto"
+        self._password = g("DELTACHAT_PASSWORD", "password") or None
+        self._display_name = g("DELTACHAT_DISPLAY_NAME", "display_name", "Hermes")
+        self._avatar_path = _validate_avatar_path(
+            g("DELTACHAT_AVATAR_PATH", "avatar_path") or None, strict=False
+        )
+        self._data_dir = g("DELTACHAT_DATA_DIR", "data_dir") or None
+
+        chatmail_servers = os.getenv("DELTACHAT_CHATMAIL_SERVERS") or extra.get(
+            "chatmail_servers"
+        )
+        if not chatmail_servers:
+            chatmail_servers = os.getenv("DELTACHAT_CHATMAIL_SERVER", "nine.testrun.org")
+        self._chatmail_servers = _parse_chatmail_servers(chatmail_servers)
+
         # Runtime state for observability and crash recovery
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._crash_times: list[float] = []
         self._stats: dict[str, int] = {}
         self._lock = threading.RLock()
         self._self_addr: Optional[str] = None
+        self._invite_link: Optional[str] = None
 
     def _bump_stat(self, key: str, count: int = 1) -> None:
         """Increment an internal counter under the adapter lock."""
@@ -671,15 +688,22 @@ class DeltaChatAdapter(BasePlatformAdapter):
     def _get_dc_config_dir(self) -> str:
         """Get Delta Chat config directory path.
 
-        Returns:
-            Path to Delta Chat config directory (<HERMES_HOME>/deltachat-platform/)
+        Uses DELTACHAT_DATA_DIR if set, otherwise falls back to
+        <HERMES_HOME>/deltachat-platform/ for backward compatibility.
+        The directory is created with restrictive permissions when first accessed.
         """
         if self._dc_config_dir is None:
-            from gateway.config import get_hermes_home
+            if self._data_dir:
+                path = self._data_dir
+            else:
+                from gateway.config import get_hermes_home
 
-            self._dc_config_dir = os.path.join(get_hermes_home(), "deltachat-platform")
-            # Ensure directory exists
-            os.makedirs(self._dc_config_dir, exist_ok=True)
+                path = os.path.join(get_hermes_home(), "deltachat-platform")
+            # Validate/create the directory, but keep the original (unresolved) path
+            # so that existing tests and relative-path configs stay stable.
+            expanded = os.path.expanduser(path)
+            _safe_data_dir(expanded, create=True)
+            self._dc_config_dir = expanded
         return self._dc_config_dir
 
     def _get_rpc_server_path(self) -> str:
@@ -699,6 +723,86 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
         # Default - assume in PATH
         return "deltachat-rpc-server"
+
+    async def _apply_profile(self, rpc, account_id: int) -> None:
+        """Apply display name, avatar, and bot mode to the account.
+
+        Failures are logged but do not abort the connection.
+        """
+        try:
+            await rpc.set_config(account_id, "displayname", self._display_name)
+            logger.debug("Set display name to %r", self._display_name)
+        except Exception as e:
+            logger.warning("Could not set display name: %s", e)
+
+        try:
+            await rpc.set_config(account_id, "bot", "1")
+            logger.debug("Bot mode enabled")
+        except Exception as e:
+            logger.warning("Could not enable bot mode: %s", e)
+
+        if self._avatar_path:
+            try:
+                resolved = _validate_avatar_path(self._avatar_path, strict=True)
+                await rpc.set_config(account_id, "selfavatar", resolved)
+                logger.debug("Set avatar to %r", resolved)
+            except Exception as e:
+                logger.warning("Could not set avatar: %s", e)
+
+    async def _configure_account(self, rpc) -> bool:
+        """Select an existing account or create and configure a new one."""
+        accounts = await rpc.get_all_accounts()
+        if accounts:
+            self.account_id = accounts[0]["id"]
+            logger.info("Using existing Delta Chat account: %s", self.account_id)
+            await self._apply_profile(rpc, self.account_id)
+            return True
+
+        logger.info("No Delta Chat account found; creating one")
+        account_id = await rpc.add_account()
+        if isinstance(account_id, dict):
+            account_id = account_id.get("id", account_id.get("account_id"))
+        if not isinstance(account_id, int):
+            raise RuntimeError(f"add_account returned unexpected value: {account_id!r}")
+        self.account_id = account_id
+        logger.info("Created Delta Chat account: %s", self.account_id)
+
+        await self._apply_profile(rpc, self.account_id)
+
+        if (
+            self._email
+            and self._email != "auto"
+            and self._password
+        ):
+            logger.info("Configuring account with email %s", self._email)
+            await rpc.add_or_update_transport(
+                self.account_id,
+                {"addr": self._email, "password": self._password},
+            )
+            await rpc.configure(self.account_id)
+        else:
+            await self._create_chatmail_account(rpc)
+
+        return True
+
+    async def _create_chatmail_account(self, rpc) -> None:
+        """Create a chatmail account by trying configured servers in order."""
+        last_error: Optional[Exception] = None
+        servers = self._chatmail_servers or ["nine.testrun.org"]
+        for server in servers:
+            logger.info("Trying chatmail server %s", server)
+            try:
+                await rpc.set_config_from_qr(
+                    self.account_id, f"DCACCOUNT:https://{server}/new"
+                )
+                await rpc.configure(self.account_id)
+                addr = await rpc.get_config(self.account_id, "addr")
+                logger.info("Chatmail account ready: %s", addr)
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning("Chatmail server %s failed: %s", server, e)
+        raise last_error or RuntimeError("All configured chatmail servers failed")
 
     async def connect(self) -> bool:
         """Connect to Delta Chat via RPC server.
@@ -748,29 +852,25 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 self._cleanup()
                 return False
 
-            # Get or create account - use first available
-            accounts = await self.rpc.get_all_accounts()
-            if accounts:
-                self.account_id = accounts[0]["id"]
-                logger.info(f"Using Delta Chat account: {self.account_id}")
-            else:
-                logger.error(
-                    f"No Delta Chat accounts found in {dc_accounts_path}. "
-                    "Run: python ~/.hermes/plugins/deltachat-platform/setup.py"
-                )
+            # Select existing account or create/configure a new one
+            if not await self._configure_account(self.rpc):
                 self._cleanup()
                 return False
 
-            # Enable bot mode: auto-accept contact requests
-            try:
-                await self.rpc.set_config(self.account_id, "bot", "1")
-                logger.debug("Bot mode enabled: contact requests will be auto-accepted")
-            except Exception as e:
-                logger.warning(f"Could not set bot config: {e}")
-
             # Start IO for the account to receive events
             await self.rpc.start_io(self.account_id)
-            logger.debug(f"Started IO for account {self.account_id}")
+            logger.debug("Started IO for account %s", self.account_id)
+
+            # Generate a SecureJoin invite link now that IO is running.
+            try:
+                link, _svg = await self.rpc.get_chat_securejoin_qr_code_svg(
+                    self.account_id, None
+                )
+                self._invite_link = link
+                logger.debug("SecureJoin invite link: %s", link)
+            except Exception as e:
+                logger.warning("Could not generate SecureJoin invite link: %s", e)
+                self._invite_link = None
 
             # Register graceful shutdown signals.
             try:
@@ -824,6 +924,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self.rpc = None
         self.account_id = None
         self._self_addr = None
+        self._invite_link = None
 
     def _signal_handler(self):
         """Handle SIGTERM/SIGINT by scheduling disconnect on the event loop."""
@@ -864,6 +965,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
             "connected": self.rpc is not None and thread_alive,
             "running": running,
             "account_addr": self._self_addr,
+            "invite_link": self._invite_link,
             "crashes_last_60s": len(crashes),
             "last_crash": crashes[-1] if crashes else None,
             "stats": stats,
@@ -2244,8 +2346,10 @@ def validate_config(config) -> bool:
         raise ValueError(f"Invalid DELTACHAT_GROUP_POLICY: {group_policy!r}")
 
     # Lightweight path checks (do not create directories or require the binary).
+    from gateway.config import get_hermes_home
+
     data_dir = os.getenv("DELTACHAT_DATA_DIR") or extra.get(
-        "data_dir", "~/.hermes/deltachat-data"
+        "data_dir", os.path.join(get_hermes_home(), "deltachat-platform")
     )
     _safe_data_dir(data_dir, create=False)
 
@@ -2298,11 +2402,18 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     result = {"rpc_server": rpc_server}
 
     # Add onboarding / profile fields if set
+    from gateway.config import get_hermes_home
+
     email = os.getenv("DELTACHAT_EMAIL")
     if email:
         result["email"] = email
-    result["data_dir"] = os.getenv("DELTACHAT_DATA_DIR", "~/.hermes/deltachat-data")
+    result["data_dir"] = os.getenv(
+        "DELTACHAT_DATA_DIR", os.path.join(get_hermes_home(), "deltachat-platform")
+    )
     result["display_name"] = os.getenv("DELTACHAT_DISPLAY_NAME", "Hermes")
+    avatar_path = os.getenv("DELTACHAT_AVATAR_PATH")
+    if avatar_path:
+        result["avatar_path"] = avatar_path
     chatmail_servers = os.getenv("DELTACHAT_CHATMAIL_SERVERS")
     if not chatmail_servers:
         chatmail_servers = os.getenv("DELTACHAT_CHATMAIL_SERVER", "nine.testrun.org")
