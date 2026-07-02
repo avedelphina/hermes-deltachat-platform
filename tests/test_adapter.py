@@ -12,6 +12,7 @@ import pytest
 
 from adapter import (
     DC_MESSAGE_MAX_LEN,
+    DeltaChatAdapter,
     _async_retry,
     _cfg,
     _is_valid_email,
@@ -222,3 +223,40 @@ class TestCfg:
         monkeypatch.delenv("DELTACHAT_TEST_KEY", raising=False)
         config = self._FakeConfig({})
         assert _cfg(config, "DELTACHAT_TEST_KEY", "test_key", "default") == "default"
+
+
+class TestMentionDetection:
+    """Unit tests for the group mention detector."""
+
+    def test_at_mention_matches(self, platform_config):
+        platform_config.extra = {"display_name": "Hermes"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("Hello @Hermes, how are you?") is True
+
+    def test_bare_name_mention_matches(self, platform_config):
+        platform_config.extra = {"display_name": "Hermes"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("Hermes please help") is True
+
+    def test_case_insensitive(self, platform_config):
+        platform_config.extra = {"display_name": "Hermes"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("hey @hermes") is True
+        assert adapter._is_mentioned("HERMES do this") is True
+
+    def test_substring_does_not_match(self, platform_config):
+        platform_config.extra = {"display_name": "Hermes"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("Hermesssss") is False
+        assert adapter._is_mentioned("@Hermesss") is False
+
+    def test_punctuation_boundary_still_matches(self, platform_config):
+        platform_config.extra = {"display_name": "Hermes"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("@Hermes!") is True
+        assert adapter._is_mentioned("(@Hermes)") is True
+
+    def test_empty_text_is_not_mentioned(self, platform_config):
+        platform_config.extra = {"display_name": "Hermes"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("") is False

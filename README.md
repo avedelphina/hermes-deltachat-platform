@@ -33,6 +33,9 @@ Delta Chat is a decentralized private messenger with end-to-end encryption, and 
 
 **Advanced:**
 - Drop the agent into a **group chat** to assist everyone
+- Require `@DisplayName` mentions in groups so the bot only replies when addressed
+- Send images by URL; the adapter downloads and forwards them safely
+- Rich metadata on every incoming/outgoing message for skills and downstream tooling
 - Run **multiple independent agents** with their own Delta Chat accounts
 - Give the AI sandboxed access to the full **Delta Chat JSON-RPC API** to automate your messaging directly
 
@@ -148,10 +151,19 @@ pip install aiortc
 
 **NixOS** (add to your `python3.withPackages` in flake.nix):
 ```nix
-(python3.withPackages (ps: with ps; [ deltachat2 aiortc ]))
+(python3.withPackages (ps: with ps; [ deltachat2 aiortc httpx ]))
 ```
 
 aiortc brings in `av` (PyAV/libav for audio resampling), `aioice`, and Opus support — all required for the WebRTC call pipeline.
+
+#### httpx (required for URL image sending)
+
+**pip:**
+```bash
+pip install httpx
+```
+
+`httpx` is only needed if you want the AI to be able to send images by URL.
 
 ### 2. (Optional) Configure RPC server path
 
@@ -183,9 +195,14 @@ hermes gateway start
 
 ## Configuration
 
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full environment-variable reference.
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `DELTACHAT_RPC_SERVER` | No | `deltachat-rpc-server` | Path to RPC binary |
+| `DELTACHAT_EMAIL` | No | `auto` | Bot email or `auto` for chatmail |
+| `DELTACHAT_DISPLAY_NAME` | No | `Hermes` | Name shown to contacts |
+| `DELTACHAT_REQUIRE_MENTION` | No | `false` | Require `@DisplayName` mention in groups |
 | `DELTACHAT_HOME_CHANNEL` | No | — | Chat ID for cron/proactive delivery (or use `/sethome` in chat) |
 | `DELTACHAT_ENABLE_RAW_RPC` | No | — | Enable unrestricted `dc_rpc_call` tool |
 
@@ -205,6 +222,8 @@ hermes -p personal gateway start
 
 ## Documentation
 
+- [Configuration](docs/CONFIGURATION.md) — full environment-variable reference
+- [Security](docs/SECURITY.md) — URL image restrictions, permissions, RPC access
 - [Voice Calls](docs/voice-calls.md) — setup, tuning, TURN servers, Voxtral STT
 - [Version Compatibility](docs/version-compatibility.md) — version requirements
 - [File Structure](docs/file-structure.md) — directory layout

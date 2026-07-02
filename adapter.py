@@ -15,9 +15,12 @@ import signal
 import sys
 import asyncio
 import logging
+import mimetypes
+import tempfile
 import threading
 import time
 import unicodedata
+import urllib.parse
 from collections import deque
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -53,6 +56,9 @@ MIN_DC_VERSION = "2.51.0"
 
 # DC truncates at ~3800; split conservatively
 DC_MESSAGE_MAX_LEN = 3600
+
+# Maximum image download size for send_image_file() URLs (25 MiB)
+_MAX_IMAGE_SIZE = 25 * 1024 * 1024
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
@@ -553,6 +559,10 @@ class DeltaChatAdapter(BasePlatformAdapter):
             )
         )
 
+        self._require_mention = g(
+            "DELTACHAT_REQUIRE_MENTION", "require_mention", "false"
+        ).lower() in ("1", "true", "yes")
+
         # Onboarding / profile settings
         self._email = g("DELTACHAT_EMAIL", "email", "auto").strip() or "auto"
         self._password = g("DELTACHAT_PASSWORD", "password") or None
@@ -582,6 +592,58 @@ class DeltaChatAdapter(BasePlatformAdapter):
         with self._lock:
             self._stats[key] = self._stats.get(key, 0) + count
 
+    def _message_metadata(
+        self,
+        chat_id: Any,
+        msg_id: Any,
+        from_id: Any,
+        is_group: bool,
+        token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build metadata dict for an incoming MessageEvent."""
+        meta: Dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "message_id": str(msg_id),
+            "is_group": is_group,
+        }
+        if from_id is not None:
+            meta["from_id"] = str(from_id)
+        if token:
+            meta["dc_token"] = token
+        return meta
+
+    def _send_result(
+        self,
+        chat_id: str,
+        msg_id: Optional[int],
+        error: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Build a SendResult, including metadata when supported."""
+        if error is not None:
+            try:
+                return SendResult(success=False, error=error)
+            except TypeError:
+                return SendResult(success=False)
+
+        meta: Dict[str, Any] = dict(metadata or {})
+        meta.setdefault("chat_id", str(chat_id))
+        if msg_id is not None:
+            meta.setdefault("message_id", str(msg_id))
+        try:
+            token = _chat_id_to_token.get(int(chat_id))
+            if token:
+                meta.setdefault("dc_token", token)
+        except (ValueError, TypeError):
+            pass
+
+        try:
+            return SendResult(
+                success=True, message_id=str(msg_id) if msg_id else None, metadata=meta
+            )
+        except TypeError:
+            return SendResult(success=True, message_id=str(msg_id) if msg_id else None)
+
     def _check_dm(self, sender_email: str, is_verified: bool) -> Optional[str]:
         if self._dm_policy == "disabled":
             return "Sorry, this bot does not accept direct messages."
@@ -605,6 +667,41 @@ class DeltaChatAdapter(BasePlatformAdapter):
         ):
             return "Sorry, you are not authorized for group interactions."
         return None
+
+    def _is_mentioned(self, text: str) -> bool:
+        """Return True if the message text mentions the bot by display name.
+
+        Matches whole-word `@DisplayName` or `DisplayName`, case-insensitive.
+        Substrings like `Hermesss` do not count.
+        """
+        if not text or not self._display_name:
+            return False
+        name = re.escape(self._display_name)
+        pattern = rf"(?:^|\W)@{name}(?:\W|$)|(?:^|\W){name}(?:\W|$)"
+        return re.search(pattern, text, re.IGNORECASE) is not None
+
+    async def _check_mention(
+        self, text: str, chat_type: str, chat_id: str
+    ) -> bool:
+        """Drop group messages that do not mention the bot when required.
+
+        Returns True if the message should be processed.
+        """
+        if chat_type != "group" or not self._require_mention:
+            return True
+        if not text or text.startswith("/"):
+            return True
+        if self._is_mentioned(text):
+            return True
+
+        logger.debug("Ignoring unmentioned group message in chat %s", chat_id)
+        self._bump_stat("messages_rejected")
+        if self._send_rejection_replies:
+            await self.send(
+                str(chat_id),
+                f"Please mention me (@{self._display_name}) to talk in this group.",
+            )
+        return False
 
     async def _gate_inbound(self, chat_id, msg_id, from_id) -> bool:
         """Run dedup, rate-limit, and DM/group policy checks for an inbound message.
@@ -1083,9 +1180,9 @@ body {{
                 # In shared-history mode the placing agent's "call connected" ack
                 # also lands here (same session), so drop that one line.
                 if self._call_manager.consume_call_ack(chat_id):
-                    return SendResult(success=True, message_id=None)
+                    return self._send_result(chat_id, None)
                 asyncio.create_task(self._call_manager.play_response(chat_id, content))
-                return SendResult(success=True, message_id=None)
+                return self._send_result(chat_id, None)
             # Reply from the text/chat thread while a call is active (e.g. the
             # agent's "calling you now" line in separate-thread mode, or a
             # concurrent DM) — deliver it as a normal Delta Chat message instead
@@ -1093,13 +1190,12 @@ body {{
         # Suppress the AI's reply to the internal "call ended" note so we don't
         # text the user a stray message after a call.
         if self._call_manager and self._call_manager.consume_drop_response(chat_id):
-            return SendResult(success=True, message_id=None)
+            return self._send_result(chat_id, None)
 
         try:
             if not self.rpc or not self.account_id:
-                return SendResult(
-                    success=False,
-                    error="Delta Chat not connected",
+                return self._send_result(
+                    chat_id, None, error="Delta Chat not connected"
                 )
 
             # Delta Chat renders plain text only; strip common markdown syntax.
@@ -1149,20 +1245,14 @@ body {{
                 return msg_id
 
             msg_id = await _async_retry(_do_send, max_attempts=3, base_delay=1.0)
-            logger.debug(f"Sent message {msg_id} to chat {chat_id}")
+            logger.debug("Sent message %s to chat %s", msg_id, chat_id)
             self._bump_stat("messages_sent")
-            return SendResult(
-                success=True,
-                message_id=str(msg_id) if msg_id is not None else None,
-            )
+            return self._send_result(chat_id, msg_id)
 
         except Exception as e:
-            logger.error(f"Error sending message to chat {chat_id}: {e}")
+            logger.error("Error sending message to chat %s: %s", chat_id, e)
             self._bump_stat("messages_send_failed")
-            return SendResult(
-                success=False,
-                error=str(e),
-            )
+            return self._send_result(chat_id, None, error=str(e))
 
     async def send_file(
         self,
@@ -1180,7 +1270,9 @@ body {{
         """
         try:
             if not self.rpc or not self.account_id:
-                return SendResult(success=False, error="Delta Chat not connected")
+                return self._send_result(
+                    chat_id, None, error="Delta Chat not connected"
+                )
 
             from deltachat2.types import MsgData
 
@@ -1196,14 +1288,14 @@ body {{
                 )
 
             msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
-            logger.debug(f"Sent file {file_path} as message {msg_id} to chat {chat_id}")
+            logger.debug("Sent file %s as message %s to chat %s", file_path, msg_id, chat_id)
             self._bump_stat("files_sent")
-            return SendResult(success=True, message_id=str(msg_id))
+            return self._send_result(chat_id, msg_id)
 
         except Exception as e:
-            logger.error(f"Error sending file {file_path} to chat {chat_id}: {e}")
+            logger.error("Error sending file %s to chat %s: %s", file_path, chat_id, e)
             self._bump_stat("files_send_failed")
-            return SendResult(success=False, error=str(e))
+            return self._send_result(chat_id, None, error=str(e))
 
     async def send_document(
         self,
@@ -1229,6 +1321,59 @@ body {{
             metadata=metadata,
         )
 
+    async def _download_image_url(self, url: str) -> str:
+        """Download an image URL to a temporary file and return the path.
+
+        Validates scheme, Content-Type, and size (25 MiB max).
+        The caller is responsible for deleting the returned temp file.
+        """
+        try:
+            import httpx
+        except ImportError as e:
+            raise RuntimeError("httpx is required to download image URLs") from e
+
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(f"Invalid image URL: {url}")
+
+        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+            headers = {"Accept": "image/*"}
+            async with client.stream("GET", url, headers=headers) as resp:
+                resp.raise_for_status()
+                content_type = resp.headers.get("content-type", "")
+                if not content_type.startswith("image/"):
+                    raise ValueError(
+                        f"URL did not return an image (Content-Type: {content_type})"
+                    )
+                content_length = resp.headers.get("content-length")
+                if content_length and int(content_length) > _MAX_IMAGE_SIZE:
+                    raise ValueError("Image exceeds 25 MiB limit")
+
+                suffix = os.path.splitext(parsed.path)[1]
+                if not suffix:
+                    ext = mimetypes.guess_extension(
+                        content_type.split(";")[0].strip()
+                    )
+                    suffix = ext or ".bin"
+                fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+                os.close(fd)
+
+                downloaded = 0
+                try:
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=8192):
+                            downloaded += len(chunk)
+                            if downloaded > _MAX_IMAGE_SIZE:
+                                raise ValueError("Image exceeds 25 MiB limit")
+                            f.write(chunk)
+                except Exception:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
+        return tmp_path
+
     async def send_image_file(
         self,
         chat_id: str,
@@ -1238,11 +1383,11 @@ body {{
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send an image file to a Delta Chat chat.
+        """Send an image file or image URL to a Delta Chat chat.
 
         Args:
             chat_id: Delta Chat chat ID
-            image_path: Path to image file on disk
+            image_path: Path to image file on disk, or an http(s) URL
             caption: Optional caption for the image
             reply_to: Optional message ID to reply to
             metadata: Optional metadata
@@ -1250,9 +1395,18 @@ body {{
         Returns:
             SendResult with success status and message ID
         """
+        tmp_path: Optional[str] = None
         try:
             if not self.rpc or not self.account_id:
-                return SendResult(success=False, error="Delta Chat not connected")
+                return self._send_result(
+                    chat_id, None, error="Delta Chat not connected"
+                )
+
+            if image_path.startswith(("http://", "https://")):
+                tmp_path = await self._download_image_url(image_path)
+                file_path = tmp_path
+            else:
+                file_path = image_path
 
             from deltachat2.types import MsgData, MessageViewtype
 
@@ -1261,7 +1415,7 @@ body {{
                     self.account_id,
                     int(chat_id),
                     MsgData(
-                        file=image_path,
+                        file=file_path,
                         text=caption or "",
                         viewtype=MessageViewtype.IMAGE,
                         quoted_message_id=int(reply_to) if reply_to else None,
@@ -1269,15 +1423,19 @@ body {{
                 )
 
             msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
-            logger.debug(
-                f"Sent image {image_path} as message {msg_id} to chat {chat_id}"
-            )
+            logger.debug("Sent image %s as message %s to chat %s", image_path, msg_id, chat_id)
             self._bump_stat("images_sent")
-            return SendResult(success=True, message_id=str(msg_id))
+            return self._send_result(chat_id, msg_id)
         except Exception as e:
-            logger.error(f"Error sending image {image_path} to chat {chat_id}: {e}")
+            logger.error("Error sending image %s to chat %s: %s", image_path, chat_id, e)
             self._bump_stat("images_send_failed")
-            return SendResult(success=False, error=str(e))
+            return self._send_result(chat_id, None, error=str(e))
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     async def send_voice(
         self,
@@ -1312,16 +1470,14 @@ body {{
 
         # Validate audio file exists and is accessible
         if not os.path.exists(audio_path):
-            logger.error(f"send_voice: Audio file does not exist: {audio_path}")
-            return SendResult(
-                success=False,
-                error=f"Audio file not found: {audio_path}",
+            logger.error("send_voice: Audio file does not exist: %s", audio_path)
+            return self._send_result(
+                chat_id, None, error=f"Audio file not found: {audio_path}"
             )
         if not os.path.isfile(audio_path):
-            logger.error(f"send_voice: Path is not a file: {audio_path}")
-            return SendResult(
-                success=False,
-                error=f"Path is not a file: {audio_path}",
+            logger.error("send_voice: Path is not a file: %s", audio_path)
+            return self._send_result(
+                chat_id, None, error=f"Path is not a file: {audio_path}"
             )
         file_size = os.path.getsize(audio_path)
         logger.info(f"send_voice: Audio file exists, size={file_size} bytes")
@@ -1337,13 +1493,14 @@ body {{
                         "None" if not self.account_id else self.account_id,
                     )
                 )
-                return SendResult(
-                    success=False,
-                    error="Delta Chat not connected",
+                return self._send_result(
+                    chat_id, None, error="Delta Chat not connected"
                 )
 
             logger.debug(
-                f"send_voice: Sending to account_id={self.account_id}, chat_id={chat_id}"
+                "send_voice: Sending to account_id=%s, chat_id=%s",
+                self.account_id,
+                chat_id,
             )
 
             async def _do_send():
@@ -1359,25 +1516,24 @@ body {{
 
             msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
             logger.info(
-                f"Sent voice message {msg_id} to chat {chat_id}, "
-                f"file={audio_path}, size={file_size}"
+                "Sent voice message %s to chat %s, file=%s, size=%s",
+                msg_id,
+                chat_id,
+                audio_path,
+                file_size,
             )
             self._bump_stat("voices_sent")
-            return SendResult(
-                success=True,
-                message_id=str(msg_id),
-            )
+            return self._send_result(chat_id, msg_id)
 
         except Exception as e:
             import traceback
 
-            logger.error(f"Error in send_voice: {e}")
-            logger.debug(f"send_voice exception traceback:\n{traceback.format_exc()}")
-            self._bump_stat("voices_send_failed")
-            return SendResult(
-                success=False,
-                error=str(e),
+            logger.error("Error in send_voice: %s", e)
+            logger.debug(
+                "send_voice exception traceback:\n%s", traceback.format_exc()
             )
+            self._bump_stat("voices_send_failed")
+            return self._send_result(chat_id, None, error=str(e))
 
     async def send_location(
         self,
@@ -1404,9 +1560,8 @@ body {{
         """
         try:
             if not self.rpc or not self.account_id:
-                return SendResult(
-                    success=False,
-                    error="Delta Chat not connected",
+                return self._send_result(
+                    chat_id, None, error="Delta Chat not connected"
                 )
 
             from deltachat2.types import MsgData
@@ -1420,20 +1575,14 @@ body {{
                 )
 
             msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
-            logger.debug(f"Sent location to chat {chat_id}")
+            logger.debug("Sent location to chat %s", chat_id)
             self._bump_stat("locations_sent")
-            return SendResult(
-                success=True,
-                message_id=str(msg_id),
-            )
+            return self._send_result(chat_id, msg_id)
 
         except Exception as e:
-            logger.error(f"Error sending location to chat {chat_id}: {e}")
+            logger.error("Error sending location to chat %s: %s", chat_id, e)
             self._bump_stat("locations_send_failed")
-            return SendResult(
-                success=False,
-                error=str(e),
-            )
+            return self._send_result(chat_id, None, error=str(e))
 
     # ------------------------------------------------------------------
     # Container-to-host file path mapping
@@ -1741,6 +1890,9 @@ body {{
             chat_type = "group" if chat.get("chat_type") == "Group" else "dm"
             chat_name = chat.get("name", f"Chat {chat_id}")
 
+            if not await self._check_mention(text, chat_type, chat_id):
+                return
+
             # Build source
             source = self.build_source(
                 chat_id=str(chat_id),
@@ -1754,6 +1906,7 @@ body {{
             # Hermes doesn't misparse the token as part of the command argument.
             if text.startswith("/"):
                 text_with_token = text
+                token = None
             else:
                 token = await _get_or_create_chat_token(
                     self.rpc, self.account_id, int(chat_id)
@@ -1766,6 +1919,9 @@ body {{
                 message_type=MessageType.TEXT,
                 source=source,
                 message_id=str(msg_id),
+                metadata=self._message_metadata(
+                    chat_id, msg_id, from_id, chat_type == "group", token
+                ),
             )
             await self.handle_message(message_event)
 
@@ -1900,6 +2056,14 @@ body {{
 
         token = await _get_or_create_chat_token(self.rpc, self.account_id, int(chat_id))
 
+        caption = msg.get("text", "") or ""
+        if not await self._check_mention(caption, chat_type, chat_id):
+            return
+
+        meta = self._message_metadata(
+            chat_id, msg_id, from_id, chat_type == "group", token
+        )
+
         from deltachat2.types import MessageViewtype
 
         # DC sometimes reports viewType=Text for image+caption messages.
@@ -1938,6 +2102,7 @@ body {{
                 message_id=str(msg_id),
                 media_urls=[resolved] if resolved else [],
                 media_types=[file_mime or ("audio/ogg" if is_voice else "audio/mpeg")],
+                metadata=meta,
             )
             await self.handle_message(message_event)
 
@@ -1966,6 +2131,7 @@ body {{
                 message_id=str(msg_id),
                 media_urls=[resolved] if resolved else [],
                 media_types=[file_mime or "image/jpeg"],
+                metadata=meta,
             )
             await self.handle_message(message_event)
 
@@ -1998,6 +2164,7 @@ body {{
                 message_id=str(msg_id),
                 media_urls=[resolved] if resolved else [],
                 media_types=[file_mime or "application/octet-stream"],
+                metadata=meta,
             )
             await self.handle_message(message_event)
 

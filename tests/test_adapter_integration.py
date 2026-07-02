@@ -856,3 +856,279 @@ class TestOnboarding:
         assert adapter._invite_link == "https://delta.chat/s?pk=abc"
         if adapter._event_loop_task:
             adapter._event_loop_task.cancel()
+
+
+class TestMentions:
+    """Test group mention detection and DELTACHAT_REQUIRE_MENTION."""
+
+    @pytest.fixture
+    def group_event(self):
+        return {"kind": "IncomingMsg", "chat_id": 1, "msg_id": 10}
+
+    @pytest.mark.asyncio
+    async def test_require_mention_blocks_unmentioned_group_message(
+        self, platform_config, mock_rpc, group_event
+    ):
+        platform_config.extra = {"require_mention": "true", "display_name": "Bot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "hello there",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        mock_rpc.get_contact = AsyncMock(
+            return_value={"address": "user@example.com"}
+        )
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_not_called()
+        adapter.send.assert_awaited_once()
+        args = adapter.send.await_args.args
+        assert "@Bot" in args[1]
+
+    @pytest.mark.asyncio
+    async def test_require_mention_allows_mentioned_group_message(
+        self, platform_config, mock_rpc, group_event
+    ):
+        platform_config.extra = {"require_mention": "true", "display_name": "Bot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "@Bot hello there",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        mock_rpc.get_contact = AsyncMock(
+            return_value={"address": "user@example.com"}
+        )
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_require_mention_skips_commands(
+        self, platform_config, mock_rpc, group_event
+    ):
+        platform_config.extra = {"require_mention": "true", "display_name": "Bot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "/help",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        mock_rpc.get_contact = AsyncMock(
+            return_value={"address": "user@example.com"}
+        )
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_require_mention_applies_to_image_caption(
+        self, platform_config, mock_rpc, group_event
+    ):
+        platform_config.extra = {"require_mention": "true", "display_name": "Bot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "look at this",
+                "view_type": "Image",
+                "from_id": 11,
+                "file": "/tmp/photo.jpg",
+                "file_mime": "image/jpeg",
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        mock_rpc.get_contact = AsyncMock(
+            return_value={"address": "user@example.com"}
+        )
+        adapter._resolve_blob_path = lambda x: x
+        adapter._copy_to_hermes_cache = lambda src, kind: src
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_not_called()
+
+
+class TestMetadata:
+    """Test incoming/outgoing metadata enrichment."""
+
+    @pytest.mark.asyncio
+    async def test_message_event_has_metadata(
+        self, platform_config, mock_rpc
+    ):
+        platform_config.extra = {"dm_policy": "open"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "hello",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Single", "name": "DM"}
+        )
+        mock_rpc.get_contact = AsyncMock(
+            return_value={"address": "user@example.com"}
+        )
+
+        await adapter._handle_incoming_message(
+            {"kind": "IncomingMsg", "chat_id": 7, "msg_id": 42}
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.metadata["chat_id"] == "7"
+        assert event.metadata["message_id"] == "42"
+        assert event.metadata["from_id"] == "11"
+        assert event.metadata["is_group"] is False
+        assert "dc_token" in event.metadata
+
+    @pytest.mark.asyncio
+    async def test_send_result_includes_metadata(
+        self, platform_config, mock_rpc
+    ):
+        from adapter import _chat_id_to_token
+
+        _chat_id_to_token[7] = "abc123"
+        try:
+            adapter = DeltaChatAdapter(platform_config)
+            adapter.rpc = mock_rpc
+            adapter.account_id = 1
+            adapter._running = False
+            mock_rpc.send_msg = AsyncMock(return_value=99)
+
+            result = await adapter.send("7", "Hello")
+
+            assert result.success is True
+            assert result.metadata["chat_id"] == "7"
+            assert result.metadata["message_id"] == "99"
+            assert result.metadata["dc_token"] == "abc123"
+        finally:
+            _chat_id_to_token.pop(7, None)
+
+
+class TestUrlImageSending:
+    """Test send_image_file() with image URLs."""
+
+    def _mock_httpx_stream(self, content_type, content, content_length=None):
+        from unittest.mock import AsyncMock, MagicMock
+
+        resp = MagicMock()
+        resp.headers = {"content-type": content_type}
+        if content_length is not None:
+            resp.headers["content-length"] = str(content_length)
+        resp.raise_for_status = MagicMock()
+
+        async def _aiter_bytes(**kwargs):
+            yield content
+
+        resp.aiter_bytes = _aiter_bytes
+
+        stream_cm = MagicMock()
+        stream_cm.__aenter__ = AsyncMock(return_value=resp)
+        stream_cm.__aexit__ = AsyncMock(return_value=False)
+
+        client = MagicMock()
+        client.stream = MagicMock(return_value=stream_cm)
+        client_cm = MagicMock()
+        client_cm.__aenter__ = AsyncMock(return_value=client)
+        client_cm.__aexit__ = AsyncMock(return_value=False)
+
+        return client_cm
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_with_url_success(
+        self, platform_config, mock_rpc
+    ):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+        mock_rpc.send_msg = AsyncMock(return_value=123)
+
+        client_cm = self._mock_httpx_stream("image/png", b"pngdata", 7)
+        with patch("httpx.AsyncClient", return_value=client_cm):
+            result = await adapter.send_image_file(
+                "7", "https://example.com/photo.png"
+            )
+
+        assert result.success is True
+        assert result.message_id == "123"
+        mock_rpc.send_msg.assert_awaited_once()
+        args = mock_rpc.send_msg.await_args.args
+        assert args[0] == 1
+        assert args[1] == 7
+        assert args[2].file.endswith(".png")
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_with_url_rejects_non_image(
+        self, platform_config, mock_rpc
+    ):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+
+        client_cm = self._mock_httpx_stream("text/plain", b"not an image", 12)
+        with patch("httpx.AsyncClient", return_value=client_cm):
+            result = await adapter.send_image_file(
+                "7", "https://example.com/file.txt"
+            )
+
+        assert result.success is False
+        assert "image" in result.error.lower()
+        mock_rpc.send_msg.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_with_url_size_limit(
+        self, platform_config, mock_rpc
+    ):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+
+        client_cm = self._mock_httpx_stream(
+            "image/png", b"x", content_length=50 * 1024 * 1024
+        )
+        with patch("httpx.AsyncClient", return_value=client_cm):
+            result = await adapter.send_image_file(
+                "7", "https://example.com/huge.png"
+            )
+
+        assert result.success is False
+        assert "25" in result.error or "limit" in result.error.lower()
+        mock_rpc.send_msg.assert_not_called()
