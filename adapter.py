@@ -945,7 +945,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 logger.warning("Chatmail server %s failed: %s", server, e)
         raise last_error or RuntimeError("All configured chatmail servers failed")
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Delta Chat via RPC server.
 
         Starts the RPC server process, initializes the client,
