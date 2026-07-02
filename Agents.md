@@ -1,113 +1,279 @@
-# deltachat-hermes – Agent Reference
+# Delta Chat × Hermes — Agent Reference
 
-## About This File
+> This file is intended for AI coding agents. The reader is assumed to know nothing about the project.
 
-This file is a living document. Agents should improve it over time when they discover something important that belongs here — but the bar is high: **prefer a code comment at the site where the knowledge is needed.** Only escalate to this file when the insight is cross-cutting, environmental, or genuinely has no good home in the code (e.g. nix environment quirks, RPC naming conventions, Hermes integration contracts). If it fits in a `# why:` comment next to the relevant line, put it there instead.
+## Project Overview
 
-## Environment (NixOS)
+This is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) platform plugin that adds **Delta Chat** as a gateway channel. It lets users talk to an AI assistant through Delta Chat — a decentralized, end-to-end encrypted messenger built on email — supporting text, voice messages, images, files, locations, live voice calls, and webxdc mini-apps.
 
-This project runs on NixOS. All tools are provided via `nix develop`. Never run `python3`, `pytest`, `pip`, or other commands bare — they won't be found.
+The project is a pure-Python plugin (no compiled extensions of its own). It is loaded by Hermes at runtime from `~/.hermes/plugins/deltachat-platform/` and communicates with the Delta Chat core through the `deltachat-rpc-server` binary via line-delimited JSON-RPC.
+
+## Technology Stack
+
+- **Language**: Python 3 (targeted for the Hermes environment, commonly Python 3.12)
+- **Plugin host**: Hermes Agent gateway
+- **External binary dependency**: `deltachat-rpc-server` (Delta Chat core JSON-RPC server)
+- **Optional voice-call dependencies**: `aiortc`, `av` (PyAV), plus STT/TTS providers configured in Hermes
+- **Build/dev environment**: NixOS flake (`flake.nix`)
+- **Formatter/linter**: `black`, `flake8`
+- **Test runner**: `pytest`
+- **License**: MPL-2.0
+
+### Key Files
+
+| File | Purpose |
+|---|---|
+| `__init__.py` | Plugin entry point; calls `register_platform()` and `register_rpc_tools()` |
+| `adapter.py` | Main platform adapter (~2100 lines); connection, event loop, messaging, RPC tools |
+| `call_handler.py` | WebRTC voice call handler (~1600 lines); incoming/outgoing calls, STT/TTS bridge |
+| `setup.py` | Interactive Delta Chat account setup helper |
+| `plugin.yaml` | Plugin manifest, name, description, environment variable schema |
+| `flake.nix` | Nix development shell and package derivation |
+| `Makefile` | Shortcuts for test / lint / format / check / clean |
+| `deltachat-rpc-openrpc.json` | Frozen copy of the RPC spec; use `jq` to inspect methods |
+| `vendor/deltachat2/` | Vendored minimal Python client for the RPC server |
+| `tests/` | pytest suite with mocked Hermes gateway classes |
+| `skills/webxdc-converter/` | Bundled skill for packaging web apps as `.xdc` mini apps |
+| `docs/` | Human-readable documentation (voice calls, NixOS install, troubleshooting, etc.) |
+
+## Runtime Architecture
+
+1. Hermes loads the plugin and calls `register(ctx)` in `__init__.py`.
+2. `register_platform()` registers `DeltaChatAdapter` as the platform adapter.
+3. `register_rpc_tools()` registers Delta Chat-specific tools (`dc_rpc_spec`, `dc_chat_rpc_spec`, `dc_safe_rpc_call`, `dc_start_call`, `dc_end_call`, and optionally `dc_rpc_call`).
+4. When the gateway starts, `DeltaChatAdapter.connect()`:
+   - Resolves `DELTACHAT_RPC_SERVER` / config `extra.rpc_server`.
+   - Starts `deltachat-rpc-server` with `DC_ACCOUNTS_PATH` set to `<HERMES_HOME>/deltachat-platform/`.
+   - Verifies the core version is at least `MIN_DC_VERSION` (`2.51.0`).
+   - Uses the first existing account or errors out (account creation is done via `setup.py`).
+   - Enables bot mode, starts IO, and launches the async event listener.
+   - Instantiates `CallManager` for voice calls.
+5. `_event_listener()` polls `get_next_event()` and dispatches `INCOMING_MSG`, `INCOMING_CALL`, `CALL_ENDED`, `OUTGOING_CALL_ACCEPTED`, etc.
+6. Incoming messages are converted to Hermes `MessageEvent` objects with `MessageType.TEXT/VOICE/AUDIO/PHOTO/DOCUMENT` and handed to `handle_message()` (provided by the base class).
+7. Outgoing replies are produced by Hermes and sent via `DeltaChatAdapter.send()`, `send_file()`, `send_voice()`, `send_image_file()`, `send_location()`, or `send_document()`.
+
+### Important Threading/Layering Notes
+
+- `deltachat2.Rpc.transport.call()` is **synchronous and blocks on a `threading.Event`**. The adapter wraps it in `_AsyncRpc`, which runs every call in the default `ThreadPoolExecutor` so the gateway asyncio loop is not frozen.
+- Voice calls run on a **dedicated event loop in a daemon thread** inside `CallManager` so ICE/media tasks are never starved by AI/TTS work on the main loop.
+- The adapter stores per-process state in module globals (`_active_adapter`, `_chat_id_to_token`, `_spec_cache`, `_seen_ids`, `_rate_limiter`).
+
+## Module Divisions
+
+### `adapter.py`
+
+- Version check helpers (`_parse_version`, `_check_dc_version`)
+- Access control (`_RateLimiter`, `_MessageCache`, `_check_dm`, `_check_group`, `_gate_inbound`)
+- Async RPC wrapper (`_AsyncRpc`)
+- Chat token management (`_get_or_create_chat_token`, `_resolve_chat_token`)
+- OpenRPC spec fetching (`_fetch_spec`)
+- `DeltaChatAdapter` class — the core platform adapter
+- Plugin registration (`register_platform`, `register_rpc_tools`)
+
+### `call_handler.py`
+
+- `CallManager` — owns the dedicated call event loop and all active `CallSession`s
+- `HermesAudioTrack` — outgoing audio track that plays queued TTS frames
+- Audio buffering, silence detection, STT/TTS orchestration, barge-in handling
+- Incoming and outgoing WebRTC signalling using `aiortc`
+
+### `setup.py`
+
+- `DeltaChatAccountSetup` — interactive account creation
+- Relay server scraping from `chatmail.at/relays`
+- `get_profiles()` / `select_profile()` for Hermes profile discovery
+- `__main__` entry point used by the install instructions
+
+### `vendor/deltachat2/`
+
+- `transport.py` — `IOTransport` starts `deltachat-rpc-server` as a subprocess and handles JSON-RPC over stdin/stdout
+- `rpc.py` — `Rpc` proxy; all methods forwarded via `__getattr__`, except `send_msg` which serializes `MsgData`
+- `_utils.py` — `AttrDict` (camelCase → snake_case), `_snake2camel`, `to_attrdict`
+- `types.py` — dataclasses/enums for events, message data, view types, etc.
+
+## Build and Test Commands
+
+> **Environment**: This project is developed on NixOS. Always enter the dev shell first; bare `python3`, `pytest`, `pip`, etc. are usually not available.
 
 ```bash
-nix develop                              # enter dev shell
-nix develop --command python3 script.py  # run a script
-nix develop --command pytest             # run tests
-nix develop --command deltachat-rpc-server --openrpc  # inspect RPC spec
+# Enter the development shell
+nix develop
+
+# Run the full test suite (excludes slow WebRTC loopback tests)
+nix develop --command bash -c "cd tests && python3 -m pytest -v --tb=short"
+
+# Run slow WebRTC loopback diagnostics
+nix develop --command bash -c "cd tests && python3 -m pytest test_call_webrtc_loopback.py -q -s -m slow"
+
+# Inspect the RPC spec
+nix develop --command deltachat-rpc-server --openrpc
 ```
 
-## Finding Hermes Source
-
-Hermes is installed in the nix store. To compare against other platform adapters:
-
-```
-/nix/store/5naa7x31xmvsj1bqqrgjzqsas99j7pc8-hermes-agent-0.15.1/lib/python3.12/site-packages/gateway/
-  platforms/base.py       # base adapter class, MessageEvent, MessageType
-  platforms/telegram.py   # reference for voice/image/location sending
-  platforms/matrix.py     # reference for read receipts
-  platforms/bluebubbles.py
-  platforms/signal.py
-```
-
-## Logging
-
-The adapter logger must use the `hermes_plugins.*` prefix to appear in `~/.hermes/logs/gateway.log`. Using `__name__` (which resolves to `"adapter"`) routes to `agent.log` only and is invisible from the gateway log.
-
-```python
-logger = logging.getLogger("hermes_plugins.deltachat")  # correct
-logger = logging.getLogger(__name__)                     # wrong — goes to agent.log only
-```
-
-Hermes log files:
-- `~/.hermes/logs/gateway.log` — `gateway.*` and `hermes_plugins.*` loggers (INFO+)
-- `~/.hermes/logs/agent.log` — everything (the catch-all)
-- `~/.hermes/logs/errors.log` — WARNING+ only
-
-## Architecture
-
-- `adapter.py` – the platform adapter; registers with Hermes via `register_platform()` and `register_rpc_tools()`
-- `vendor/deltachat2/` – vendored Python client for the DC JSON-RPC server
-  - `rpc.py` – `Rpc` class; `send_msg` is the only manually defined method (serializes `MsgData` via `_snake2camel`); all other methods are proxied via `__getattr__` → `transport.call(method_name, *args)`
-  - `_utils.py` – `AttrDict` (camelCase → snake_case on receive), `_snake2camel` (snake_case → camelCase on send)
-  - `types.py` – `MsgData`, `MessageViewtype`, `EventType`, `MessageState`, etc.
-- `deltachat-rpc-openrpc.json` – OpenRPC spec; inspect for available methods and their params
-
-## DC JSON-RPC — Always Check the Spec First
-
-**Do not guess or hallucinate RPC method names, parameter names, or field names.**
-
-`jq` is available in the dev shell. Before writing any RPC call, look up the method in `deltachat-rpc-openrpc.json`:
+### Makefile Targets
 
 ```bash
-# List all method names
-jq '[.methods[].name]' deltachat-rpc-openrpc.json
-
-# Find methods matching a pattern, with their parameter names
-jq '[.methods[] | select(.name | contains("send")) | {name, params: [.params[].name]}]' deltachat-rpc-openrpc.json
-
-# Full spec for a specific method
-jq '.methods[] | select(.name == "markseen_msgs")' deltachat-rpc-openrpc.json
-
-# Schema for a type (e.g. Message, MessageData, BasicChat)
-jq '.components.schemas.BasicChat' deltachat-rpc-openrpc.json
+make test     # cd tests && python3 -m pytest -v --tb=short
+make lint     # flake8 adapter.py setup.py __init__.py tests/ --max-line-length=100 --extend-ignore=E203,W503,F401
+make format   # black adapter.py setup.py __init__.py tests/ docs/ skills/
+make check    # black --check ...
+make clean    # remove __pycache__ and .pytest_cache
 ```
+
+### Quick Syntax Check (outside NixOS)
+
+If Nix is unavailable, you can still verify syntax:
+
+```bash
+python3 -m py_compile adapter.py setup.py __init__.py call_handler.py
+python3 -m py_compile vendor/deltachat2/*.py
+```
+
+## Code Style Guidelines
+
+- **Formatter**: `black`
+- **Linter**: `flake8` with `--max-line-length=100 --extend-ignore=E203,W503,F401`
+- **Docstrings**: Google-style docstrings are used throughout.
+- **Imports**: Standard library first, third-party next, project/vendor last. `isort` is not configured; keep groups separated by blank lines.
+- **Line length**: 100 characters.
+- **Logging**: Use `logging.getLogger("hermes_plugins.deltachat")` (or a sub-logger like `"hermes_plugins.deltachat.calls"`). Using `__name__` routes logs to `agent.log` only and they will not appear in the gateway log.
+- **Comments**: Prefer a `# why:` comment at the relevant line over adding cross-cutting notes to this file. Escalate only when the insight is environmental or RPC-convention related.
+
+## Testing Instructions
+
+- Tests live in `tests/`.
+- `tests/conftest.py` installs mock `gateway` modules (`gateway.platforms.base`, `gateway.config`) before any adapter import, so tests can import `adapter` and `call_handler` without Hermes installed.
+- `pytest.ini` excludes `slow` tests by default. Mark long-running tests (e.g. WebRTC ICE loopback) with `@pytest.mark.slow`.
+- The suite covers:
+  - `test_setup.py` — relay-server scraping regex logic and version formatting
+  - `test_config.py` — config directory and RPC path resolution logic
+  - `test_version.py` — version parsing
+  - `test_adapter_integration.py` — adapter integration with mocked Hermes/RPC
+  - `test_call_handler.py` — pure/unit-testable parts of `call_handler.py`
+  - `test_call_webrtc_loopback.py` — live `aiortc` loopback diagnostics (slow, opt-in)
+
+### Adding Tests
+
+- Use the existing fixtures in `conftest.py` for `platform_config`, `mock_platform_config`, and `mock_rpc`.
+- Mock Hermes classes live in `conftest.py`; update them if you introduce new base-class behavior.
+- Do not add real network or real Delta Chat account dependencies to the default test run.
+
+## Security Considerations
+
+- **Authentication is relationship-based**: Delta Chat uses Autocrypt/SecureJoin. The setup script prints a SecureJoin invite link; users must scan it in Delta Chat. Adding only the email address does not establish an encrypted session.
+- **Access control is configured in `plugin.yaml` / env vars**:
+  - `DELTACHAT_DM_POLICY` — `open`, `allowlist`, `pairing` (default), or `disabled`
+  - `DELTACHAT_GROUP_POLICY` — `open` (default), `allowlist`, or `disabled`
+  - `DELTACHAT_ALLOWED_USERS`, `DELTACHAT_DM_ALLOWED_USERS`, `DELTACHAT_GROUP_ALLOWED_USERS`
+  - `DELTACHAT_ALLOW_ALL_USERS=true` disables all sender checks (dev/open mode only)
+  - `DELTACHAT_SEND_REJECTION_REPLIES` — whether rejected senders get an explanation
+- **Rate limiting**: per-sender sliding window, default 30 messages / 60 seconds.
+- **Raw RPC is opt-in**: `dc_rpc_call` (unrestricted RPC access) is only registered when `DELTACHAT_ENABLE_RAW_RPC=1` is set. Prefer `dc_safe_rpc_call`, which validates the chat token, injects `accountId`/`chatId`, and blocks destructive methods.
+- **Chat tokens**: Opaque per-chat tokens (`[dc:chat=<token>]`) are appended to incoming message text so the LLM can call `dc_safe_rpc_call`. They are persisted in Delta Chat UI config keys (`ui.hermes.chat_token.<chat_id>`) and cached in-process.
+- **File paths from containers**: When an agent writes files to `/workspace/` inside the Docker sandbox, the adapter remaps those paths to the host sandbox and copies them to the Hermes documents cache before validation/sending.
+- **Secrets**: Do not commit real accounts, keys, or `.env` files. `DC_ACCOUNTS_PATH` lives under the Hermes profile directory (default `~/.hermes/deltachat-platform/`).
 
 ## DC JSON-RPC Conventions
 
-**Method names**: all `snake_case` — e.g. `send_msg`, `markseen_msgs`, `get_basic_chat_info`.
+**Always check the spec first** (`deltachat-rpc-openrpc.json` or `deltachat-rpc-server --openrpc`). Do not guess method names or parameter names.
 
-**Parameter names** in the JSON spec: `camelCase` — e.g. `accountId`, `chatId`, `msgIds`. These appear in the spec but are handled automatically by the Python client.
+- **Method names**: `snake_case` (e.g. `send_msg`, `markseen_msgs`, `get_basic_chat_info`).
+- **Spec parameter names**: `camelCase` (e.g. `accountId`, `chatId`, `msgIds`). The Python client handles this automatically.
+- **Incoming data** (`get_message` returns `AttrDict`):
+  - JSON `viewType` → Python `view_type`
+  - JSON `fromId` → `from_id`, `chatId` → `chat_id`, `fileMime` → `file_mime`, etc.
+  - Group status comes from `get_basic_chat_info` (`chat_type == "Group"`), not from messages.
+- **Outgoing data** (`MsgData` dataclass → JSON via `_snake2camel`):
+  - `quoted_message_id` → `quotedMessageId`
+  - `override_sender_name` → `overrideSenderName`
+  - `viewtype` stays `viewtype`
 
-**Incoming messages** (`get_message` returns AttrDict):
-- JSON `viewType` → Python key `view_type`
-- JSON `fromId` → `from_id`, `chatId` → `chat_id`, `fileMime` → `file_mime`, etc.
-- `is_group` lives on **chat** objects (`get_basic_chat_info`), not message objects
+Useful `jq` examples:
 
-**Outgoing** (`MsgData` dataclass → JSON via `_snake2camel`):
-- `quoted_message_id` → `quotedMessageId`
-- `override_sender_name` → `overrideSenderName`
-- `viewtype` (no underscore) → `viewtype` (unchanged)
+```bash
+jq '[.methods[].name]' deltachat-rpc-openrpc.json
+jq '[.methods[] | select(.name | contains("send")) | {name, params: [.params[].name]}]' deltachat-rpc-openrpc.json
+jq '.methods[] | select(.name == "markseen_msgs")' deltachat-rpc-openrpc.json
+jq '.components.schemas.BasicChat' deltachat-rpc-openrpc.json
+```
 
 ## Hermes MessageEvent Contract
 
-Hermes routes incoming events in `run.py` by `message_type`. Always set this correctly and populate `media_urls`/`media_types` for non-text content:
+Hermes routes incoming events by `message_type`. Set the correct type and populate `media_urls`/`media_types` for non-text content. Do **not** transcribe audio or analyze images inside the adapter.
 
 | `MessageType` | When to use | Notes |
 |---|---|---|
-| `TEXT` | plain text | default |
-| `VOICE` | voice/opus message | Hermes auto-runs STT if `media_urls` set |
-| `AUDIO` | audio file attachment | never STT |
-| `PHOTO` | image | Hermes routes to vision pipeline if `media_urls` set |
-| `DOCUMENT` | file attachment | |
+| `TEXT` | Plain text | Default |
+| `VOICE` | Voice/opus message | Hermes auto-runs STT if `media_urls` set |
+| `AUDIO` | Audio file attachment | Never STT |
+| `PHOTO` | Image | Hermes routes to vision pipeline if `media_urls` set |
+| `DOCUMENT` | File attachment | `.xdc` files become webxdc apps automatically |
 
-Do **not** transcribe audio or analyze images inside the adapter — set the type and `media_urls`, let Hermes handle it.
+## Deployment / Installation
+
+The plugin is not a standalone executable; it is installed into the Hermes plugins directory:
+
+```bash
+git clone https://github.com/Simon-Laux/hermes-deltachat-platform ~/.hermes/plugins/deltachat-platform
+hermes plugins enable deltachat-platform
+```
+
+Then create the Delta Chat account:
+
+```bash
+python3 ~/.hermes/plugins/deltachat-platform/setup.py
+```
+
+And start the gateway:
+
+```bash
+hermes gateway start
+```
+
+### NixOS Notes
+
+- Install `deltachat-rpc-server` via `nix profile install nixpkgs#deltachat-rpc-server`.
+- For voice calls, build a GC-rooted Python environment containing `aiortc`:
+  ```bash
+  nix build --impure --expr 'with import <nixpkgs> {}; python312.withPackages(ps: [ps.aiortc])' -o ~/.hermes/aiortc-env
+  ```
+  Then add its site-packages to `PYTHONPATH` in `~/.hermes/.env`.
+- The `flake.nix` also provides a `packages.default` derivation that installs the plugin files to `$out/share/hermes/plugins/deltachat-platform/`.
+
+## Environment / Configuration Reference
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DELTACHAT_RPC_SERVER` | Yes (unless in PATH) | `deltachat-rpc-server` | Path to RPC binary |
+| `DELTACHAT_HOME_CHANNEL` | No | — | Chat ID for cron/proactive delivery |
+| `DELTACHAT_ENABLE_RAW_RPC` | No | unset | Enables unrestricted `dc_rpc_call` tool |
+| `DELTACHAT_DM_POLICY` | No | `pairing` | Direct message policy |
+| `DELTACHAT_GROUP_POLICY` | No | `open` | Group chat policy |
+| `DELTACHAT_ALLOWED_USERS` | No | — | Comma-separated allowed emails |
+| `DELTACHAT_ALLOW_ALL_USERS` | No | `false` | Disable all sender checks |
+| `DELTACHAT_SEND_REJECTION_REPLIES` | No | `true` | Send explanations on rejection |
+| `DELTACHAT_RATE_LIMIT_MAX` | No | `30` | Max inbound messages per sender per window |
+| `DELTACHAT_RATE_LIMIT_WINDOW` | No | `60` | Rate-limit window in seconds |
+| `DELTACHAT_CALL_STT_VOXTRAL` | No | `false` | Use Mistral Voxtral cloud STT for calls |
+| `DELTACHAT_CALL_MODEL` | No | unset | Per-call LLM override |
+| `DELTACHAT_DEBUG` | No | unset | Enables debug logging for `deltachat2` |
+
+## Common Gotchas
+
+- **Never run `python3` bare on NixOS** — always use `nix develop --command ...`.
+- **Logger names matter**: `hermes_plugins.deltachat` appears in `gateway.log`; `__name__` does not.
+- **Account creation is separate from connection**: `setup.py` creates the account; the adapter only uses the first existing account.
+- **Voice messages**: set `MessageType.VOICE` and pass the file path in `media_urls`; Hermes handles STT.
+- **Outgoing calls need a dedicated loop**: if you modify call scheduling, keep media tasks on the `CallManager` loop, not the gateway loop.
+- **Container path mapping**: output files from the Docker sandbox must be under `/workspace/`, not `/tmp/`, or the host cannot reach them.
 
 ## Useful RPC Methods
 
 ```python
-markseen_msgs(account_id, [msg_id])       # mark message seen (read receipt)
-marknoticed_chat(account_id, chat_id)     # mark all as noticed (not seen)
-get_message(account_id, msg_id)           # fetch full message snapshot
-get_basic_chat_info(account_id, chat_id)  # name, is_group
+markseen_msgs(account_id, [msg_id])       # read receipt
+get_message(account_id, msg_id)           # full message snapshot
+get_basic_chat_info(account_id, chat_id)  # name, chat_type
+get_contact(account_id, contact_id)       # name, address, is_verified
 send_msg(account_id, chat_id, MsgData)    # send any message type
-get_contact(account_id, contact_id)       # name, addr
+accept_chat(account_id, chat_id)          # accept contact request
+get_chat_securejoin_qr_code(account_id, None)  # invite link
 ```
