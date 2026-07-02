@@ -167,10 +167,12 @@ python3 -m py_compile vendor/deltachat2/*.py
   - `DELTACHAT_ALLOW_ALL_USERS=true` disables all sender checks (dev/open mode only)
   - `DELTACHAT_SEND_REJECTION_REPLIES` — whether rejected senders get an explanation
 - **Rate limiting**: per-sender sliding window, default 30 messages / 60 seconds.
-- **Raw RPC is opt-in**: `dc_rpc_call` (unrestricted RPC access) is only registered when `DELTACHAT_ENABLE_RAW_RPC=1` is set. Prefer `dc_safe_rpc_call`, which validates the chat token, injects `accountId`/`chatId`, and blocks destructive methods.
-- **Chat tokens**: Opaque per-chat tokens (`[dc:chat=<token>]`) are appended to incoming message text so the LLM can call `dc_safe_rpc_call`. They are persisted in Delta Chat UI config keys (`ui.hermes.chat_token.<chat_id>`) and cached in-process.
-- **File paths from containers**: When an agent writes files to `/workspace/` inside the Docker sandbox, the adapter remaps those paths to the host sandbox and copies them to the Hermes documents cache before validation/sending.
-- **Secrets**: Do not commit real accounts, keys, or `.env` files. `DC_ACCOUNTS_PATH` lives under the Hermes profile directory (default `~/.hermes/deltachat-platform/`).
+- **Raw RPC is opt-in and filtered**: `dc_rpc_call` (unrestricted RPC access) is only registered when `DELTACHAT_ENABLE_RAW_RPC=1` is set. It logs every call at `WARNING`, blocks all destructive methods (`delete_*`, `remove_*`, and the internal destructive list), and supports an optional allowlist (`DELTACHAT_RAW_RPC_ALLOWLIST=method1,method2`) or extra blocklist (`DELTACHAT_RAW_RPC_BLOCKLIST=method1`). Prefer `dc_safe_rpc_call`, which validates the chat token, injects `accountId`/`chatId`, and blocks destructive methods.
+- **Chat tokens**: Opaque per-chat tokens (`[dc:chat=<token>]`) are appended to incoming message text so the LLM can call `dc_safe_rpc_call`. They are persisted in Delta Chat UI config keys (`ui.hermes.chat_token.<chat_id>`) and cached in-process under an `asyncio.Lock`.
+- **File paths from containers**: When an agent writes files to `/workspace/` inside the Docker sandbox, the adapter resolves the path, verifies it stays inside the sandbox (rejects `..` and symlink escapes), rejects symlinks, and copies the file to the Hermes documents cache before validation/sending.
+- **Secrets**: Do not commit real accounts, keys, or `.env` files. `DC_ACCOUNTS_PATH` lives under the Hermes profile directory (default `~/.hermes/deltachat-platform/`). The account password is cleared from memory as soon as configuration completes or fails.
+- **Inbound access control is fail-closed**: If the adapter cannot fetch chat info to determine DM/group policy, the message is rejected. RPC/version-check failures also reject instead of falling through.
+- **Voice-call audio buffering is capped**: Continuous speech is forced to flush after a 60-second ceiling so the incoming audio buffer cannot grow without bound.
 
 ## DC JSON-RPC Conventions
 

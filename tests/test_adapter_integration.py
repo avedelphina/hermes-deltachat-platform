@@ -666,9 +666,7 @@ class TestMentions:
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Group", "name": "Test Group"}
         )
-        mock_rpc.get_contact = AsyncMock(
-            return_value={"address": "user@example.com"}
-        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
 
         await adapter._handle_incoming_message(group_event)
 
@@ -696,9 +694,7 @@ class TestMentions:
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Group", "name": "Test Group"}
         )
-        mock_rpc.get_contact = AsyncMock(
-            return_value={"address": "user@example.com"}
-        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
 
         await adapter._handle_incoming_message(group_event)
 
@@ -723,9 +719,7 @@ class TestMentions:
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Group", "name": "Test Group"}
         )
-        mock_rpc.get_contact = AsyncMock(
-            return_value={"address": "user@example.com"}
-        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
 
         await adapter._handle_incoming_message(group_event)
 
@@ -751,9 +745,7 @@ class TestMentions:
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Group", "name": "Test Group"}
         )
-        mock_rpc.get_contact = AsyncMock(
-            return_value={"address": "user@example.com"}
-        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
         adapter._resolve_blob_path = lambda x: x
         adapter._copy_to_hermes_cache = lambda src, kind: src
 
@@ -766,9 +758,7 @@ class TestMetadata:
     """Test incoming/outgoing metadata enrichment."""
 
     @pytest.mark.asyncio
-    async def test_message_event_has_metadata(
-        self, platform_config, mock_rpc
-    ):
+    async def test_message_event_has_metadata(self, platform_config, mock_rpc):
         platform_config.extra = {"dm_policy": "open"}
         adapter = DeltaChatAdapter(platform_config)
         adapter.rpc = mock_rpc
@@ -784,9 +774,7 @@ class TestMetadata:
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Single", "name": "DM"}
         )
-        mock_rpc.get_contact = AsyncMock(
-            return_value={"address": "user@example.com"}
-        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
 
         await adapter._handle_incoming_message(
             {"kind": "IncomingMsg", "chat_id": 7, "msg_id": 42}
@@ -801,9 +789,7 @@ class TestMetadata:
         assert "dc_token" in event.metadata
 
     @pytest.mark.asyncio
-    async def test_send_result_includes_metadata(
-        self, platform_config, mock_rpc
-    ):
+    async def test_send_result_includes_metadata(self, platform_config, mock_rpc):
         from adapter import _chat_id_to_token
 
         _chat_id_to_token[7] = "abc123"
@@ -854,9 +840,7 @@ class TestUrlImageSending:
         return client_cm
 
     @pytest.mark.asyncio
-    async def test_send_image_file_with_url_success(
-        self, platform_config, mock_rpc
-    ):
+    async def test_send_image_file_with_url_success(self, platform_config, mock_rpc):
         adapter = DeltaChatAdapter(platform_config)
         adapter.rpc = mock_rpc
         adapter.account_id = 1
@@ -864,9 +848,7 @@ class TestUrlImageSending:
 
         client_cm = self._mock_httpx_stream("image/png", b"pngdata", 7)
         with patch("httpx.AsyncClient", return_value=client_cm):
-            result = await adapter.send_image_file(
-                "7", "https://example.com/photo.png"
-            )
+            result = await adapter.send_image_file("7", "https://example.com/photo.png")
 
         assert result.success is True
         assert result.message_id == "123"
@@ -886,18 +868,14 @@ class TestUrlImageSending:
 
         client_cm = self._mock_httpx_stream("text/plain", b"not an image", 12)
         with patch("httpx.AsyncClient", return_value=client_cm):
-            result = await adapter.send_image_file(
-                "7", "https://example.com/file.txt"
-            )
+            result = await adapter.send_image_file("7", "https://example.com/file.txt")
 
         assert result.success is False
         assert "image" in result.error.lower()
         mock_rpc.send_msg.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_send_image_file_with_url_size_limit(
-        self, platform_config, mock_rpc
-    ):
+    async def test_send_image_file_with_url_size_limit(self, platform_config, mock_rpc):
         adapter = DeltaChatAdapter(platform_config)
         adapter.rpc = mock_rpc
         adapter.account_id = 1
@@ -906,9 +884,7 @@ class TestUrlImageSending:
             "image/png", b"x", content_length=50 * 1024 * 1024
         )
         with patch("httpx.AsyncClient", return_value=client_cm):
-            result = await adapter.send_image_file(
-                "7", "https://example.com/huge.png"
-            )
+            result = await adapter.send_image_file("7", "https://example.com/huge.png")
 
         assert result.success is False
         assert "25" in result.error or "limit" in result.error.lower()
