@@ -16,14 +16,17 @@ import wave
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor"))
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor"),
+)
 
 import call_handler as ch  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # _split_sentences
 # ---------------------------------------------------------------------------
+
 
 class TestSplitSentences:
     def test_empty(self):
@@ -31,7 +34,9 @@ class TestSplitSentences:
         assert ch._split_sentences("   ") == []
 
     def test_no_terminator_single_chunk(self):
-        assert ch._split_sentences("just one line no period") == ["just one line no period"]
+        assert ch._split_sentences("just one line no period") == [
+            "just one line no period"
+        ]
 
     def test_long_multi_sentence_splits_per_sentence(self):
         text = (
@@ -68,6 +73,7 @@ class TestSplitSentences:
 # _env_flag
 # ---------------------------------------------------------------------------
 
+
 class TestEnvFlag:
     @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on", "  On "])
     def test_truthy(self, monkeypatch, val):
@@ -87,6 +93,7 @@ class TestEnvFlag:
 # ---------------------------------------------------------------------------
 # CallManager._frames_to_chars (barge-in attribution)
 # ---------------------------------------------------------------------------
+
 
 class TestFramesToChars:
     CPS = [(10, 100), (25, 250), (40, 400)]  # (cum_chars, cum_frames) per sentence
@@ -116,12 +123,16 @@ class TestFramesToChars:
 # HermesAudioTrack — queue / flush / played accounting
 # ---------------------------------------------------------------------------
 
+
 def _make_frames(n):
     """n silent 960-sample mono s16 frames."""
     import av
+
     frames = []
     for _ in range(n):
-        f = av.AudioFrame(format="s16", layout="mono", samples=ch.HermesAudioTrack._FRAME_SAMPLES)
+        f = av.AudioFrame(
+            format="s16", layout="mono", samples=ch.HermesAudioTrack._FRAME_SAMPLES
+        )
         for p in f.planes:
             p.update(bytes(p.buffer_size))
         f.sample_rate = ch._SAMPLE_RATE
@@ -149,7 +160,7 @@ class TestHermesAudioTrack:
         f1 = await t.recv()
         f2 = await t.recv()
         assert f1.samples == ch.HermesAudioTrack._FRAME_SAMPLES
-        assert t.played_count == 2          # both queued frames counted
+        assert t.played_count == 2  # both queued frames counted
         # queue now empty → silence frame, played_count unchanged
         f3 = await t.recv()
         assert f3 is not None
@@ -164,56 +175,68 @@ class TestHermesAudioTrack:
         await t.recv()
         assert t.played_count == 3
         dropped = t.flush()
-        assert dropped == 7                 # 10 enqueued - 3 played
+        assert dropped == 7  # 10 enqueued - 3 played
 
 
 # ---------------------------------------------------------------------------
 # HermesAudioTrack.decode_tts — clean 960-sample frames, no padding
 # ---------------------------------------------------------------------------
 
+
 class TestBargeIn:
     """_handle_barge_in: only fires while speaking, cancels a pending hangup."""
 
     def _session(self, n_frames):
         from unittest.mock import MagicMock
+
         track = ch.HermesAudioTrack()
         track.enqueue_tts_frames(_make_frames(n_frames))
         return ch.CallSession(
-            pc=MagicMock(), chat_id="12", msg_id=1, caller_id="11", caller_name="X",
-            outgoing_track=track, audio_buffer=MagicMock(), ice_channel=MagicMock(),
+            pc=MagicMock(),
+            chat_id="12",
+            msg_id=1,
+            caller_id="11",
+            caller_name="X",
+            outgoing_track=track,
+            audio_buffer=MagicMock(),
+            ice_channel=MagicMock(),
             last_response_text="Hello there friend. How are you doing today?",
         )
 
     def _manager(self, session):
         from unittest.mock import MagicMock
+
         mgr = ch.CallManager(adapter=MagicMock())
         mgr._sessions[session.msg_id] = session
         mgr._chat_to_msg[session.chat_id] = session.msg_id
         return mgr
 
-    def test_no_interrupt_when_not_speaking(self):
-        session = self._session(0)            # nothing queued
+    @pytest.mark.asyncio
+    async def test_no_interrupt_when_not_speaking(self):
+        session = self._session(0)  # nothing queued
         session.is_responding = False
         mgr = self._manager(session)
         mgr._handle_barge_in(1)
-        assert session.interrupted is False   # nothing to interrupt
+        assert session.interrupted is False  # nothing to interrupt
 
-    def test_interrupt_flushes_and_stops_tts(self):
+    @pytest.mark.asyncio
+    async def test_interrupt_flushes_and_stops_tts(self):
         session = self._session(10)
         session.is_responding = True
         mgr = self._manager(session)
         mgr._handle_barge_in(1)
         assert session.interrupted is True
-        assert session.outgoing_track.is_speaking() is False   # queue flushed
+        assert session.outgoing_track.is_speaking() is False  # queue flushed
 
-    def test_barge_in_cancels_pending_hangup(self):
+    @pytest.mark.asyncio
+    async def test_barge_in_cancels_pending_hangup(self):
         session = self._session(10)
         session.hangup_pending = True
-        session.hanging_up = True             # goodbye drain in progress
+        session.hanging_up = True  # goodbye drain in progress
         mgr = self._manager(session)
         mgr._handle_barge_in(1)
         assert session.hangup_pending is False
-        assert session.hangup_cancelled is True   # _hangup_session will abort
+        assert session.hangup_cancelled is True  # _hangup_session will abort
 
 
 class TestOutgoingCall:
@@ -221,6 +244,7 @@ class TestOutgoingCall:
 
     def _manager(self):
         from unittest.mock import MagicMock
+
         return ch.CallManager(adapter=MagicMock())
 
     @pytest.mark.asyncio
@@ -232,7 +256,7 @@ class TestOutgoingCall:
             {"msg_id": 42, "accept_call_info": "v=0 ...sdp..."}
         )
         assert fut.done() and fut.result() == "v=0 ...sdp..."
-        assert 42 not in mgr._pending_answers   # consumed
+        assert 42 not in mgr._pending_answers  # consumed
 
     @pytest.mark.asyncio
     async def test_accepted_without_sdp_sets_exception(self):
@@ -248,7 +272,9 @@ class TestOutgoingCall:
     async def test_accepted_unknown_call_is_noop(self):
         mgr = self._manager()
         # no future registered → should not raise
-        await mgr.handle_outgoing_call_accepted({"msg_id": 999, "accept_call_info": "x"})
+        await mgr.handle_outgoing_call_accepted(
+            {"msg_id": 999, "accept_call_info": "x"}
+        )
 
     @pytest.mark.asyncio
     async def test_call_ended_wakes_pending_waiter(self):
@@ -260,10 +286,11 @@ class TestOutgoingCall:
         with pytest.raises(RuntimeError):
             fut.result()
 
-    def test_consume_drop_response_is_one_shot(self):
+    @pytest.mark.asyncio
+    async def test_consume_drop_response_is_one_shot(self):
         mgr = self._manager()
-        mgr._drop_next_response.add("12")
-        assert mgr.consume_drop_response("12") is True   # call-ended note's reply → drop
+        mgr._drop_next_response["12"] = 1
+        assert mgr.consume_drop_response("12") is True  # call-ended note's reply → drop
         assert mgr.consume_drop_response("12") is False  # subsequent replies go through
         assert mgr.consume_drop_response("99") is False
 
@@ -272,12 +299,17 @@ class TestDecodeTts:
     def _write_wav(self, path, seconds=0.4, rate=22050):
         # mono s16 sine-ish (just nonzero) to mimic a TTS mp3's mono low rate
         import struct
+
         nframes = int(seconds * rate)
         with wave.open(str(path), "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(rate)
-            wf.writeframes(b"".join(struct.pack("<h", (i % 100) * 100 - 5000) for i in range(nframes)))
+            wf.writeframes(
+                b"".join(
+                    struct.pack("<h", (i % 100) * 100 - 5000) for i in range(nframes)
+                )
+            )
 
     def test_decode_yields_960_sample_mono_48k_frames(self, tmp_path):
         wav = tmp_path / "tts.wav"
@@ -300,5 +332,5 @@ class TestDecodeTts:
         self._write_wav(wav, seconds=seconds, rate=rate)
         frames = ch.HermesAudioTrack.decode_tts(str(wav))
         total = sum(f.samples for f in frames)
-        expected = seconds * ch._SAMPLE_RATE        # 48 kHz target
+        expected = seconds * ch._SAMPLE_RATE  # 48 kHz target
         assert abs(total - expected) < ch.HermesAudioTrack._FRAME_SAMPLES * 2

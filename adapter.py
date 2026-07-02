@@ -3,14 +3,22 @@
 Integrates Delta Chat as a messaging platform using deltachat2 (direct JSON-RPC).
 """
 
+import email.utils
 import functools
 import html
 import json
 import os
+import re
 import secrets
+import shutil
 import sys
 import asyncio
 import logging
+import threading
+import time
+import unicodedata
+from collections import deque
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 # Add vendor directory to sys.path so vendored deltachat2 can be imported
@@ -42,6 +50,129 @@ if os.getenv("DELTACHAT_DEBUG"):
 # Plugin will NOT connect with older versions
 MIN_DC_VERSION = "2.51.0"
 
+# DC truncates at ~3800; split conservatively
+DC_MESSAGE_MAX_LEN = 3600
+
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _cfg(config, env: str, key: str, default: str = "") -> str:
+    """Read platform config: env var takes precedence over config.extra."""
+    extra = getattr(config, "extra", {}) or {}
+    val = os.getenv(env)
+    if val:
+        return val
+    val = extra.get(key, default)
+    if isinstance(val, bool):
+        val = "true" if val else "false"
+    return val if val is not None else default
+
+
+def _strip_markdown(text: str) -> str:
+    """Delta Chat renders plain text only; strip common markdown syntax."""
+    if not text:
+        return text
+    text = re.sub(r"```(?:\w*\n)?(.*?)```", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+(.*)$", r"\1", text, flags=re.MULTILINE)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    text = re.sub(r"(\*\*\*|___)(.+?)\1", r"\2", text)
+    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text)
+    text = re.sub(r"(?<!\w)(\*|_)(.+?)\1(?!\w)", r"\2", text)
+    text = re.sub(r"~~(.+?)~~", r"\1", text)
+    return text
+
+
+def _split_message(text: str, max_len: int = DC_MESSAGE_MAX_LEN) -> list[str]:
+    """Split long text at paragraph/line/sentence/word boundaries."""
+    if not text:
+        return []
+    if len(text) <= max_len:
+        return [text]
+    parts: list[str] = []
+    remaining = text
+    while len(remaining) > max_len:
+        split_at = -1
+        # Try in order: paragraph break, line break, sentence end, word boundary.
+        # Require split point past 25% of max_len so first chunk isn't tiny.
+        for rfind_str, extra in [("\n\n", 0), ("\n", 0), (". ", 1), (" ", 0)]:
+            idx = remaining.rfind(rfind_str, 0, max_len)
+            if idx > max_len * 0.25:
+                split_at = idx + extra
+                break
+        if split_at <= 0:
+            split_at = max_len
+            # Avoid splitting in the middle of a combining character.
+            while split_at > 1 and unicodedata.combining(remaining[split_at]):
+                split_at -= 1
+        parts.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+        if not remaining:
+            break
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
+def _is_valid_email(s: str) -> bool:
+    """Return True if *s* looks like a plain email address."""
+    if not s or len(s) > 254:
+        return False
+    if not _EMAIL_RE.match(s):
+        return False
+    real_name, addr = email.utils.parseaddr(s)
+    return real_name == "" and addr.lower() == s.lower()
+
+
+def _safe_data_dir(path: str, create: bool = False) -> Path:
+    """Resolve and optionally create the Delta Chat data directory."""
+    p = Path(path).expanduser()
+    if ".." in p.parts:
+        raise ValueError(f"data_dir may not contain '..': {path!r}")
+    if create:
+        p = p.resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        p.chmod(0o700)
+        mode = p.stat().st_mode
+        if mode & 0o077:
+            logger.warning(
+                "DeltaChat: data_dir %s has permissive mode %o; expected 0o700",
+                p,
+                mode & 0o777,
+            )
+    return p
+
+
+def _validate_rpc_server_path(path: str, strict: bool = True) -> str:
+    """Resolve the RPC server binary path. Raise ValueError if invalid."""
+    if not path:
+        raise ValueError("RPC server path must not be empty")
+    resolved = shutil.which(path)
+    if resolved:
+        return resolved
+    p = Path(path)
+    if p.is_absolute() and p.is_file() and os.access(p, os.X_OK):
+        return str(p)
+    if not strict:
+        return path
+    raise ValueError(f"RPC server not found or not executable: {path!r}")
+
+
+def _validate_avatar_path(path: Optional[str], strict: bool = True) -> Optional[str]:
+    """Validate avatar image path. Raise ValueError if invalid."""
+    if not path:
+        return None
+    suffix = Path(path).suffix.lower()
+    if suffix not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+        raise ValueError(f"DELTACHAT_AVATAR_PATH must be an image file: {path!r}")
+    if strict:
+        p = Path(path).expanduser().resolve()
+        if not p.is_file():
+            raise ValueError(f"DELTACHAT_AVATAR_PATH does not exist: {path!r}")
+        return str(p)
+    return path
+
+
 # Lazy import to avoid dependency issues if deltachat2 not installed
 _DC2_AVAILABLE = None
 
@@ -52,6 +183,7 @@ def _check_dc2_available():
     if _DC2_AVAILABLE is None:
         try:
             import deltachat2
+
             _DC2_AVAILABLE = True
             return True
         except ImportError:
@@ -118,6 +250,101 @@ async def _check_dc_version(rpc) -> bool:
         return True
 
 
+# ---------------------------------------------------------------------------
+# Access control: rate limiting, dedup, DM/group policy
+# ---------------------------------------------------------------------------
+
+
+def _parse_email_list(raw: str) -> set:
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+def _parse_chatmail_servers(raw: str) -> list[str]:
+    """Return a list of non-empty, trimmed chatmail server hostnames."""
+    servers = [s.strip() for s in raw.split(",") if s.strip()]
+    # Remove duplicate hostnames while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for s in servers:
+        key = s.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(s)
+    return unique
+
+
+class _RateLimiter:
+    """Simple sliding-window rate limiter keyed by arbitrary strings."""
+
+    def __init__(self, max_calls: int = 30, window_seconds: float = 60.0):
+        self.max_calls = max_calls
+        self.window = window_seconds
+        self._buckets: Dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                self._buckets[key] = deque([now], maxlen=self.max_calls)
+                return True
+            while bucket and now - bucket[0] > self.window:
+                bucket.popleft()
+            if len(bucket) >= self.max_calls:
+                return False
+            bucket.append(now)
+            return True
+
+
+class _MessageCache:
+    """Bounded LRU set for duplicate message detection."""
+
+    def __init__(self, max_size: int = 1000):
+        self.max_size = max_size
+        self._deque: deque = deque(maxlen=max_size)
+        self._set: set = set()
+
+    def add(self, msg_id: str) -> bool:
+        """Add *msg_id*. Return True if it was new, False if already seen."""
+        if msg_id in self._set:
+            return False
+        if len(self._deque) >= self.max_size:
+            oldest = self._deque.popleft()
+            self._set.discard(oldest)
+        self._deque.append(msg_id)
+        self._set.add(msg_id)
+        return True
+
+
+async def _async_retry(
+    coro_fn,
+    max_attempts: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 10.0,
+    exceptions: tuple = (Exception,),
+):
+    """Retry an async callable with exponential backoff."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            return await coro_fn()
+        except exceptions as e:
+            last_exc = e
+            if attempt == max_attempts - 1:
+                raise
+            delay = min(base_delay * (2**attempt), max_delay)
+            logger.warning(
+                "Operation failed (attempt %d/%d): %s; retrying in %.1fs",
+                attempt + 1,
+                max_attempts,
+                e,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise last_exc
+
+
 class _AsyncRpc:
     """Wraps synchronous deltachat2.Rpc so every call runs in a thread executor.
 
@@ -133,9 +360,11 @@ class _AsyncRpc:
 
     def __getattr__(self, name: str):
         method = getattr(object.__getattribute__(self, "_rpc"), name)
+
         async def _async_call(*args):
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, method, *args)
+
         return _async_call
 
 
@@ -151,14 +380,16 @@ _chat_id_to_token: Dict[int, str] = {}
 _chat_token_to_id: Dict[str, int] = {}
 
 # Methods that mutate or destroy chat data — blocked from dc_safe_rpc_call.
-_DESTRUCTIVE_METHODS = frozenset({
-    "delete_chat",
-    "delete_messages",
-    "delete_messages_for_all",
-    "remove_contact_from_chat",
-    "remove_draft",
-    "leave_group",
-})
+_DESTRUCTIVE_METHODS = frozenset(
+    {
+        "delete_chat",
+        "delete_messages",
+        "delete_messages_for_all",
+        "remove_contact_from_chat",
+        "remove_draft",
+        "leave_group",
+    }
+)
 
 # Cached OpenRPC spec (fetched lazily on first use).
 _spec_cache: Optional[dict] = None
@@ -185,7 +416,9 @@ async def _get_or_create_chat_token(rpc, account_id: int, chat_id: int) -> str:
         token = secrets.token_hex(8)
         try:
             await rpc.set_config(account_id, dc_key, token)
-            await rpc.set_config(account_id, f"ui.hermes.token_chat.{token}", str(chat_id))
+            await rpc.set_config(
+                account_id, f"ui.hermes.token_chat.{token}", str(chat_id)
+            )
         except Exception as e:
             logger.warning(f"Could not persist chat token to DC config: {e}")
 
@@ -228,13 +461,16 @@ async def _fetch_spec() -> dict:
             else os.getenv("DELTACHAT_RPC_SERVER", "deltachat-rpc-server")
         )
         proc = await asyncio.create_subprocess_exec(
-            rpc_server, "--openrpc",
+            rpc_server,
+            "--openrpc",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
-            raise RuntimeError(f"deltachat-rpc-server --openrpc failed: {stderr.decode().strip()}")
+            raise RuntimeError(
+                f"deltachat-rpc-server --openrpc failed: {stderr.decode().strip()}"
+            )
         _spec_cache = json.loads(stdout.decode())
     return _spec_cache
 
@@ -261,7 +497,157 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._dc_config_dir: Optional[str] = None
         self._call_manager = None
 
+        extra = getattr(config, "extra", {}) or {}
 
+        def g(env, key, default=""):
+            val = os.getenv(env)
+            if val:
+                return val
+            val = extra.get(key, default)
+            if isinstance(val, bool):
+                val = "true" if val else "false"
+            return val
+
+        allow_all = g(
+            "DELTACHAT_ALLOW_ALL_USERS", "allow_all_users", "false"
+        ).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        raw_allowed = g("DELTACHAT_ALLOWED_USERS", "allowed_users")
+        self._allowed_users = (
+            set()
+            if allow_all
+            else (_parse_email_list(raw_allowed) if raw_allowed else set())
+        )
+
+        self._dm_policy = g("DELTACHAT_DM_POLICY", "dm_policy", "pairing")
+        raw_dm_allow = g("DELTACHAT_DM_ALLOWED_USERS", "dm_allowed_users")
+        self._dm_allow_from = _parse_email_list(raw_dm_allow) if raw_dm_allow else set()
+
+        self._group_policy = g("DELTACHAT_GROUP_POLICY", "group_policy", "open")
+        raw_group_allow = g("DELTACHAT_GROUP_ALLOWED_USERS", "group_allowed_users")
+        self._group_allow_from = (
+            _parse_email_list(raw_group_allow) if raw_group_allow else set()
+        )
+
+        self._send_rejection_replies = g(
+            "DELTACHAT_SEND_REJECTION_REPLIES", "send_rejection_replies", "true"
+        ).lower() in ("1", "true", "yes")
+
+        self._seen_ids = _MessageCache(max_size=1000)
+        self._rate_limiter = _RateLimiter(
+            max_calls=int(g("DELTACHAT_RATE_LIMIT_MAX", "rate_limit_max", "30")),
+            window_seconds=float(
+                g("DELTACHAT_RATE_LIMIT_WINDOW", "rate_limit_window", "60")
+            ),
+        )
+
+        self._max_message_len = int(
+            g(
+                "DELTACHAT_MAX_MESSAGE_LENGTH",
+                "max_message_length",
+                str(DC_MESSAGE_MAX_LEN),
+            )
+        )
+
+    def _check_dm(self, sender_email: str, is_verified: bool) -> Optional[str]:
+        if self._dm_policy == "disabled":
+            return "Sorry, this bot does not accept direct messages."
+        if self._dm_policy == "pairing" and not is_verified:
+            return "I only chat with verified contacts. Scan my QR code to connect securely."
+        if (
+            self._dm_policy == "allowlist"
+            and self._dm_allow_from
+            and sender_email not in self._dm_allow_from
+        ):
+            return "Sorry, you are not on the allowed list for direct messages."
+        return None
+
+    def _check_group(self, sender_email: str) -> Optional[str]:
+        if self._group_policy == "disabled":
+            return "Sorry, this bot does not respond in group chats."
+        if (
+            self._group_policy == "allowlist"
+            and self._group_allow_from
+            and sender_email not in self._group_allow_from
+        ):
+            return "Sorry, you are not authorized for group interactions."
+        return None
+
+    async def _gate_inbound(self, chat_id, msg_id, from_id) -> bool:
+        """Run dedup, rate-limit, and DM/group policy checks for an inbound message.
+
+        Returns True if the message should be processed further, False if it
+        was dropped or rejected (rejection reply already sent if configured).
+        """
+        if not self._seen_ids.add(str(msg_id)):
+            logger.debug("Ignoring duplicate message %s", msg_id)
+            return False
+
+        sender_email = ""
+        is_verified = False
+        if from_id:
+            try:
+                contact = await self.rpc.get_contact(self.account_id, int(from_id))
+                sender_email = (contact.get("address") or "").lower()
+                is_verified = bool(contact.get("is_verified"))
+            except Exception as e:
+                logger.debug("Could not fetch contact %s: %s", from_id, e)
+
+        if sender_email and not self._rate_limiter.is_allowed(sender_email):
+            logger.warning("Rate limit exceeded for %s", sender_email)
+            return False
+
+        if self._allowed_users and sender_email not in self._allowed_users:
+            logger.warning("Rejected %s (not in allowed_users)", sender_email)
+            if self._send_rejection_replies:
+                await self.send(
+                    str(chat_id), "Sorry, you are not authorized to use this bot."
+                )
+            return False
+
+        try:
+            chat = await self.rpc.get_basic_chat_info(self.account_id, int(chat_id))
+        except Exception as e:
+            logger.debug("Could not fetch chat %s: %s", chat_id, e)
+            chat = {}
+        chat_type = chat.get("chat_type")
+        is_request = bool(chat.get("is_contact_request"))
+
+        if chat_type == "Single":
+            reason = self._check_dm(sender_email, is_verified)
+            if reason:
+                logger.warning("dm_policy rejected %s", sender_email)
+                if self._send_rejection_replies:
+                    await self.send(str(chat_id), reason)
+                return False
+            if is_request:
+                try:
+                    await self.rpc.accept_chat(self.account_id, int(chat_id))
+                except Exception as e:
+                    logger.warning("accept_chat failed: %s", e)
+
+        elif chat_type == "Group":
+            reason = self._check_group(sender_email)
+            if reason:
+                logger.warning("group_policy rejected %s", sender_email)
+                if is_request:
+                    try:
+                        await self.rpc.leave_group(self.account_id, int(chat_id))
+                    except Exception as e:
+                        logger.warning("leave_group failed: %s", e)
+                elif self._send_rejection_replies:
+                    await self.send(str(chat_id), reason)
+                return False
+            if is_request:
+                try:
+                    await self.rpc.accept_chat(self.account_id, int(chat_id))
+                except Exception as e:
+                    logger.warning("accept_chat failed: %s", e)
+
+        return True
 
     def _get_dc_config_dir(self) -> str:
         """Get Delta Chat config directory path.
@@ -327,7 +713,9 @@ class DeltaChatAdapter(BasePlatformAdapter):
             from deltachat2.transport import IOTransport
 
             os.environ["DC_ACCOUNTS_PATH"] = dc_accounts_path
-            self._transport = IOTransport(accounts_dir=dc_accounts_path, rpc_server=rpc_server_path)
+            self._transport = IOTransport(
+                accounts_dir=dc_accounts_path, rpc_server=rpc_server_path
+            )
             self._transport.start()
             self.rpc = _AsyncRpc(deltachat2.Rpc(self._transport))
 
@@ -372,6 +760,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
             _active_adapter = self
 
             from call_handler import CallManager
+
             self._call_manager = CallManager(self)
 
             # Log the bot's address for reference
@@ -427,8 +816,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
             # Try to get SecureJoin QR code content (which is the link)
             try:
                 qr_content = await self.rpc.get_chat_securejoin_qr_code(
-                    self.account_id,
-                    None  # chat_id - None for account-level QR
+                    self.account_id, None  # chat_id - None for account-level QR
                 )
                 if qr_content:
                     return qr_content
@@ -546,32 +934,57 @@ body {{
                     error="Delta Chat not connected",
                 )
 
-            # Format long messages with HTML
-            text_part, html_part = self._format_html_message(content)
+            # Delta Chat renders plain text only; strip common markdown syntax.
+            stripped = _strip_markdown(content)
 
             quoted_id = int(reply_to) if reply_to else None
 
-            if html_part:
-                from deltachat2.types import MsgData, MessageViewtype
-
-                msg_id = await self.rpc.send_msg(
-                    self.account_id,
-                    int(chat_id),
-                    MsgData(text=text_part, html=html_part, viewtype=MessageViewtype.TEXT, quoted_message_id=quoted_id),
-                )
-            else:
+            async def _do_send() -> Optional[int]:
                 from deltachat2.types import MsgData
 
-                msg_id = await self.rpc.send_msg(
-                    self.account_id,
-                    int(chat_id),
-                    MsgData(text=content, quoted_message_id=quoted_id),
-                )
+                # Very long messages are split at natural boundaries and sent
+                # as multiple plain-text chunks.
+                chunks = _split_message(stripped, self._max_message_len)
+                if len(chunks) > 1:
+                    last_msg_id: Optional[int] = None
+                    for idx, chunk in enumerate(chunks):
+                        # Only quote-reply the first chunk.
+                        chunk_quoted = quoted_id if idx == 0 else None
+                        last_msg_id = await self.rpc.send_msg(
+                            self.account_id,
+                            int(chat_id),
+                            MsgData(text=chunk, quoted_message_id=chunk_quoted),
+                        )
+                    return last_msg_id
 
+                # Shorter messages may use HTML formatting when >40 lines.
+                text_part, html_part = self._format_html_message(stripped)
+                from deltachat2.types import MessageViewtype
+
+                if html_part:
+                    msg_id = await self.rpc.send_msg(
+                        self.account_id,
+                        int(chat_id),
+                        MsgData(
+                            text=text_part,
+                            html=html_part,
+                            viewtype=MessageViewtype.TEXT,
+                            quoted_message_id=quoted_id,
+                        ),
+                    )
+                else:
+                    msg_id = await self.rpc.send_msg(
+                        self.account_id,
+                        int(chat_id),
+                        MsgData(text=stripped, quoted_message_id=quoted_id),
+                    )
+                return msg_id
+
+            msg_id = await _async_retry(_do_send, max_attempts=3, base_delay=1.0)
             logger.debug(f"Sent message {msg_id} to chat {chat_id}")
             return SendResult(
                 success=True,
-                message_id=str(msg_id),
+                message_id=str(msg_id) if msg_id is not None else None,
             )
 
         except Exception as e:
@@ -601,11 +1014,18 @@ body {{
 
             from deltachat2.types import MsgData
 
-            msg_id = await self.rpc.send_msg(
-                self.account_id,
-                int(chat_id),
-                MsgData(file=file_path, text=caption or "", quoted_message_id=int(reply_to) if reply_to else None),
-            )
+            async def _do_send():
+                return await self.rpc.send_msg(
+                    self.account_id,
+                    int(chat_id),
+                    MsgData(
+                        file=file_path,
+                        text=caption or "",
+                        quoted_message_id=int(reply_to) if reply_to else None,
+                    ),
+                )
+
+            msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
             logger.debug(f"Sent file {file_path} as message {msg_id} to chat {chat_id}")
             return SendResult(success=True, message_id=str(msg_id))
 
@@ -664,17 +1084,22 @@ body {{
 
             from deltachat2.types import MsgData, MessageViewtype
 
-            msg_id = await self.rpc.send_msg(
-                self.account_id,
-                int(chat_id),
-                MsgData(
-                    file=image_path,
-                    text=caption or "",
-                    viewtype=MessageViewtype.IMAGE,
-                    quoted_message_id=int(reply_to) if reply_to else None,
-                ),
+            async def _do_send():
+                return await self.rpc.send_msg(
+                    self.account_id,
+                    int(chat_id),
+                    MsgData(
+                        file=image_path,
+                        text=caption or "",
+                        viewtype=MessageViewtype.IMAGE,
+                        quoted_message_id=int(reply_to) if reply_to else None,
+                    ),
+                )
+
+            msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
+            logger.debug(
+                f"Sent image {image_path} as message {msg_id} to chat {chat_id}"
             )
-            logger.debug(f"Sent image {image_path} as message {msg_id} to chat {chat_id}")
             return SendResult(success=True, message_id=str(msg_id))
         except Exception as e:
             logger.error(f"Error sending image {image_path} to chat {chat_id}: {e}")
@@ -704,7 +1129,10 @@ body {{
             SendResult with success status and message ID
         """
         import os
-        logger.info(f"send_voice called: chat_id={chat_id}, audio_path={audio_path}, caption={caption[:50] if caption else None}")
+
+        logger.info(
+            f"send_voice called: chat_id={chat_id}, audio_path={audio_path}, caption={caption[:50] if caption else None}"
+        )
         logger.debug(f"send_voice kwargs: {kwargs}")
 
         # Validate audio file exists and is accessible
@@ -728,23 +1156,36 @@ body {{
 
         try:
             if not self.rpc or not self.account_id:
-                logger.error("send_voice: Delta Chat not connected (rpc={}, account_id={})".format(
-                    "None" if not self.rpc else "set",
-                    "None" if not self.account_id else self.account_id
-                ))
+                logger.error(
+                    "send_voice: Delta Chat not connected (rpc={}, account_id={})".format(
+                        "None" if not self.rpc else "set",
+                        "None" if not self.account_id else self.account_id,
+                    )
+                )
                 return SendResult(
                     success=False,
                     error="Delta Chat not connected",
                 )
 
-            logger.debug(f"send_voice: Sending to account_id={self.account_id}, chat_id={chat_id}")
-            msg_id = await self.rpc.send_msg(
-                self.account_id,
-                int(chat_id),
-                MsgData(file=audio_path, text=caption or "", viewtype=MessageViewtype.VOICE),
+            logger.debug(
+                f"send_voice: Sending to account_id={self.account_id}, chat_id={chat_id}"
             )
 
-            logger.info(f"Sent voice message {msg_id} to chat {chat_id}, file={audio_path}, size={file_size}")
+            async def _do_send():
+                return await self.rpc.send_msg(
+                    self.account_id,
+                    int(chat_id),
+                    MsgData(
+                        file=audio_path,
+                        text=caption or "",
+                        viewtype=MessageViewtype.VOICE,
+                    ),
+                )
+
+            msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
+            logger.info(
+                f"Sent voice message {msg_id} to chat {chat_id}, file={audio_path}, size={file_size}"
+            )
             return SendResult(
                 success=True,
                 message_id=str(msg_id),
@@ -752,6 +1193,7 @@ body {{
 
         except Exception as e:
             import traceback
+
             logger.error(f"Error in send_voice: {e}")
             logger.debug(f"send_voice exception traceback:\n{traceback.format_exc()}")
             return SendResult(
@@ -791,13 +1233,15 @@ body {{
 
             from deltachat2.types import MsgData
 
-            # location tuple is (latitude, longitude) per GeoJSON convention
-            msg_id = await self.rpc.send_msg(
-                self.account_id,
-                int(chat_id),
-                MsgData(text=poi_name, location=(latitude, longitude)),
-            )
+            async def _do_send():
+                # location tuple is (latitude, longitude) per GeoJSON convention
+                return await self.rpc.send_msg(
+                    self.account_id,
+                    int(chat_id),
+                    MsgData(text=poi_name, location=(latitude, longitude)),
+                )
 
+            msg_id = await _async_retry(_do_send, max_attempts=2, base_delay=0.5)
             logger.debug(f"Sent location to chat {chat_id}")
             return SendResult(
                 success=True,
@@ -838,13 +1282,21 @@ body {{
         p = str(container_path)
         if not p.startswith("/workspace/"):
             return None
-        rel = p[len("/workspace/"):]
+        rel = p[len("/workspace/") :]
         try:
             from tools.environments.base import get_sandbox_dir
+
             sandbox_workspace = get_sandbox_dir() / "docker" / "default" / "workspace"
         except ImportError:
             from gateway.config import get_hermes_home
-            sandbox_workspace = Path(get_hermes_home()) / "sandboxes" / "docker" / "default" / "workspace"
+
+            sandbox_workspace = (
+                Path(get_hermes_home())
+                / "sandboxes"
+                / "docker"
+                / "default"
+                / "workspace"
+            )
         return str(sandbox_workspace / rel)
 
     def _copy_container_file_to_cache(self, container_path: str) -> Optional[str]:
@@ -910,7 +1362,7 @@ body {{
 
         files, remaining = BasePlatformAdapter.extract_local_files(content)
 
-        xdc_re = re.compile(r'(?<![/:\w.])(/workspace/[\w./\-]+\.xdc)\b', re.IGNORECASE)
+        xdc_re = re.compile(r"(?<![/:\w.])(/workspace/[\w./\-]+\.xdc)\b", re.IGNORECASE)
         for match in xdc_re.finditer(content):
             path = match.group(1)
             if path not in files:
@@ -990,7 +1442,9 @@ body {{
                 asyncio.create_task(self._call_manager.handle_call_ended(event))
         elif event_kind == EventType.OUTGOING_CALL_ACCEPTED:
             if self._call_manager:
-                asyncio.create_task(self._call_manager.handle_outgoing_call_accepted(event))
+                asyncio.create_task(
+                    self._call_manager.handle_outgoing_call_accepted(event)
+                )
         elif event_kind == EventType.INCOMING_CALL_ACCEPTED:
             logger.info("Incoming call accepted msg_id=%s", event.get("msg_id"))
         else:
@@ -1025,6 +1479,9 @@ body {{
             except Exception as e:
                 logger.debug(f"Could not mark message {msg_id} as seen: {e}")
 
+            if not await self._gate_inbound(chat_id, msg_id, msg.get("from_id")):
+                return
+
             text = msg.get("text", "")
             view_type = msg.get("view_type", "")
             has_file = bool(msg.get("file") or msg.get("file_mime"))
@@ -1034,8 +1491,11 @@ body {{
             if not text or view_type not in ("Text", "", None) or has_file:
                 logger.info(
                     "Non-text message: view_type=%r text=%r file=%r file_mime=%r msg_id=%s",
-                    view_type, text[:80] if text else text,
-                    msg.get("file"), msg.get("file_mime"), msg_id,
+                    view_type,
+                    text[:80] if text else text,
+                    msg.get("file"),
+                    msg.get("file_mime"),
+                    msg_id,
                 )
                 await self._handle_non_text_message(msg, chat_id, msg_id)
                 return
@@ -1053,15 +1513,19 @@ body {{
                     self.account_id,
                     int(from_id),
                 )
-                user_name = (contact.get("name") or contact.get("display_name")
-                             or contact.get("name_and_addr") or f"Contact {from_id}")
+                user_name = (
+                    contact.get("name")
+                    or contact.get("display_name")
+                    or contact.get("name_and_addr")
+                    or f"Contact {from_id}"
+                )
                 user_id = str(from_id)
             else:
                 user_name = "Unknown"
                 user_id = "unknown"
 
             # Determine chat type
-            chat_type = "group" if chat.get("is_group", False) else "dm"
+            chat_type = "group" if chat.get("chat_type") == "Group" else "dm"
             chat_name = chat.get("name", f"Chat {chat_id}")
 
             # Build source
@@ -1078,7 +1542,9 @@ body {{
             if text.startswith("/"):
                 text_with_token = text
             else:
-                token = await _get_or_create_chat_token(self.rpc, self.account_id, int(chat_id))
+                token = await _get_or_create_chat_token(
+                    self.rpc, self.account_id, int(chat_id)
+                )
                 text_with_token = f"{text}\n[dc:chat={token}]"
 
             # Build and handle message event
@@ -1105,7 +1571,9 @@ body {{
         if os.path.exists(filename):
             logger.debug("Blob path exists as-is: %s", filename)
             return filename
-        blob_path = os.path.join(self._get_dc_config_dir(), "blobs", os.path.basename(filename))
+        blob_path = os.path.join(
+            self._get_dc_config_dir(), "blobs", os.path.basename(filename)
+        )
         if os.path.exists(blob_path):
             logger.debug("Blob path resolved via blobs dir: %s", blob_path)
             return blob_path
@@ -1124,16 +1592,20 @@ body {{
             data = open(src, "rb").read()
             if kind == "audio":
                 from gateway.platforms.base import cache_audio_from_bytes
+
                 dest = cache_audio_from_bytes(data, ext=ext or ".ogg")
             elif kind == "image":
                 from gateway.platforms.base import cache_image_from_bytes
+
                 dest = cache_image_from_bytes(data, ext=ext or ".jpg")
             else:
                 return src
             logger.info("Copied %s blob to Hermes cache: %s -> %s", kind, src, dest)
             return dest
         except Exception as e:
-            logger.warning("Could not copy %s to Hermes cache: %s", src, e, exc_info=True)
+            logger.warning(
+                "Could not copy %s to Hermes cache: %s", src, e, exc_info=True
+            )
         return src
 
     async def _handle_non_text_message(
@@ -1154,7 +1626,10 @@ body {{
         # If the file isn't available yet (auto-download still in progress),
         # trigger download_full_message and re-fetch once before proceeding.
         if not filename and view_type not in ("Text", "", None):
-            logger.info("_handle_non_text_message: file not ready, triggering download for msg %s", msg_id)
+            logger.info(
+                "_handle_non_text_message: file not ready, triggering download for msg %s",
+                msg_id,
+            )
             try:
                 await self.rpc.download_full_message(self.account_id, int(msg_id))
                 await asyncio.sleep(2)
@@ -1162,11 +1637,19 @@ body {{
                 filename = msg.get("file", "")
                 file_mime = msg.get("file_mime", "") or ""
                 view_type = msg.get("view_type", "")
-                logger.info("_handle_non_text_message: after download: file=%r view_type=%r", filename, view_type)
+                logger.info(
+                    "_handle_non_text_message: after download: file=%r view_type=%r",
+                    filename,
+                    view_type,
+                )
             except Exception as e:
-                logger.warning("_handle_non_text_message: download_full_message failed: %s", e)
+                logger.warning(
+                    "_handle_non_text_message: download_full_message failed: %s", e
+                )
 
-        logger.info(f"_handle_non_text_message: view_type={view_type}, chat_id={chat_id}, msg_id={msg_id}, filename={filename[:100] if filename else None}")
+        logger.info(
+            f"_handle_non_text_message: view_type={view_type}, chat_id={chat_id}, msg_id={msg_id}, filename={filename[:100] if filename else None}"
+        )
 
         # Resolve sender and chat info (shared by all branches)
         from_id = msg.get("from_id")
@@ -1175,8 +1658,12 @@ body {{
         try:
             if from_id:
                 contact = await self.rpc.get_contact(self.account_id, int(from_id))
-                user_name = (contact.get("name") or contact.get("display_name")
-                             or contact.get("name_and_addr") or user_name)
+                user_name = (
+                    contact.get("name")
+                    or contact.get("display_name")
+                    or contact.get("name_and_addr")
+                    or user_name
+                )
         except Exception:
             pass
 
@@ -1185,7 +1672,7 @@ body {{
         try:
             chat = await self.rpc.get_basic_chat_info(self.account_id, int(chat_id))
             chat_name = chat.get("name", chat_name)
-            chat_type = "group" if chat.get("is_group", False) else "dm"
+            chat_type = "group" if chat.get("chat_type") == "Group" else "dm"
         except Exception:
             pass
 
@@ -1212,7 +1699,10 @@ body {{
                 view_type = MessageViewtype.VIDEO.value
 
         # Voice / Audio — let Hermes handle STT via media_urls
-        if view_type in (MessageViewtype.VOICE.value, MessageViewtype.AUDIO.value) and filename:
+        if (
+            view_type in (MessageViewtype.VOICE.value, MessageViewtype.AUDIO.value)
+            and filename
+        ):
             resolved = self._resolve_blob_path(filename)
             if resolved:
                 resolved = self._copy_to_hermes_cache(resolved, "audio")
@@ -1224,7 +1714,9 @@ body {{
                 text = f"{text}: {caption}"
             text = f"{text}\n[dc:chat={token}]"
             if not resolved:
-                logger.warning(f"Voice/audio file not found, forwarding without media: {filename}")
+                logger.warning(
+                    f"Voice/audio file not found, forwarding without media: {filename}"
+                )
             message_event = MessageEvent(
                 text=text,
                 message_type=hermes_type,
@@ -1236,7 +1728,15 @@ body {{
             await self.handle_message(message_event)
 
         # Image
-        elif view_type in (MessageViewtype.IMAGE.value, MessageViewtype.GIF.value, MessageViewtype.STICKER.value) and filename:
+        elif (
+            view_type
+            in (
+                MessageViewtype.IMAGE.value,
+                MessageViewtype.GIF.value,
+                MessageViewtype.STICKER.value,
+            )
+            and filename
+        ):
             resolved = self._resolve_blob_path(filename)
             if resolved:
                 resolved = self._copy_to_hermes_cache(resolved, "image")
@@ -1256,11 +1756,15 @@ body {{
             await self.handle_message(message_event)
 
         # File / document (including .xdc webxdc apps)
-        elif view_type in (MessageViewtype.FILE.value, MessageViewtype.VIDEO.value) and filename:
+        elif (
+            view_type in (MessageViewtype.FILE.value, MessageViewtype.VIDEO.value)
+            and filename
+        ):
             resolved = self._resolve_blob_path(filename)
             if resolved:
                 try:
                     from gateway.platforms.base import cache_document_from_bytes
+
                     data = open(resolved, "rb").read()
                     file_name = msg.get("file_name") or os.path.basename(resolved)
                     resolved = cache_document_from_bytes(data, file_name)
@@ -1286,7 +1790,9 @@ body {{
         elif view_type == "Call":
             # DC sends a Call info message (Missed call / Call ended) after calls.
             # The actual call is handled via IncomingCall/CallEnded events — ignore this.
-            logger.debug("Ignoring Call info message msg_id=%s text=%r", msg_id, msg.get("text"))
+            logger.debug(
+                "Ignoring Call info message msg_id=%s text=%r", msg_id, msg.get("text")
+            )
 
         else:
             logger.debug(f"Unhandled view_type={view_type}, file={filename}")
@@ -1306,38 +1812,56 @@ body {{
         """
         import os
 
-        logger.info(f"_handle_audio_message START: chat_id={chat_id}, msg_id={msg_id}, filename={filename}")
+        logger.info(
+            f"_handle_audio_message START: chat_id={chat_id}, msg_id={msg_id}, filename={filename}"
+        )
         logger.info(f"Original filename: {filename}")
         logger.info(f"File exists at original path: {os.path.exists(filename)}")
         if filename:
             logger.info(f"Absolute path: {os.path.abspath(filename)}")
             logger.info(f"Filename basename: {os.path.basename(filename)}")
-        logger.info(f"Message data: msg_type={msg.get('msg_type')}, from_id={msg.get('from_id')}, timestamp={msg.get('timestamp')}")
+        logger.info(
+            f"Message data: msg_type={msg.get('msg_type')}, from_id={msg.get('from_id')}, timestamp={msg.get('timestamp')}"
+        )
 
         if not filename:
-            logger.warning("_handle_audio_message: No filename in audio message, cannot process")
+            logger.warning(
+                "_handle_audio_message: No filename in audio message, cannot process"
+            )
             return
 
         # For Delta Chat, the file might be in blob directory
         if not os.path.exists(filename):
-            logger.info("_handle_audio_message: File not at original path, searching blob directory...")
+            logger.info(
+                "_handle_audio_message: File not at original path, searching blob directory..."
+            )
             dc_blob_dir = os.path.join(self._get_dc_config_dir(), "blobs")
-            logger.info(f"Blob directory: {dc_blob_dir}, exists: {os.path.exists(dc_blob_dir)}")
+            logger.info(
+                f"Blob directory: {dc_blob_dir}, exists: {os.path.exists(dc_blob_dir)}"
+            )
             if os.path.exists(dc_blob_dir):
                 blob_path = os.path.join(dc_blob_dir, os.path.basename(filename))
-                logger.info(f"Trying blob path: {blob_path}, exists: {os.path.exists(blob_path)}")
+                logger.info(
+                    f"Trying blob path: {blob_path}, exists: {os.path.exists(blob_path)}"
+                )
                 if os.path.exists(blob_path):
                     filename = blob_path
                     logger.info(f"Found file in blob dir: {filename}")
                 else:
-                    blob_path_no_ext = os.path.join(dc_blob_dir, os.path.splitext(os.path.basename(filename))[0])
-                    logger.info(f"Trying blob path (no ext): {blob_path_no_ext}, exists: {os.path.exists(blob_path_no_ext)}")
+                    blob_path_no_ext = os.path.join(
+                        dc_blob_dir, os.path.splitext(os.path.basename(filename))[0]
+                    )
+                    logger.info(
+                        f"Trying blob path (no ext): {blob_path_no_ext}, exists: {os.path.exists(blob_path_no_ext)}"
+                    )
                     if os.path.exists(blob_path_no_ext):
                         filename = blob_path_no_ext
                         logger.info(f"Found file in blob dir (no ext): {filename}")
 
         if not os.path.exists(filename):
-            logger.error(f"_handle_audio_message: Audio file not found at any location: {filename}")
+            logger.error(
+                f"_handle_audio_message: Audio file not found at any location: {filename}"
+            )
             logger.error("_handle_audio_message: Cannot transcribe - file unavailable")
             # Still notify about the voice message
             from_id = msg.get("from_id")
@@ -1356,6 +1880,7 @@ body {{
                 user_name=user_name,
             )
             from gateway.platforms.base import MessageEvent, MessageType
+
             message_event = MessageEvent(
                 text=f"[Voice message from {user_name}]",
                 message_type=MessageType.TEXT,
@@ -1363,13 +1888,17 @@ body {{
                 message_id=str(msg_id),
                 metadata={"chat_id": str(chat_id), "msg_type": "voice"},
             )
-            logger.info("_handle_audio_message: Forwarding notification message (no file)")
+            logger.info(
+                "_handle_audio_message: Forwarding notification message (no file)"
+            )
             await self.handle_message(message_event)
             return
 
         # File exists - get stats
         file_size = os.path.getsize(filename)
-        logger.info(f"_handle_audio_message: Audio file found: {filename}, size={file_size} bytes")
+        logger.info(
+            f"_handle_audio_message: Audio file found: {filename}, size={file_size} bytes"
+        )
         logger.info(f"_handle_audio_message: Transcribing audio message: {filename}")
 
         # Get sender info
@@ -1377,8 +1906,12 @@ body {{
         if from_id:
             try:
                 contact = await self.rpc.get_contact(self.account_id, int(from_id))
-                user_name = (contact.get("name") or contact.get("display_name")
-                             or contact.get("name_and_addr") or f"Contact {from_id}")
+                user_name = (
+                    contact.get("name")
+                    or contact.get("display_name")
+                    or contact.get("name_and_addr")
+                    or f"Contact {from_id}"
+                )
             except Exception:
                 user_name = f"Contact {from_id}"
         else:
@@ -1395,34 +1928,59 @@ body {{
         # Try to transcribe
         transcribed_text = None
         transcription_attempted = False
-        logger.info("_handle_audio_message: Checking for LLM transcription capability...")
+        logger.info(
+            "_handle_audio_message: Checking for LLM transcription capability..."
+        )
         try:
             # Try Hermes STT
             try:
                 from gateway.llm import llm
-                logger.info(f"_handle_audio_message: llm module imported, type={type(llm)}")
-                has_transcribe = hasattr(llm, 'transcribe_audio_file')
-                logger.info(f"_handle_audio_message: llm.transcribe_audio_file available: {has_transcribe}")
+
+                logger.info(
+                    f"_handle_audio_message: llm module imported, type={type(llm)}"
+                )
+                has_transcribe = hasattr(llm, "transcribe_audio_file")
+                logger.info(
+                    f"_handle_audio_message: llm.transcribe_audio_file available: {has_transcribe}"
+                )
                 if has_transcribe:
                     transcription_attempted = True
-                    logger.info("_handle_audio_message: Calling llm.transcribe_audio_file...")
+                    logger.info(
+                        "_handle_audio_message: Calling llm.transcribe_audio_file..."
+                    )
                     transcription_result = await llm.transcribe_audio_file(filename)
-                    logger.info(f"_handle_audio_message: Transcription result: {transcription_result}")
+                    logger.info(
+                        f"_handle_audio_message: Transcription result: {transcription_result}"
+                    )
                     if transcription_result and transcription_result.get("text"):
                         transcribed_text = transcription_result["text"]
-                        logger.info(f"_handle_audio_message: Transcribed text (first 200 chars): {transcribed_text[:200]}")
+                        logger.info(
+                            f"_handle_audio_message: Transcribed text (first 200 chars): {transcribed_text[:200]}"
+                        )
                     else:
-                        logger.warning("_handle_audio_message: Transcription returned empty or no text field")
+                        logger.warning(
+                            "_handle_audio_message: Transcription returned empty or no text field"
+                        )
                 else:
-                    logger.warning("_handle_audio_message: LLM does NOT have transcribe_audio_file method")
+                    logger.warning(
+                        "_handle_audio_message: LLM does NOT have transcribe_audio_file method"
+                    )
             except Exception as e:
                 import traceback
-                logger.warning(f"_handle_audio_message: llm.transcribe_audio_file failed: {e}")
-                logger.debug(f"_handle_audio_message: llm.transcribe_audio_file traceback:\n{traceback.format_exc()}")
+
+                logger.warning(
+                    f"_handle_audio_message: llm.transcribe_audio_file failed: {e}"
+                )
+                logger.debug(
+                    f"_handle_audio_message: llm.transcribe_audio_file traceback:\n{traceback.format_exc()}"
+                )
         except Exception as e:
             import traceback
+
             logger.warning(f"_handle_audio_message: Transcription outer exception: {e}")
-            logger.debug(f"_handle_audio_message: Transcription traceback:\n{traceback.format_exc()}")
+            logger.debug(
+                f"_handle_audio_message: Transcription traceback:\n{traceback.format_exc()}"
+            )
 
         # Build response
         chat_type = "group" if msg.get("is_group", False) else "dm"
@@ -1438,13 +1996,19 @@ body {{
 
         if transcribed_text:
             full_text = f"[Voice message from {user_name}]: {transcribed_text}"
-            logger.info("_handle_audio_message: SUCCESS - voice message transcribed and will be forwarded")
+            logger.info(
+                "_handle_audio_message: SUCCESS - voice message transcribed and will be forwarded"
+            )
         else:
             full_text = f"[Voice message from {user_name}]"
             if transcription_attempted:
-                logger.warning("_handle_audio_message: Transcription attempted but returned no text")
+                logger.warning(
+                    "_handle_audio_message: Transcription attempted but returned no text"
+                )
             else:
-                logger.warning("_handle_audio_message: NO TRANSCRIPTION - llm.transcribe_audio_file not available, file will be forwarded as notification only")
+                logger.warning(
+                    "_handle_audio_message: NO TRANSCRIPTION - llm.transcribe_audio_file not available, file will be forwarded as notification only"
+                )
 
         logger.debug(f"_handle_audio_message: Final message text: {full_text[:150]}")
         message_event = MessageEvent(
@@ -1464,7 +2028,10 @@ body {{
         )
         logger.info("_handle_audio_message: Forwarding message to Hermes...")
         await self.handle_message(message_event)
-        logger.info("_handle_audio_message: COMPLETE - Audio message handled successfully")
+        logger.info(
+            "_handle_audio_message: COMPLETE - Audio message handled successfully"
+        )
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get metadata for a chat.
 
@@ -1482,7 +2049,7 @@ body {{
                 )
                 return {
                     "name": chat.get("name", chat_id),
-                    "type": "group" if chat.get("is_group") else "dm",
+                    "type": "group" if chat.get("chat_type") == "Group" else "dm",
                 }
         except Exception as e:
             logger.warning(f"Error getting chat info for {chat_id}: {e}")
@@ -1507,7 +2074,9 @@ body {{
                 logger.debug(f"Deleted message {message_id} from chat {chat_id}")
                 return True
         except Exception as e:
-            logger.error(f"Error deleting message {message_id} from chat {chat_id}: {e}")
+            logger.error(
+                f"Error deleting message {message_id} from chat {chat_id}: {e}"
+            )
             return False
         return False
 
@@ -1532,7 +2101,66 @@ def check_requirements() -> bool:
 
 def validate_config(config) -> bool:
     """Validate platform configuration."""
-    return check_requirements()
+    if not check_requirements():
+        return False
+
+    extra = getattr(config, "extra", {}) or {}
+
+    email = os.getenv("DELTACHAT_EMAIL") or extra.get("email", "auto")
+    password = os.getenv("DELTACHAT_PASSWORD") or extra.get("password")
+    if email and email != "auto" and not _is_valid_email(email):
+        raise ValueError(f"DELTACHAT_EMAIL is not a valid email address: {email!r}")
+    if email and email != "auto" and not password:
+        raise ValueError(
+            "DELTACHAT_PASSWORD required when DELTACHAT_EMAIL is set (not 'auto')"
+        )
+
+    dm_policy = os.getenv("DELTACHAT_DM_POLICY") or extra.get("dm_policy", "pairing")
+    if dm_policy not in ("open", "allowlist", "pairing", "disabled"):
+        raise ValueError(f"Invalid DELTACHAT_DM_POLICY: {dm_policy!r}")
+
+    group_policy = os.getenv("DELTACHAT_GROUP_POLICY") or extra.get(
+        "group_policy", "open"
+    )
+    if group_policy not in ("open", "allowlist", "disabled"):
+        raise ValueError(f"Invalid DELTACHAT_GROUP_POLICY: {group_policy!r}")
+
+    # Lightweight path checks (do not create directories or require the binary).
+    data_dir = os.getenv("DELTACHAT_DATA_DIR") or extra.get(
+        "data_dir", "~/.hermes/deltachat-data"
+    )
+    _safe_data_dir(data_dir, create=False)
+
+    avatar_path = os.getenv("DELTACHAT_AVATAR_PATH") or extra.get("avatar_path")
+    if avatar_path:
+        _validate_avatar_path(avatar_path, strict=False)
+
+    rpc_server = os.getenv("DELTACHAT_RPC_SERVER") or extra.get(
+        "rpc_server", "deltachat-rpc-server"
+    )
+    if rpc_server != "deltachat-rpc-server":
+        _validate_rpc_server_path(rpc_server, strict=True)
+
+    chatmail_servers = os.getenv("DELTACHAT_CHATMAIL_SERVERS") or extra.get(
+        "chatmail_servers"
+    )
+    if chatmail_servers:
+        servers = _parse_chatmail_servers(chatmail_servers)
+        if not servers:
+            raise ValueError(
+                f"Invalid DELTACHAT_CHATMAIL_SERVERS: {chatmail_servers!r}"
+            )
+
+    max_len = os.getenv("DELTACHAT_MAX_MESSAGE_LENGTH") or extra.get(
+        "max_message_length"
+    )
+    if max_len:
+        try:
+            int(max_len)
+        except ValueError:
+            raise ValueError(f"Invalid DELTACHAT_MAX_MESSAGE_LENGTH: {max_len!r}")
+
+    return True
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:
@@ -1550,6 +2178,17 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
             return None
 
     result = {"rpc_server": rpc_server}
+
+    # Add onboarding / profile fields if set
+    email = os.getenv("DELTACHAT_EMAIL")
+    if email:
+        result["email"] = email
+    result["data_dir"] = os.getenv("DELTACHAT_DATA_DIR", "~/.hermes/deltachat-data")
+    result["display_name"] = os.getenv("DELTACHAT_DISPLAY_NAME", "Hermes")
+    chatmail_servers = os.getenv("DELTACHAT_CHATMAIL_SERVERS")
+    if not chatmail_servers:
+        chatmail_servers = os.getenv("DELTACHAT_CHATMAIL_SERVER", "nine.testrun.org")
+    result["chatmail_servers"] = chatmail_servers
 
     # Add home channel if set
     home_channel = os.getenv("DELTACHAT_HOME_CHANNEL")
@@ -1594,11 +2233,12 @@ def register_platform(ctx):
             "Do NOT call dc_safe_rpc_call, dc_chat_rpc_spec, or dc_rpc_spec unless the user explicitly "
             "asks for a Delta Chat-specific operation that cannot be done with the standard tools."
         ),
-        max_message_length=3200,
+        max_message_length=DC_MESSAGE_MAX_LEN,
     )
 
     # Register bundled skills so skill_view('deltachat-platform:<name>') resolves them.
     from pathlib import Path as _Path
+
     skills_dir = _Path(_plugin_dir) / "skills"
     logger.info(f"Checking for skills in: {skills_dir}")
     if skills_dir.is_dir():
@@ -1607,7 +2247,9 @@ def register_platform(ctx):
             if skill_md.is_file():
                 try:
                     ctx.register_skill(skill_dir.name, skill_md)
-                    logger.info("Registered plugin skill: %s from %s", skill_dir.name, skill_md)
+                    logger.info(
+                        "Registered plugin skill: %s from %s", skill_dir.name, skill_md
+                    )
                 except Exception as e:
                     logger.warning("Could not register skill %s: %s", skill_dir.name, e)
     else:
@@ -1652,7 +2294,8 @@ def register_rpc_tools(ctx) -> None:
         except Exception as e:
             return f"Error: {e}"
         safe_methods = [
-            m for m in spec.get("methods", [])
+            m
+            for m in spec.get("methods", [])
             if any(p["name"] == "chatId" for p in m.get("params", []))
             and m["name"] not in _DESTRUCTIVE_METHODS
             and not m["name"].startswith("delete_")
@@ -1665,15 +2308,25 @@ def register_rpc_tools(ctx) -> None:
         chat_token = (args or {}).get("chat_token")
         params = (args or {}).get("params") or []
         if not method or not isinstance(method, str):
-            return json.dumps({"error": "Missing 'method' (snake_case RPC name). Use dc_chat_rpc_spec to find one."})
+            return json.dumps(
+                {
+                    "error": "Missing 'method' (snake_case RPC name). Use dc_chat_rpc_spec to find one."
+                }
+            )
         adapter = _active_adapter
         if adapter is None or adapter.rpc is None:
             return {"error": "Delta Chat is not connected"}
 
         # Resolve token → real chat_id
-        real_chat_id = await _resolve_chat_token(adapter.rpc, adapter.account_id, chat_token)
+        real_chat_id = await _resolve_chat_token(
+            adapter.rpc, adapter.account_id, chat_token
+        )
         if real_chat_id is None:
-            return json.dumps({"error": "Unknown chat_token — use the [dc:chat=...] value from your message"})
+            return json.dumps(
+                {
+                    "error": "Unknown chat_token — use the [dc:chat=...] value from your message"
+                }
+            )
 
         # Block destructive methods
         if (
@@ -1689,13 +2342,23 @@ def register_rpc_tools(ctx) -> None:
         except Exception as e:
             return json.dumps({"error": f"Could not fetch spec: {e}"})
 
-        method_entry = next((m for m in spec.get("methods", []) if m["name"] == method), None)
+        method_entry = next(
+            (m for m in spec.get("methods", []) if m["name"] == method), None
+        )
         if method_entry is None:
-            return json.dumps({"error": f"Unknown method '{method}' — use dc_chat_rpc_spec to browse available methods"})
+            return json.dumps(
+                {
+                    "error": f"Unknown method '{method}' — use dc_chat_rpc_spec to browse available methods"
+                }
+            )
 
         param_names = [p["name"] for p in method_entry.get("params", [])]
         if "chatId" not in param_names:
-            return json.dumps({"error": f"'{method}' has no chatId parameter — use dc_rpc_call for non-chat methods"})
+            return json.dumps(
+                {
+                    "error": f"'{method}' has no chatId parameter — use dc_rpc_call for non-chat methods"
+                }
+            )
 
         # Build positional params: accountId at [0], chatId at [1]
         full_params = [adapter.account_id, real_chat_id] + list(params or [])
@@ -1732,17 +2395,32 @@ def register_rpc_tools(ctx) -> None:
             return json.dumps({"error": "Delta Chat not connected"})
 
         if not opening:
-            return json.dumps({"error": "Provide 'opening' — the exact words to say when they pick up."})
+            return json.dumps(
+                {
+                    "error": "Provide 'opening' — the exact words to say when they pick up."
+                }
+            )
 
-        real_chat_id = await _resolve_chat_token(adapter.rpc, adapter.account_id, chat_token)
+        real_chat_id = await _resolve_chat_token(
+            adapter.rpc, adapter.account_id, chat_token
+        )
         if real_chat_id is None:
-            return json.dumps({"error": "Unknown chat_token — use the [dc:chat=...] value"})
+            return json.dumps(
+                {"error": "Unknown chat_token — use the [dc:chat=...] value"}
+            )
 
         try:
-            msg_id = await adapter._call_manager.start_call(str(real_chat_id), opening=opening)
-            return json.dumps({"success": True, "msg_id": msg_id,
-                               "message": "Call connected — the opening line is being "
-                                          "spoken and the conversation is live."})
+            msg_id = await adapter._call_manager.start_call(
+                str(real_chat_id), opening=opening
+            )
+            return json.dumps(
+                {
+                    "success": True,
+                    "msg_id": msg_id,
+                    "message": "Call connected — the opening line is being "
+                    "spoken and the conversation is live.",
+                }
+            )
         except asyncio.TimeoutError:
             return json.dumps({"error": "Call was not answered"})
         except Exception as e:
@@ -1912,7 +2590,7 @@ def register_rpc_tools(ctx) -> None:
                         "type": "string",
                         "description": (
                             "The EXACT words to say the instant they pick up "
-                            "(e.g. \"Hi Simon, quick reminder to take your medication.\"). "
+                            '(e.g. "Hi Simon, quick reminder to take your medication."). '
                             "Synthesized while the phone is still ringing and played "
                             "immediately on answer — no startup delay. Write it as natural "
                             "speech, not a topic label."

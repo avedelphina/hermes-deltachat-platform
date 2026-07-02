@@ -1,14 +1,86 @@
 name: deltachat-platform
 label: Delta Chat
 kind: platform
-version: 1.0.0
+version: 1.1.0
 description: Delta Chat messaging platform adapter for Hermes Agent. Supports text, webxdc mini apps, voice messages, images, and videos.
 author: Simon Laux
 requires_env:
   - name: DELTACHAT_RPC_SERVER
     description: "Path to deltachat-rpc-server binary. After setting, run: python ~/.hermes/plugins/deltachat-platform/setup.py"
 optional_env:
+  - name: DELTACHAT_EMAIL
+    description: "Email for the bot account. Use 'auto' to create a free chatmail account automatically during connect"
+    prompt: "Email address (or 'auto' for chatmail)"
+    password: false
+  - name: DELTACHAT_PASSWORD
+    description: "Email password (not needed when DELTACHAT_EMAIL=auto)"
+    prompt: "Email password (optional)"
+    password: true
+  - name: DELTACHAT_DATA_DIR
+    description: "Directory for Delta Chat account data (default: ~/.hermes/deltachat-data)"
+    prompt: "Data directory"
+    password: false
+  - name: DELTACHAT_CHATMAIL_SERVER
+    description: "Chatmail server for auto accounts (default: nine.testrun.org)"
+    prompt: "Chatmail server"
+    password: false
+  - name: DELTACHAT_CHATMAIL_SERVERS
+    description: "Comma-separated chatmail servers to try in order (overrides DELTACHAT_CHATMAIL_SERVER)"
+    prompt: "Chatmail servers (comma-separated)"
+    password: false
+  - name: DELTACHAT_DISPLAY_NAME
+    description: "Bot display name shown to contacts (default: Hermes)"
+    prompt: "Bot display name"
+    password: false
+  - name: DELTACHAT_AVATAR_PATH
+    description: "Path to bot avatar image (PNG or JPEG)"
+    prompt: "Avatar image path"
+    password: false
   - name: DELTACHAT_HOME_CHANNEL
     description: "Default chat for cron delivery"
     prompt: "Home chat"
+    password: false
+  - name: DELTACHAT_ALLOWED_USERS
+    description: "Comma-separated email addresses allowed to use the bot (empty = use dm/group policy)"
+    prompt: "Allowed emails (comma-separated, optional)"
+    password: false
+  - name: DELTACHAT_ALLOW_ALL_USERS
+    description: "Set to 'true' to allow anyone regardless of policies (dev/open mode)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: DELTACHAT_DM_POLICY
+    description: "DM policy: open, allowlist, pairing (verified contacts only), disabled (default: pairing)"
+    prompt: "DM policy"
+    password: false
+  - name: DELTACHAT_DM_ALLOWED_USERS
+    description: "Comma-separated emails for 'allowlist' DM policy (overrides DELTACHAT_ALLOWED_USERS for DMs)"
+    prompt: "DM allowlist (optional)"
+    password: false
+  - name: DELTACHAT_GROUP_POLICY
+    description: "Group chat policy: open, allowlist, disabled (default: open)"
+    prompt: "Group policy"
+    password: false
+  - name: DELTACHAT_GROUP_ALLOWED_USERS
+    description: "Comma-separated emails for 'allowlist' group policy"
+    prompt: "Group allowlist (optional)"
+    password: false
+  - name: DELTACHAT_REQUIRE_MENTION
+    description: "Require @mention in group chats before responding (default: false)"
+    prompt: "Require mention in groups? (true/false)"
+    password: false
+  - name: DELTACHAT_SEND_REJECTION_REPLIES
+    description: "Send explanation messages when a sender is rejected (default: true)"
+    prompt: "Send rejection replies? (true/false)"
+    password: false
+  - name: DELTACHAT_MAX_MESSAGE_LENGTH
+    description: "Character limit for automatic message splitting (default: 3600)"
+    prompt: "Max message length"
+    password: false
+  - name: DELTACHAT_RATE_LIMIT_MAX
+    description: "Max inbound messages per sender per window (default: 30)"
+    prompt: "Rate limit max"
+    password: false
+  - name: DELTACHAT_RATE_LIMIT_WINDOW
+    description: "Rate-limit window in seconds (default: 60)"
+    prompt: "Rate limit window"
     password: false
