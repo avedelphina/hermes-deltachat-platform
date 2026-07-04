@@ -112,7 +112,7 @@ class DeltaChatAccountSetup:
             self.rpc.set_config(account_id, "displayname", name)
             print(f"Account created! ID: {account_id}")
         else:
-            account_id = accounts[0]['id']
+            account_id = accounts[0]["id"]
             print(f"\nUsing existing account: {account_id}")
 
         # Check if transport is configured
@@ -135,14 +135,16 @@ class DeltaChatAccountSetup:
                     # Strip https:// for display
                     display_servers = [s.replace("https://", "") for s in servers]
 
-                    print(f"\nSelect relay server:")
+                    print("\nSelect relay server:")
                     print("-" * 40)
                     print(f"  1. {display_servers[0]} (default)")
                     for i, server in enumerate(display_servers[1:], 2):
                         print(f"  {i}. {server}")
                     print(f"  {len(servers) + 1}. Enter custom relay server")
 
-                    relay_choice = input(f"\nSelect relay [1-{len(servers) + 1}, default=1]: ").strip()
+                    relay_choice = input(
+                        f"\nSelect relay [1-{len(servers) + 1}, default=1]: "
+                    ).strip()
 
                     if not relay_choice or relay_choice == "1":
                         relay = servers[0]
@@ -152,20 +154,26 @@ class DeltaChatAccountSetup:
                             if 0 <= idx < len(servers):
                                 relay = servers[idx]
                             elif idx == len(servers):
-                                relay = input(f"Enter relay server: ").strip()
+                                relay = input("Enter relay server: ").strip()
                                 # Add https:// if user didn't include it
                                 if not relay.startswith("https://"):
                                     relay = f"https://{relay}"
                             else:
-                                print(f"Invalid choice, using default: {display_servers[0]}")
+                                print(
+                                    f"Invalid choice, using default: {display_servers[0]}"
+                                )
                                 relay = servers[0]
                         except ValueError:
-                            print(f"Invalid choice, using default: {display_servers[0]}")
+                            print(
+                                f"Invalid choice, using default: {display_servers[0]}"
+                            )
                             relay = servers[0]
 
                     # Strip https:// for QR code
                     relay_host = relay.replace("https://", "")
-                    self.rpc.add_transport_from_qr(account_id, f"dcaccount:{relay_host}")
+                    self.rpc.add_transport_from_qr(
+                        account_id, f"dcaccount:{relay_host}"
+                    )
                     print(f"Transport configured using relay: {relay_host}")
                     break
 
@@ -174,7 +182,9 @@ class DeltaChatAccountSetup:
                     email = input("\nEmail: ").strip()
                     password = input("Password: ").strip()
 
-                    self.rpc.add_or_update_transport(account_id, {"addr": email, "password": password})
+                    self.rpc.add_or_update_transport(
+                        account_id, {"addr": email, "password": password}
+                    )
                     print(f"Transport configured using email: {email}")
                     break
 
@@ -182,8 +192,12 @@ class DeltaChatAccountSetup:
                     print("Invalid choice, please try again.")
 
         # Offer to change display name
-        current_name = self.rpc.get_account_info(account_id).get('name', 'Unnamed')
-        change_name = input(f"\nCurrent display name: '{current_name}'. Change? [y/N]: ").strip().lower()
+        current_name = self.rpc.get_account_info(account_id).get("name", "Unnamed")
+        change_name = (
+            input(f"\nCurrent display name: '{current_name}'. Change? [y/N]: ")
+            .strip()
+            .lower()
+        )
         if change_name == "y":
             new_name = input(f"New display name [{current_name}]: ").strip()
             if new_name and new_name != current_name:
@@ -194,8 +208,6 @@ class DeltaChatAccountSetup:
                     print(f"Failed to change name: {e}")
 
         return account_id
-
-
 
 
 def setup_account(rpc, profile_name: str = "default") -> Optional[str]:
@@ -219,6 +231,7 @@ def setup_account(rpc, profile_name: str = "default") -> Optional[str]:
 def get_profiles():
     """Get list of Hermes profile directories."""
     import os
+
     default_profile = os.path.expanduser("~/.hermes")
     profiles_dir = os.path.join(os.path.expanduser("~/.hermes"), "profiles")
     profiles = []
@@ -242,6 +255,7 @@ def select_profile():
         Tuple of (profile_name, profile_path)
     """
     import os
+
     profiles = get_profiles()
 
     if not profiles:
@@ -282,8 +296,7 @@ def get_account_address(rpc, account_id: int) -> Optional[str]:
         # Try to get SecureJoin QR code content (which is the link)
         try:
             qr_content = rpc.get_chat_securejoin_qr_code(
-                account_id,
-                None  # chat_id - None for account-level QR
+                account_id, None  # chat_id - None for account-level QR
             )
             if qr_content:
                 return qr_content
@@ -314,6 +327,7 @@ if __name__ == "__main__":
 
     # Try to import deltachat2 from vendor or system
     import sys as _sys
+
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     vendor_dir = os.path.join(plugin_dir, "vendor")
     if os.path.exists(vendor_dir) and vendor_dir not in _sys.path:
@@ -328,6 +342,7 @@ if __name__ == "__main__":
 
     # Enable debug logging for RPC if requested
     import logging
+
     if os.getenv("DELTACHAT_DEBUG"):
         logging.getLogger("deltachat2").setLevel(logging.DEBUG)
         logging.getLogger("deltachat2.IOTransport").setLevel(logging.DEBUG)
@@ -373,6 +388,6 @@ if __name__ == "__main__":
         addr = get_account_address(rpc, account_id)
         if addr:
             print(f"\nSecureJoin link: {addr}")
-            print(f"Share this link to chat with the bot via Delta Chat")
+            print("Share this link to chat with the bot via Delta Chat")
 
     transport.close()

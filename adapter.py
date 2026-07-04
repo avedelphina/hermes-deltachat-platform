@@ -2467,6 +2467,13 @@ def _apply_yaml_config(
     """
     seeded: Dict[str, Any] = {}
 
+    # why: Hermes replaces extra wholesale with our return value, so values already
+    # under platform_cfg["extra"] (e.g. set by an earlier hook) must be carried
+    # forward or they are silently dropped.
+    extra_block = platform_cfg.get("extra") or {}
+    if isinstance(extra_block, dict):
+        seeded.update(extra_block)
+
     for yaml_key, extra_key in (
         ("display_name", "display_name"),
         ("avatar_path", "avatar_path"),
@@ -2475,6 +2482,12 @@ def _apply_yaml_config(
         ("chatmail_servers", "chatmail_servers"),
         ("data_dir", "data_dir"),
         ("home_channel", "home_channel"),
+        ("allowed_users", "allowed_users"),
+        ("allow_all_users", "allow_all_users"),
+        ("dm_allowed_users", "dm_allowed_users"),
+        ("group_allowed_users", "group_allowed_users"),
+        ("dm_policy", "dm_policy"),
+        ("group_policy", "group_policy"),
         ("require_mention", "require_mention"),
         ("free_response_channels", "free_response_channels"),
         ("auto_delete_interval", "auto_delete_interval"),

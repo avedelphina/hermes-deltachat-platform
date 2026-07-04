@@ -18,7 +18,8 @@ trickle behavior or the NAT/TURN path, so a PASS here does not guarantee the
 phone works — final confirmation still needs a live call. Treat as a fast
 diagnostic + regression guard, not a workaround oracle.
 
-Run: nix develop --command bash -c "cd tests && python3 -m pytest test_call_webrtc_loopback.py -q -s"
+Run: nix develop --command bash -c \
+    "cd tests && python3 -m pytest test_call_webrtc_loopback.py -q -s"
 """
 
 import asyncio
@@ -32,7 +33,10 @@ import pytest
 pytestmark = pytest.mark.slow
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor"))
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor"),
+)
 
 import call_handler as ch  # noqa: E402
 from aiortc import (  # noqa: E402
@@ -77,8 +81,11 @@ async def _wait_connected(pcs, timeout=15.0):
 
 def _make_answerer(bundle: bool):
     """A mock 'mobile' answerer: audio + the two negotiated data channels."""
-    config = (RTCConfiguration(bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
-              if bundle else RTCConfiguration())
+    config = (
+        RTCConfiguration(bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
+        if bundle
+        else RTCConfiguration()
+    )
     pc = RTCPeerConnection(config)
     pc.createDataChannel("iceTrickling", negotiated=True, id=1)
     pc.createDataChannel("mutedState", negotiated=True, id=3)
@@ -88,8 +95,11 @@ def _make_answerer(bundle: bool):
 
 def _make_offerer(bundle: bool, data_channels: bool):
     """A configurable offerer to A/B workarounds (no dependency on reverted code)."""
-    config = (RTCConfiguration(bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
-              if bundle else RTCConfiguration())
+    config = (
+        RTCConfiguration(bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
+        if bundle
+        else RTCConfiguration()
+    )
     pc = RTCPeerConnection(config)
     if data_channels:
         pc.createDataChannel("iceTrickling", negotiated=True, id=1)
@@ -118,11 +128,14 @@ async def _run_real_offerer_vs_answerer(answerer_bundle: bool):
     _new_peer_connection(with_data_channels=False) + HermesAudioTrack) against
     an aiortc answerer. Ties the test to production code. Returns (ok, states)."""
     from unittest.mock import MagicMock, AsyncMock
+
     adapter = MagicMock()
     adapter.rpc.ice_servers = AsyncMock(return_value="[]")  # loopback: no TURN needed
     mgr = ch.CallManager(adapter=adapter)
 
-    off, _off_ice = await mgr._new_peer_connection(with_data_channels=False)  # as start_call does
+    off, _off_ice = await mgr._new_peer_connection(
+        with_data_channels=False
+    )  # as start_call does
     off.addTrack(ch.HermesAudioTrack())
     answer_pc = _make_answerer(bundle=answerer_bundle)
     try:
@@ -143,7 +156,9 @@ async def test_real_callmanager_offerer_connects_vs_maxbundle_answerer():
     """The actual CallManager outgoing setup connects against a max-bundle
     answerer (the DC mobile). Exercises production code, not just a mock offer."""
     ok, states = await _run_real_offerer_vs_answerer(answerer_bundle=True)
-    print(f"\n[real CallManager offerer vs max-bundle answerer] connected={ok} states={states}")
+    print(
+        f"\n[real CallManager offerer vs max-bundle answerer] connected={ok} states={states}"
+    )
     assert ok, f"real offerer setup did not connect (states={states})"
 
 
@@ -155,7 +170,9 @@ async def test_audio_only_offerer_connects_vs_maxbundle_answerer():
     offerer = _make_offerer(bundle=False, data_channels=False)
     answerer = _make_answerer(bundle=True)
     ok, states = await _negotiate(offerer, answerer)
-    print(f"\n[audio-only offerer vs max-bundle answerer] connected={ok} states={states}")
+    print(
+        f"\n[audio-only offerer vs max-bundle answerer] connected={ok} states={states}"
+    )
     assert ok, f"audio-only offerer did not connect (states={states})"
 
 
@@ -167,7 +184,9 @@ async def test_data_channel_offerer_fails_vs_maxbundle_answerer():
     offerer = _make_offerer(bundle=False, data_channels=True)
     answerer = _make_answerer(bundle=True)
     ok, states = await _negotiate(offerer, answerer)
-    print(f"\n[data-channel offerer vs max-bundle answerer] connected={ok} states={states}")
+    print(
+        f"\n[data-channel offerer vs max-bundle answerer] connected={ok} states={states}"
+    )
     assert not ok, "data-channel offerer now connects — aiortc may be fixed; revisit"
 
 

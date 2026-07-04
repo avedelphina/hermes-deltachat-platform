@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.2] - 2026-07-02
+
+### Fixed
+- `_apply_yaml_config` now preserves values already under `platform_cfg["extra"]` instead of silently dropping them.
+- `_apply_yaml_config` now bridges access-control keys from YAML (`allowed_users`, `allow_all_users`, `dm_allowed_users`, `group_allowed_users`, `dm_policy`, `group_policy`).
+- Code formatting (`black`) applied to `setup.py` and `tests/test_call_webrtc_loopback.py`.
+
+### Tests
+- Added `TestApplyYamlConfig` covering extra preservation, access-control bridging, and YAML-key precedence.
+
 ## [1.5.1] - 2026-07-02
 
 ### Added
