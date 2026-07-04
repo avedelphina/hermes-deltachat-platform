@@ -338,3 +338,48 @@ class TestApplyYamlConfig:
         platform_cfg = {"extra": {"dm_policy": "open"}, "dm_policy": "allowlist"}
         seeded = _apply_yaml_config({}, platform_cfg)
         assert seeded["dm_policy"] == "allowlist"
+
+
+class TestBotExchangeGuard:
+    def test_disabled_without_human_users(self, platform_config):
+        platform_config.extra = {"max_bot_exchanges": 2}
+        adapter = DeltaChatAdapter(platform_config)
+        for _ in range(10):
+            should_process, _ = adapter._check_bot_exchange_guard("chat1", "bot-a@x")
+            assert should_process is True
+
+    def test_trips_across_alternating_senders(self, platform_config):
+        platform_config.extra = {
+            "human_users": "tom@x",
+            "max_bot_exchanges": 2,
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        senders = ["bot-a@x", "bot-b@x", "bot-c@x", "bot-a@x"]
+        results = [adapter._check_bot_exchange_guard("chat1", s)[0] for s in senders]
+        # 3rd message (count=3) exceeds max_bot_exchanges=2, regardless of
+        # each message coming from a different sender.
+        assert results == [True, True, False, False]
+
+    def test_human_message_resets_the_count(self, platform_config):
+        platform_config.extra = {
+            "human_users": "tom@x",
+            "max_bot_exchanges": 2,
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter._check_bot_exchange_guard("chat1", "bot-a@x")
+        adapter._check_bot_exchange_guard("chat1", "bot-b@x")
+        adapter._check_bot_exchange_guard("chat1", "tom@x")
+        should_process, _ = adapter._check_bot_exchange_guard("chat1", "bot-c@x")
+        assert should_process is True
+
+    def test_should_warn_only_once_per_trip(self, platform_config):
+        platform_config.extra = {
+            "human_users": "tom@x",
+            "max_bot_exchanges": 1,
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter._check_bot_exchange_guard("chat1", "bot-a@x")
+        _, warn1 = adapter._check_bot_exchange_guard("chat1", "bot-b@x")
+        _, warn2 = adapter._check_bot_exchange_guard("chat1", "bot-c@x")
+        assert warn1 is True
+        assert warn2 is False
