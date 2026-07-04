@@ -2455,6 +2455,38 @@ def validate_config(config) -> bool:
     return True
 
 
+def _apply_yaml_config(
+    yaml_cfg: Dict[str, Any], platform_cfg: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Bridge YAML config values to env-style extra keys for the platform adapter.
+
+    The gateway config loader calls this hook with the parsed YAML tree and the
+    deltachat-platform config block (which may be nested under ``platforms``).
+    Values returned here are merged into ``platform_config.extra`` and are then
+    read by the adapter constructor.
+    """
+    seeded: Dict[str, Any] = {}
+
+    for yaml_key, extra_key in (
+        ("display_name", "display_name"),
+        ("avatar_path", "avatar_path"),
+        ("email", "email"),
+        ("chatmail_server", "chatmail_server"),
+        ("chatmail_servers", "chatmail_servers"),
+        ("data_dir", "data_dir"),
+        ("home_channel", "home_channel"),
+        ("require_mention", "require_mention"),
+        ("free_response_channels", "free_response_channels"),
+        ("auto_delete_interval", "auto_delete_interval"),
+        ("max_message_length", "max_message_length"),
+    ):
+        value = platform_cfg.get(yaml_key)
+        if value is not None:
+            seeded[extra_key] = value
+
+    return seeded
+
+
 def _env_enablement() -> Optional[Dict[str, Any]]:
     """Seed PlatformConfig from environment variables."""
     import shutil
@@ -2480,7 +2512,9 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     result["data_dir"] = os.getenv(
         "DELTACHAT_DATA_DIR", os.path.join(get_hermes_home(), "deltachat-platform")
     )
-    result["display_name"] = os.getenv("DELTACHAT_DISPLAY_NAME", "Hermes")
+    display_name = os.getenv("DELTACHAT_DISPLAY_NAME")
+    if display_name:
+        result["display_name"] = display_name
     avatar_path = os.getenv("DELTACHAT_AVATAR_PATH")
     if avatar_path:
         result["avatar_path"] = avatar_path
@@ -2510,6 +2544,7 @@ def register_platform(ctx):
         validate_config=validate_config,
         required_env=["DELTACHAT_RPC_SERVER"],
         env_enablement_fn=_env_enablement,
+        apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="DELTACHAT_HOME_CHANNEL",
         emoji="💬",
         platform_hint=(
