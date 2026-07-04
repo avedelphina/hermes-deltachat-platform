@@ -84,6 +84,10 @@ optional_env:
     description: "Rate-limit window in seconds (default: 60)"
     prompt: "Rate limit window"
     password: false
+  - name: DELTACHAT_MAX_CONSECUTIVE_REPLIES
+    description: "Stop auto-replying to the same sender in a chat after this many messages in a row with no one else chiming in — guards against bot-to-bot loops (default: 20, <=0 disables)"
+    prompt: "Max consecutive replies to same sender"
+    password: false
   - name: DELTACHAT_ENABLE_RAW_RPC
     description: "Set to '1' to register the unrestricted dc_rpc_call tool (use with caution)"
     prompt: "Enable raw RPC access? (1/0)"

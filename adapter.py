@@ -606,6 +606,17 @@ class DeltaChatAdapter(BasePlatformAdapter):
             "DELTACHAT_REQUIRE_MENTION", "require_mention", "false"
         ).lower() in ("1", "true", "yes")
 
+        # Guards against bot-to-bot auto-reply loops (e.g. multiple agents in
+        # one group replying to each other forever). <=0 disables the guard.
+        self._max_consecutive_replies = int(
+            g(
+                "DELTACHAT_MAX_CONSECUTIVE_REPLIES",
+                "max_consecutive_replies",
+                "20",
+            )
+        )
+        self._reply_streak: dict[str, tuple[str, int, bool]] = {}
+
         # Onboarding / profile settings
         self._email = g("DELTACHAT_EMAIL", "email", "auto").strip() or "auto"
         self._password = g("DELTACHAT_PASSWORD", "password") or None
@@ -745,6 +756,34 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 f"Please mention me (@{self._display_name}) to talk in this group.",
             )
         return False
+
+    def _check_loop_guard(self, chat_id, from_id) -> tuple[bool, bool]:
+        """Cap consecutive auto-replies to the same sender in one chat.
+
+        Two (or more) agents in a shared group can end up replying to each
+        other forever. If the same from_id sends more than
+        DELTACHAT_MAX_CONSECUTIVE_REPLIES messages in a row in a chat with no
+        other participant chiming in between, stop processing further
+        messages from them until someone else speaks.
+
+        Returns (should_process, should_warn) — should_warn is True only the
+        first time a given streak trips, so we don't send a notice per message.
+        """
+        if self._max_consecutive_replies <= 0 or not from_id:
+            return True, False
+        key = str(chat_id)
+        sender = str(from_id)
+        with self._lock:
+            last_sender, count, warned = self._reply_streak.get(key, (None, 0, False))
+            if last_sender == sender:
+                count += 1
+            else:
+                count = 1
+                warned = False
+            tripped = count > self._max_consecutive_replies
+            should_warn = tripped and not warned
+            self._reply_streak[key] = (sender, count, warned or should_warn)
+        return not tripped, should_warn
 
     async def _gate_inbound(self, chat_id, msg_id, from_id) -> bool:
         """Run dedup, rate-limit, and DM/group policy checks for an inbound message.
@@ -1959,7 +1998,39 @@ body {{
             chat_type = "group" if chat.get("chat_type") == "Group" else "dm"
             chat_name = chat.get("name", f"Chat {chat_id}")
 
-            if not await self._check_mention(text, chat_type, chat_id):
+            should_process, should_warn = self._check_loop_guard(chat_id, from_id)
+            if not should_process:
+                self._bump_stat("loop_guard_tripped")
+                if should_warn and self._send_rejection_replies:
+                    await self.send(
+                        str(chat_id),
+                        f"Pausing replies in this chat — {self._max_consecutive_replies} "
+                        "in a row from the same sender with no one else joining in "
+                        "(looks like a bot loop). Send a message to resume.",
+                    )
+                return
+
+            # A quote-reply to one of this bot's own messages is an implicit
+            # mention (continues the thread even under require_mention), and
+            # the quoted text is surfaced so the LLM knows which earlier point
+            # is being replied to.
+            quote = msg.get("quote") or {}
+            is_reply_to_self = bool(
+                quote.get("kind") == "WithMessage"
+                and quote.get("author_display_name")
+                and self._display_name
+                and quote["author_display_name"].strip().lower()
+                == self._display_name.strip().lower()
+            )
+            if quote.get("kind") == "WithMessage" and quote.get("text"):
+                text = (
+                    f'[replying to {quote.get("author_display_name") or "a message"}: '
+                    f'"{quote["text"]}"]\n{text}'
+                )
+
+            if not is_reply_to_self and not await self._check_mention(
+                text, chat_type, chat_id
+            ):
                 return
 
             # Build source
@@ -2690,6 +2761,57 @@ def register_rpc_tools(ctx) -> None:
             logger.error("start_call failed: %s", e, exc_info=True)
             return json.dumps({"error": f"Failed to start call: {e}"})
 
+    async def _send_message_handler(args: dict, **kwargs) -> str:
+        """Send text to a chat proactively (not as a reply to an inbound message).
+
+        Used for cron/scheduled pushes or agent-to-agent chatter where there
+        is no incoming [dc:chat=...] token in hand yet.
+        """
+        args = args or {}
+        text = (args.get("text") or "").strip()
+        chat_token = args.get("chat_token")
+        adapter = _active_adapter
+        if adapter is None or adapter.rpc is None:
+            return json.dumps({"error": "Delta Chat is not connected"})
+        if not text:
+            return json.dumps({"error": "Provide 'text' to send."})
+
+        if chat_token:
+            real_chat_id = await _resolve_chat_token(
+                adapter.rpc, adapter.account_id, chat_token
+            )
+            if real_chat_id is None:
+                return json.dumps(
+                    {
+                        "error": "Unknown chat_token — use the [dc:chat=...] value "
+                        "from a message in that chat"
+                    }
+                )
+        else:
+            home_channel = os.getenv("DELTACHAT_HOME_CHANNEL")
+            if not home_channel:
+                return json.dumps(
+                    {
+                        "error": "No chat_token given and DELTACHAT_HOME_CHANNEL is "
+                        "not configured — there is no default chat to send to."
+                    }
+                )
+            try:
+                real_chat_id = int(home_channel)
+            except ValueError:
+                return json.dumps(
+                    {"error": "DELTACHAT_HOME_CHANNEL is not a valid chat id"}
+                )
+
+        try:
+            result = await adapter.send(str(real_chat_id), text)
+        except Exception as e:
+            logger.error("dc_send_message failed: %s", e, exc_info=True)
+            return json.dumps({"error": "Send failed"})
+        if not result.success:
+            return json.dumps({"error": result.error or "Send failed"})
+        return json.dumps({"success": True, "message_id": result.message_id})
+
     ctx.register_tool(
         name="dc_rpc_spec",
         toolset="deltachat",
@@ -2869,4 +2991,41 @@ def register_rpc_tools(ctx) -> None:
         handler=_start_call_handler,
         is_async=True,
         emoji="📞",
+    )
+
+    ctx.register_tool(
+        name="dc_send_message",
+        toolset="deltachat",
+        schema={
+            "description": (
+                "Send a text message to a Delta Chat chat proactively — not as a reply "
+                "to an inbound message. Use this from a scheduled/cron task, or when "
+                "one agent needs to post into a shared group without having an inbound "
+                "[dc:chat=...] token in hand yet (e.g. a multi-agent group where other "
+                "bots run on different servers). If chat_token is omitted, sends to "
+                "DELTACHAT_HOME_CHANNEL if configured."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The message text to send.",
+                    },
+                    "chat_token": {
+                        "type": "string",
+                        "description": (
+                            "The opaque chat token from the [dc:chat=...] line in a "
+                            "message from that chat. Omit to fall back to "
+                            "DELTACHAT_HOME_CHANNEL. Never use a token from a "
+                            "different conversation."
+                        ),
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+        handler=_send_message_handler,
+        is_async=True,
+        emoji="📤",
     )
