@@ -13,6 +13,7 @@ import pytest
 from adapter import (
     DC_MESSAGE_MAX_LEN,
     DeltaChatAdapter,
+    _apply_yaml_config,
     _async_retry,
     _cfg,
     _is_valid_email,
@@ -307,3 +308,33 @@ class TestMentionDetection:
         platform_config.extra = {"display_name": "Hermes"}
         adapter = DeltaChatAdapter(platform_config)
         assert adapter._is_mentioned("") is False
+
+
+class TestApplyYamlConfig:
+    def test_carries_forward_existing_extra(self):
+        platform_cfg = {"extra": {"foo": "bar"}}
+        seeded = _apply_yaml_config({}, platform_cfg)
+        assert seeded["foo"] == "bar"
+
+    def test_access_control_keys_are_bridged(self):
+        platform_cfg = {
+            "extra": {},
+            "allowed_users": "a@example.com,b@example.com",
+            "allow_all_users": True,
+            "dm_allowed_users": "a@example.com",
+            "group_allowed_users": "b@example.com",
+            "dm_policy": "allowlist",
+            "group_policy": "allowlist",
+        }
+        seeded = _apply_yaml_config({}, platform_cfg)
+        assert seeded["allowed_users"] == "a@example.com,b@example.com"
+        assert seeded["allow_all_users"] is True
+        assert seeded["dm_allowed_users"] == "a@example.com"
+        assert seeded["group_allowed_users"] == "b@example.com"
+        assert seeded["dm_policy"] == "allowlist"
+        assert seeded["group_policy"] == "allowlist"
+
+    def test_yaml_keys_override_carried_forward_extra(self):
+        platform_cfg = {"extra": {"dm_policy": "open"}, "dm_policy": "allowlist"}
+        seeded = _apply_yaml_config({}, platform_cfg)
+        assert seeded["dm_policy"] == "allowlist"
