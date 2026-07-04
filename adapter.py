@@ -617,6 +617,18 @@ class DeltaChatAdapter(BasePlatformAdapter):
         )
         self._reply_streak: dict[str, tuple[str, int, bool]] = {}
 
+        # Caps total bot-to-bot messages in a chat (any senders, not just one
+        # repeat offender) before requiring a check-in from a configured human
+        # address. Only active when DELTACHAT_HUMAN_USERS is set — with no
+        # human addresses configured there is no way to detect a "check-in",
+        # so the guard stays off rather than trip on every message.
+        raw_human = g("DELTACHAT_HUMAN_USERS", "human_users")
+        self._human_users = _parse_email_list(raw_human) if raw_human else set()
+        self._max_bot_exchanges = int(
+            g("DELTACHAT_MAX_BOT_EXCHANGES", "max_bot_exchanges", "12")
+        )
+        self._bot_exchange_streak: dict[str, tuple[int, bool]] = {}
+
         # Onboarding / profile settings
         self._email = g("DELTACHAT_EMAIL", "email", "auto").strip() or "auto"
         self._password = g("DELTACHAT_PASSWORD", "password") or None
@@ -783,6 +795,35 @@ class DeltaChatAdapter(BasePlatformAdapter):
             tripped = count > self._max_consecutive_replies
             should_warn = tripped and not warned
             self._reply_streak[key] = (sender, count, warned or should_warn)
+        return not tripped, should_warn
+
+    def _check_bot_exchange_guard(
+        self, chat_id, sender_email: str
+    ) -> tuple[bool, bool]:
+        """Cap total bot-to-bot messages in a chat, regardless of who's sending.
+
+        Unlike _check_loop_guard (which only catches one sender flooding),
+        this catches 3+ bots round-robining a group — from each bot's own
+        view the sender keeps changing, so the same-sender streak never
+        trips. Every message not from a DELTACHAT_HUMAN_USERS address counts
+        toward DELTACHAT_MAX_BOT_EXCHANGES; a message from one of those
+        addresses resets the count. Inactive unless human_users is set.
+
+        Returns (should_process, should_warn) — should_warn is True only the
+        first time a given streak trips.
+        """
+        if not self._human_users or self._max_bot_exchanges <= 0:
+            return True, False
+        key = str(chat_id)
+        with self._lock:
+            count, warned = self._bot_exchange_streak.get(key, (0, False))
+            if sender_email in self._human_users:
+                count, warned = 0, False
+            else:
+                count += 1
+            tripped = count > self._max_bot_exchanges
+            should_warn = tripped and not warned
+            self._bot_exchange_streak[key] = (count, warned or should_warn)
         return not tripped, should_warn
 
     async def _gate_inbound(self, chat_id, msg_id, from_id) -> bool:
@@ -1978,6 +2019,7 @@ body {{
 
             # Get sender info
             from_id = msg.get("from_id")
+            sender_email = ""
             if from_id:
                 contact = await self.rpc.get_contact(
                     self.account_id,
@@ -1990,6 +2032,7 @@ body {{
                     or f"Contact {from_id}"
                 )
                 user_id = str(from_id)
+                sender_email = (contact.get("address") or "").lower()
             else:
                 user_name = "Unknown"
                 user_id = "unknown"
@@ -2007,6 +2050,20 @@ body {{
                         f"Pausing replies in this chat — {self._max_consecutive_replies} "
                         "in a row from the same sender with no one else joining in "
                         "(looks like a bot loop). Send a message to resume.",
+                    )
+                return
+
+            should_process, should_warn = self._check_bot_exchange_guard(
+                chat_id, sender_email
+            )
+            if not should_process:
+                self._bump_stat("bot_exchange_guard_tripped")
+                if should_warn and self._send_rejection_replies:
+                    await self.send(
+                        str(chat_id),
+                        f"Pausing replies in this chat — {self._max_bot_exchanges} "
+                        "bot-to-bot messages with no human check-in. Send a message "
+                        "to resume.",
                     )
                 return
 
@@ -2488,6 +2545,8 @@ def _apply_yaml_config(
         ("group_allowed_users", "group_allowed_users"),
         ("dm_policy", "dm_policy"),
         ("group_policy", "group_policy"),
+        ("human_users", "human_users"),
+        ("max_bot_exchanges", "max_bot_exchanges"),
         ("require_mention", "require_mention"),
         ("free_response_channels", "free_response_channels"),
         ("auto_delete_interval", "auto_delete_interval"),
