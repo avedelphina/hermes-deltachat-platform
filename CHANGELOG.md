@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.4] - 2026-07-05
+
+### Fixed
+- `free_response_channels` / `DELTACHAT_FREE_RESPONSE_CHANNELS` was bridged from YAML into `extra` but never actually read anywhere — `_check_mention` now exempts listed group chat IDs from `DELTACHAT_REQUIRE_MENTION`, so a shared multi-bot group can be configured to always respond without needing an `@mention`.
+
+### Tests
+- Added `TestFreeResponseChannels` covering the mention gate blocking an unlisted group, a listed group skipping the gate, other chats staying unaffected, and multiple configured channel IDs.
+
 ## [1.5.3] - 2026-07-04
 
 ### Added

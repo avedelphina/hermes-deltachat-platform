@@ -1,7 +1,7 @@
 name: deltachat-platform
 label: Delta Chat
 kind: platform
-version: 1.5.3
+version: 1.5.4
 description: Delta Chat messaging platform adapter for Hermes Agent. Supports text, webxdc mini apps, voice messages, images, and videos.
 author: Simon Laux
 requires_env:
@@ -67,6 +67,10 @@ optional_env:
   - name: DELTACHAT_REQUIRE_MENTION
     description: "Require @mention in group chats before responding (default: false)"
     prompt: "Require mention in groups? (true/false)"
+    password: false
+  - name: DELTACHAT_FREE_RESPONSE_CHANNELS
+    description: "Comma-separated group chat IDs exempt from DELTACHAT_REQUIRE_MENTION (e.g. a shared multi-bot group where messages should always be answered)"
+    prompt: "Free-response group chat IDs (optional)"
     password: false
   - name: DELTACHAT_SEND_REJECTION_REPLIES
     description: "Send explanation messages when a sender is rejected (default: true)"

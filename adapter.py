@@ -605,6 +605,12 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._require_mention = g(
             "DELTACHAT_REQUIRE_MENTION", "require_mention", "false"
         ).lower() in ("1", "true", "yes")
+        raw_free_response = g(
+            "DELTACHAT_FREE_RESPONSE_CHANNELS", "free_response_channels"
+        )
+        self._free_response_channels = (
+            _parse_email_list(raw_free_response) if raw_free_response else set()
+        )
 
         # Guards against bot-to-bot auto-reply loops (e.g. multiple agents in
         # one group replying to each other forever). <=0 disables the guard.
@@ -754,6 +760,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
         Returns True if the message should be processed.
         """
         if chat_type != "group" or not self._require_mention:
+            return True
+        if str(chat_id) in self._free_response_channels:
             return True
         if not text or text.startswith("/"):
             return True

@@ -383,3 +383,51 @@ class TestBotExchangeGuard:
         _, warn2 = adapter._check_bot_exchange_guard("chat1", "bot-c@x")
         assert warn1 is True
         assert warn2 is False
+
+
+class TestFreeResponseChannels:
+    @pytest.mark.asyncio
+    async def test_require_mention_blocks_unlisted_group(self, platform_config):
+        platform_config.extra = {"require_mention": True, "display_name": "Bot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.send = AsyncMock()
+        assert await adapter._check_mention("hello", "group", "13") is False
+
+    @pytest.mark.asyncio
+    async def test_free_response_channel_skips_mention_requirement(
+        self, platform_config
+    ):
+        platform_config.extra = {
+            "require_mention": True,
+            "display_name": "Bot",
+            "free_response_channels": "13",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.send = AsyncMock()
+        assert await adapter._check_mention("hello", "group", "13") is True
+
+    @pytest.mark.asyncio
+    async def test_free_response_channel_does_not_affect_other_chats(
+        self, platform_config
+    ):
+        platform_config.extra = {
+            "require_mention": True,
+            "display_name": "Bot",
+            "free_response_channels": "13",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.send = AsyncMock()
+        assert await adapter._check_mention("hello", "group", "14") is False
+
+    @pytest.mark.asyncio
+    async def test_multiple_free_response_channels(self, platform_config):
+        platform_config.extra = {
+            "require_mention": True,
+            "display_name": "Bot",
+            "free_response_channels": "13, 14",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.send = AsyncMock()
+        assert await adapter._check_mention("hello", "group", "13") is True
+        assert await adapter._check_mention("hello", "group", "14") is True
+        assert await adapter._check_mention("hello", "group", "15") is False
