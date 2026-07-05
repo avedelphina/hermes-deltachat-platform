@@ -807,6 +807,11 @@ class DeltaChatAdapter(BasePlatformAdapter):
     async def _check_mention(self, text: str, chat_type: str, chat_id: str) -> bool:
         """Drop group messages that do not mention the bot when required.
 
+        Silently ignored — no rejection reply is sent here. In a multi-bot
+        group every bot enforces this independently, so a "please mention me"
+        notice would fire once per bot per unmentioned message; silence is
+        the only option that doesn't spam the chat.
+
         Returns True if the message should be processed.
         """
         if chat_type != "group" or not self._require_mention:
@@ -820,11 +825,6 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
         logger.debug("Ignoring unmentioned group message in chat %s", chat_id)
         self._bump_stat("messages_rejected")
-        if self._send_rejection_replies:
-            await self.send(
-                str(chat_id),
-                f"Please mention me (@{self._display_name}) to talk in this group.",
-            )
         return False
 
     def _check_loop_guard(self, chat_id, from_id) -> tuple[bool, bool]:
@@ -2681,6 +2681,13 @@ def register_platform(ctx):
         env_enablement_fn=_env_enablement,
         apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="DELTACHAT_HOME_CHANNEL",
+        # why: without these, gateway._is_user_authorized has no way to know
+        # DELTACHAT_ALLOW_ALL_USERS/DELTACHAT_ALLOWED_USERS exist, and never
+        # trusts our own dm_policy/group_policy: open as authorization (by
+        # design — see gateway authz_mixin.py), so it silently drops every
+        # sender regardless of our own access-control config.
+        allowed_users_env="DELTACHAT_ALLOWED_USERS",
+        allow_all_env="DELTACHAT_ALLOW_ALL_USERS",
         emoji="💬",
         platform_hint=(
             "You are chatting via Delta Chat. "

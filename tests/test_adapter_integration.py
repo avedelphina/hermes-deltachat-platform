@@ -909,9 +909,7 @@ class TestMentions:
         await adapter._handle_incoming_message(group_event)
 
         adapter.handle_message.assert_not_called()
-        adapter.send.assert_awaited_once()
-        args = adapter.send.await_args.args
-        assert "@Bot" in args[1]
+        adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_require_mention_allows_mentioned_group_message(
@@ -1246,3 +1244,18 @@ class TestMessageMetadataRoster:
         meta = adapter._message_metadata("13", "5", "2", True, "tok", None)
 
         assert "participants" not in meta
+
+
+class TestRegisterPlatformAuthEnv:
+    """Without these, gateway._is_user_authorized never learns our env var
+    names and silently drops every sender regardless of our own
+    dm_policy/group_policy config (see CHANGELOG 1.5.6)."""
+
+    def test_declares_allowed_users_and_allow_all_env(self):
+        mock_ctx = MagicMock()
+
+        adapter.register_platform(mock_ctx)
+
+        _, kwargs = mock_ctx.register_platform.call_args
+        assert kwargs["allowed_users_env"] == "DELTACHAT_ALLOWED_USERS"
+        assert kwargs["allow_all_env"] == "DELTACHAT_ALLOW_ALL_USERS"

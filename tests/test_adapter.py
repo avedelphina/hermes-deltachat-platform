@@ -392,6 +392,7 @@ class TestFreeResponseChannels:
         adapter = DeltaChatAdapter(platform_config)
         adapter.send = AsyncMock()
         assert await adapter._check_mention("hello", "group", "13") is False
+        adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_free_response_channel_skips_mention_requirement(
@@ -431,3 +432,35 @@ class TestFreeResponseChannels:
         assert await adapter._check_mention("hello", "group", "13") is True
         assert await adapter._check_mention("hello", "group", "14") is True
         assert await adapter._check_mention("hello", "group", "15") is False
+
+
+class TestUnmentionedGroupMessageIsSilent:
+    """The mention gate must never reply — see CLAUDE.md bot-loop history:
+    every bot in a shared group enforcing this independently would spam a
+    'please mention me' notice per bot per unmentioned message."""
+
+    @pytest.mark.asyncio
+    async def test_no_reply_sent_when_unmentioned(self, platform_config):
+        platform_config.extra = {
+            "require_mention": True,
+            "display_name": "Bot",
+            "send_rejection_replies": True,
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.send = AsyncMock()
+
+        result = await adapter._check_mention("just chatting", "group", "13")
+
+        assert result is False
+        adapter.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mentioned_message_still_processes(self, platform_config):
+        platform_config.extra = {"require_mention": True, "display_name": "Bot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.send = AsyncMock()
+
+        result = await adapter._check_mention("hey @Bot, you there?", "group", "13")
+
+        assert result is True
+        adapter.send.assert_not_called()

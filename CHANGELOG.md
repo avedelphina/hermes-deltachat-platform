@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.6] - 2026-07-05
+
+### Fixed
+- `register_platform()` now declares `allowed_users_env="DELTACHAT_ALLOWED_USERS"` and `allow_all_env="DELTACHAT_ALLOW_ALL_USERS"`. Without this, Hermes-core's own authorization gate (`gateway.authz_mixin._is_user_authorized`) had no way to know these env vars exist, and never trusted `dm_policy`/`group_policy: open` as authorization (by design), so it silently dropped every sender — including the account owner — regardless of this adapter's own access-control config.
+- The group mention gate (`_check_mention`) no longer sends a "please mention me" reply on unmentioned messages — it now ignores them silently. In a multi-bot group every bot enforces this independently, so the old notice fired once per bot per unmentioned message.
+
+### Tests
+- Added `TestRegisterPlatformAuthEnv` asserting the auth env var names are declared.
+- Added `TestUnmentionedGroupMessageIsSilent`; updated the existing `TestMentions::test_require_mention_blocks_unmentioned_group_message` to assert silence instead of a reply.
+
 ## [1.5.5] - 2026-07-05
 
 ### Added
