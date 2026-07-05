@@ -214,6 +214,8 @@ Hermes routes incoming events by `message_type`. Set the correct type and popula
 | `PHOTO` | Image | Hermes routes to vision pipeline if `media_urls` set |
 | `DOCUMENT` | File attachment | `.xdc` files become webxdc apps automatically |
 
+Group messages carry additional context beyond the per-message sender: `metadata["is_group"]` is set, and `metadata["participants"]` is populated with `[{"name", "address"}, ...]` for every other member of the group (fetched via `get_chat_contacts`, self excluded, cached per `chat_id` for `_ROSTER_CACHE_TTL` seconds — see `_get_group_roster` in `adapter.py`). DMs never get a `participants` key.
+
 ## Deployment / Installation
 
 The plugin is not a standalone executable; it is installed into the Hermes plugins directory:

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.5] - 2026-07-05
+
+### Added
+- Group roster awareness: `_get_group_roster` fetches a group's member list via `get_chat_contacts` (excluding self), cached per `chat_id` for 5 minutes to avoid an RPC round-trip per message. `_message_metadata` now includes `participants` (`[{"name", "address"}, ...]`) for group messages, so the agent knows all group members, not just whoever has spoken.
+
+### Tests
+- Added `TestGroupRoster` covering fetch-and-exclude-self, caching, TTL expiry, and RPC-failure fallback to stale cache / empty list.
+- Added `TestMessageMetadataRoster` covering participants inclusion for groups and omission for DMs / no-roster calls.
+
 ## [1.5.4] - 2026-07-05
 
 ### Fixed
