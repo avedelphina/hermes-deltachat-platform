@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.8] - 2026-07-05
+
+### Fixed
+- `MSG_FAILED` events now log `chat_id` and fetch `get_message().error` for the real failure reason. Previously only the bare `msg_id` was logged, giving no way to tell which chat a failed send belonged to or why Delta Chat core marked it `DC_STATE_OUT_FAILED`.
+
+### Tests
+- Added coverage for `MSG_FAILED` handling: chat_id/error surfaced correctly, and the handler still logs what it knows if `get_message` itself fails.
+
 ## [1.5.7] - 2026-07-05
 
 ### Added

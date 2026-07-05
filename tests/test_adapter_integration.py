@@ -302,6 +302,53 @@ class TestEventHandling:
         assert "delivered" in caplog.text.lower()
 
     @pytest.mark.asyncio
+    async def test_handle_failed_event_logs_chat_id_and_error(
+        self, platform_config, mock_rpc, caplog
+    ):
+        """MSG_FAILED must surface chat_id and the real failure reason, not
+        just a bare msg_id — that's the whole point of fetching get_message."""
+        from deltachat2.types import EventType
+
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+        adapter._running = True
+        mock_rpc.get_message = AsyncMock(
+            return_value={"error": "SMTP error: 550 mailbox unavailable"}
+        )
+
+        with caplog.at_level("WARNING"):
+            event = {"kind": EventType.MSG_FAILED, "msg_id": 123, "chat_id": 13}
+            await adapter._handle_dc_event(event)
+
+        mock_rpc.get_message.assert_awaited_once_with(1, 123)
+        assert "123" in caplog.text
+        assert "13" in caplog.text
+        assert "SMTP error: 550 mailbox unavailable" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_handle_failed_event_survives_get_message_error(
+        self, platform_config, mock_rpc, caplog
+    ):
+        """If get_message itself fails, still log what we know instead of
+        raising and losing the original MSG_FAILED warning entirely."""
+        from deltachat2.types import EventType
+
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+        adapter._running = True
+        mock_rpc.get_message = AsyncMock(side_effect=RuntimeError("rpc down"))
+
+        with caplog.at_level("WARNING"):
+            event = {"kind": EventType.MSG_FAILED, "msg_id": 123, "chat_id": 13}
+            await adapter._handle_dc_event(event)
+
+        assert "123" in caplog.text
+        assert "13" in caplog.text
+        assert "unknown" in caplog.text.lower()
+
+    @pytest.mark.asyncio
     async def test_handle_incoming_call_event(self, platform_config, mock_rpc, caplog):
         """Test handling of INCOMING_CALL event."""
         from deltachat2.types import EventType

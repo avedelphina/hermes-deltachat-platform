@@ -2015,7 +2015,24 @@ body {{
         elif event_kind == EventType.MSG_DELIVERED:
             logger.debug(f"Message delivered: {event.get('msg_id')}")
         elif event_kind == EventType.MSG_FAILED:
-            logger.warning(f"Message failed: {event.get('msg_id')}")
+            msg_id = event.get("msg_id")
+            chat_id = event.get("chat_id")
+            error = None
+            try:
+                msg = await self.rpc.get_message(self.account_id, int(msg_id))
+                error = msg.get("error")
+            except Exception as e:
+                logger.debug(
+                    "Could not fetch failed message %s for error detail: %s",
+                    msg_id,
+                    e,
+                )
+            logger.warning(
+                "Message failed: msg_id=%s chat_id=%s error=%s",
+                msg_id,
+                chat_id,
+                error or "unknown",
+            )
         elif event_kind == EventType.INCOMING_CALL:
             if self._call_manager:
                 asyncio.create_task(self._call_manager.handle_incoming_call(event))
