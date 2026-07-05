@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.7] - 2026-07-05
+
+### Added
+- `dc_send_message` gains an `address` parameter: cold-opens a 1:1 chat with a Delta Chat email instead of requiring an existing `chat_token`. Resolution is `lookup_contact_id_by_addr` → `create_contact` (only if unknown) → `create_chat_by_contact_id`. Guarded by `_is_address_in_known_rosters()` — only addresses already seen via `get_chat_contacts` in a group this bot participates in are reachable; an unknown/arbitrary address is rejected. `chat_token` takes precedence when both are given.
+
+### Tests
+- Added `TestDcSendMessageAddress` (invalid email, address outside every roster, known-address send, create_contact fallback when unknown, chat_token precedence) and `TestIsAddressInKnownRosters`.
+
 ## [1.5.6] - 2026-07-05
 
 ### Fixed
