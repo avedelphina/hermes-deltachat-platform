@@ -288,6 +288,22 @@ def _parse_chatmail_servers(raw: str) -> list[str]:
     return unique
 
 
+def _build_mention_pattern(name: str) -> Optional[re.Pattern]:
+    """Build a mention regex for *name*, tolerant of short case-ending
+    variation (e.g. Czech declension: Alice -> Alici/Alicí, Anikke ->
+    Anikko) by matching a stem plus up to 2 trailing word characters.
+
+    Falls back to an exact word match for names too short to safely stem
+    (the stem must be >=3 chars — otherwise a short/generic stem could
+    match unrelated words that happen to share a prefix).
+    """
+    if not name:
+        return None
+    stem = name[:-1]
+    core = re.escape(stem) + r"\w{0,2}" if len(stem) >= 3 else re.escape(name)
+    return re.compile(rf"(?:^|\W)@?{core}(?:\W|$)", re.IGNORECASE)
+
+
 class _RateLimiter:
     """Simple sliding-window rate limiter keyed by arbitrary strings."""
 
@@ -639,6 +655,18 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._email = g("DELTACHAT_EMAIL", "email", "auto").strip() or "auto"
         self._password = g("DELTACHAT_PASSWORD", "password") or None
         self._display_name = g("DELTACHAT_DISPLAY_NAME", "display_name", "Hermes")
+        raw_mention_aliases = g("DELTACHAT_MENTION_ALIASES", "mention_aliases")
+        self._mention_aliases = (
+            _parse_chatmail_servers(raw_mention_aliases) if raw_mention_aliases else []
+        )
+        self._mention_patterns = [
+            p
+            for p in (
+                _build_mention_pattern(n)
+                for n in (self._display_name, *self._mention_aliases)
+            )
+            if p is not None
+        ]
         self._avatar_path = _validate_avatar_path(
             g("DELTACHAT_AVATAR_PATH", "avatar_path") or None, strict=False
         )
@@ -808,14 +836,15 @@ class DeltaChatAdapter(BasePlatformAdapter):
     def _is_mentioned(self, text: str) -> bool:
         """Return True if the message text mentions the bot by display name.
 
-        Matches whole-word `@DisplayName` or `DisplayName`, case-insensitive.
-        Substrings like `Hermesss` do not count.
+        Matches whole-word `@DisplayName` or `DisplayName`, case-insensitive,
+        tolerant of short case-ending variation (e.g. Czech declension:
+        "napiš Alici" mentions display_name "Alice"). Also checks any
+        configured DELTACHAT_MENTION_ALIASES. Substrings like `Hermesss`
+        (more than ~2 extra trailing characters) do not count.
         """
-        if not text or not self._display_name:
+        if not text or not self._mention_patterns:
             return False
-        name = re.escape(self._display_name)
-        pattern = rf"(?:^|\W)@{name}(?:\W|$)|(?:^|\W){name}(?:\W|$)"
-        return re.search(pattern, text, re.IGNORECASE) is not None
+        return any(p.search(text) for p in self._mention_patterns)
 
     async def _check_mention(self, text: str, chat_type: str, chat_id: str) -> bool:
         """Drop group messages that do not mention the bot when required.
@@ -2641,6 +2670,7 @@ def _apply_yaml_config(
         ("human_users", "human_users"),
         ("max_bot_exchanges", "max_bot_exchanges"),
         ("require_mention", "require_mention"),
+        ("mention_aliases", "mention_aliases"),
         ("free_response_channels", "free_response_channels"),
         ("auto_delete_interval", "auto_delete_interval"),
         ("max_message_length", "max_message_length"),
