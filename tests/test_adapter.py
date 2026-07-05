@@ -310,6 +310,55 @@ class TestMentionDetection:
         assert adapter._is_mentioned("") is False
 
 
+class TestCzechDeclensionMentions:
+    """Czech names decline by case — mentions must survive that."""
+
+    def test_alice_dative_and_instrumental(self, platform_config):
+        platform_config.extra = {"display_name": "Alice"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("napiš Alici, aby to udělala") is True
+        assert adapter._is_mentioned("mluvil jsem s Alicí") is True
+        assert adapter._is_mentioned("Alice, jsi tu?") is True
+
+    def test_anikke_vocative_and_indeclinable_form(self, platform_config):
+        platform_config.extra = {"display_name": "Anikke"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("zeptej se Anikke") is True
+        # Bots sometimes wrongly decline this indeclinable name; tolerated
+        # on the receiving end too, even though the LLM shouldn't produce it.
+        assert adapter._is_mentioned("Anikko, co si o tom myslíš?") is True
+
+    def test_holly_dative_unchanged(self, platform_config):
+        platform_config.extra = {"display_name": "Holly"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("řekni to Holly") is True
+
+    def test_short_name_does_not_stem_match(self, platform_config):
+        # "Tom" stems to "To" (2 chars, below the 3-char safety floor), so
+        # this must fall back to an exact match rather than risk matching
+        # unrelated words like "Tomas" or "Tone".
+        platform_config.extra = {"display_name": "Tom"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("Tom, jsi tu?") is True
+        assert adapter._is_mentioned("Tomasi, jsi tu?") is False
+
+    def test_mention_aliases_config(self, platform_config):
+        platform_config.extra = {
+            "display_name": "Anikke",
+            "mention_aliases": "Anička, Aničko",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("Aničko, pomoz mi") is True
+        assert adapter._is_mentioned("Anička už odpověděla") is True
+
+    def test_unrelated_word_sharing_prefix_does_not_match(self, platform_config):
+        # "Hollywood" shares the "Holl" stem but has far more than 2 extra
+        # trailing characters, so it must not count as a mention of Holly.
+        platform_config.extra = {"display_name": "Holly"}
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._is_mentioned("I watched a Hollywood movie") is False
+
+
 class TestApplyYamlConfig:
     def test_carries_forward_existing_extra(self):
         platform_cfg = {"extra": {"foo": "bar"}}

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 
 # The conftest.py already installs the mocks, so we can import adapter now
+import adapter
 from adapter import (
     DeltaChatAdapter,
     _parse_version,

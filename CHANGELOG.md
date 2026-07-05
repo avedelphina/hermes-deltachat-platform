@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.9] - 2026-07-05
+
+### Added
+- `_is_mentioned` now tolerates short case-ending variation so declined forms of a bot's name still count as a mention (e.g. Czech: "napiš Alici" mentions `display_name: Alice`; "Anikko" still mentions "Anikke"). Implemented generically via `_build_mention_pattern` (stem + up to 2 trailing word characters), not a Czech-specific grammar table. Names with a stem shorter than 3 characters fall back to an exact match to avoid matching unrelated words on a short shared prefix.
+- `DELTACHAT_MENTION_ALIASES` (comma-separated): extra names/forms that also count as a mention, for cases the automatic stemming doesn't cover.
+
+### Tests
+- Added `TestCzechDeclensionMentions`: Alice's dative/instrumental forms, Anikke's (incorrect) vocative, Holly's unchanged dative, a short-name exact-match fallback, `DELTACHAT_MENTION_ALIASES`, and a same-prefix false-positive guard ("Hollywood" vs "Holly").
+
 ## [1.5.8] - 2026-07-05
 
 ### Fixed
