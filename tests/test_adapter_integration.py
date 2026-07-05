@@ -4,6 +4,7 @@ Tests the adapter with mocked Hermes gateway classes.
 """
 
 import asyncio
+import json
 import os
 import signal
 import tempfile
@@ -1259,3 +1260,169 @@ class TestRegisterPlatformAuthEnv:
         _, kwargs = mock_ctx.register_platform.call_args
         assert kwargs["allowed_users_env"] == "DELTACHAT_ALLOWED_USERS"
         assert kwargs["allow_all_env"] == "DELTACHAT_ALLOW_ALL_USERS"
+
+
+def _get_registered_tool_handler(tool_name: str):
+    mock_ctx = MagicMock()
+    adapter.register_rpc_tools(mock_ctx)
+    for call in mock_ctx.register_tool.call_args_list:
+        if call.kwargs.get("name") == tool_name:
+            return call.kwargs["handler"]
+    raise AssertionError(f"{tool_name} was not registered")
+
+
+class TestDcSendMessageAddress:
+    """dc_send_message's 'address' param: cold-open a 1:1 chat with a contact,
+    guarded to addresses already seen in a group roster this bot has fetched."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_email(self, platform_config, mock_rpc):
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter.rpc = mock_rpc
+        real_adapter.account_id = 1
+        adapter._active_adapter = real_adapter
+        try:
+            handler = _get_registered_tool_handler("dc_send_message")
+
+            result = json.loads(
+                await handler({"text": "hi", "address": "not-an-email"})
+            )
+
+            assert "error" in result
+            assert "not a valid email" in result["error"]
+        finally:
+            adapter._active_adapter = None
+
+    @pytest.mark.asyncio
+    async def test_rejects_address_not_in_any_roster(self, platform_config, mock_rpc):
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter.rpc = mock_rpc
+        real_adapter.account_id = 1
+        adapter._active_adapter = real_adapter
+        try:
+            handler = _get_registered_tool_handler("dc_send_message")
+
+            result = json.loads(
+                await handler({"text": "hi", "address": "stranger@example.com"})
+            )
+
+            assert "error" in result
+            assert "roster" in result["error"]
+            mock_rpc.lookup_contact_id_by_addr.assert_not_called()
+        finally:
+            adapter._active_adapter = None
+
+    @pytest.mark.asyncio
+    async def test_sends_to_address_known_from_roster(self, platform_config, mock_rpc):
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter.rpc = mock_rpc
+        real_adapter.account_id = 1
+        real_adapter._roster_cache["13"] = (
+            9999999999.0,
+            [{"name": "Alice", "address": "alice@example.com"}],
+        )
+        adapter._active_adapter = real_adapter
+        try:
+            mock_rpc.lookup_contact_id_by_addr = AsyncMock(return_value=42)
+            mock_rpc.create_chat_by_contact_id = AsyncMock(return_value=99)
+            mock_rpc.send_msg = AsyncMock(return_value=123)
+            handler = _get_registered_tool_handler("dc_send_message")
+
+            result = json.loads(
+                await handler({"text": "hi Alice", "address": "Alice@Example.com"})
+            )
+
+            assert result["success"] is True
+            mock_rpc.lookup_contact_id_by_addr.assert_awaited_once_with(
+                1, "alice@example.com"
+            )
+            mock_rpc.create_chat_by_contact_id.assert_awaited_once_with(1, 42)
+            mock_rpc.create_contact.assert_not_called()
+        finally:
+            adapter._active_adapter = None
+
+    @pytest.mark.asyncio
+    async def test_creates_contact_when_lookup_returns_none(
+        self, platform_config, mock_rpc
+    ):
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter.rpc = mock_rpc
+        real_adapter.account_id = 1
+        real_adapter._roster_cache["13"] = (
+            9999999999.0,
+            [{"name": "Alice", "address": "alice@example.com"}],
+        )
+        adapter._active_adapter = real_adapter
+        try:
+            mock_rpc.lookup_contact_id_by_addr = AsyncMock(return_value=None)
+            mock_rpc.create_contact = AsyncMock(return_value=42)
+            mock_rpc.create_chat_by_contact_id = AsyncMock(return_value=99)
+            mock_rpc.send_msg = AsyncMock(return_value=123)
+            handler = _get_registered_tool_handler("dc_send_message")
+
+            result = json.loads(
+                await handler({"text": "hi Alice", "address": "alice@example.com"})
+            )
+
+            assert result["success"] is True
+            mock_rpc.create_contact.assert_awaited_once_with(
+                1, "alice@example.com", None
+            )
+        finally:
+            adapter._active_adapter = None
+
+    @pytest.mark.asyncio
+    async def test_chat_token_takes_precedence_over_address(
+        self, platform_config, mock_rpc
+    ):
+        from adapter import _chat_token_to_id
+
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter.rpc = mock_rpc
+        real_adapter.account_id = 1
+        adapter._active_adapter = real_adapter
+        _chat_token_to_id["tok123"] = 7
+        try:
+            mock_rpc.send_msg = AsyncMock(return_value=123)
+            handler = _get_registered_tool_handler("dc_send_message")
+
+            result = json.loads(
+                await handler(
+                    {
+                        "text": "hi",
+                        "chat_token": "tok123",
+                        "address": "stranger@example.com",
+                    }
+                )
+            )
+
+            assert result["success"] is True
+            mock_rpc.lookup_contact_id_by_addr.assert_not_called()
+        finally:
+            adapter._active_adapter = None
+            _chat_token_to_id.pop("tok123", None)
+
+
+class TestIsAddressInKnownRosters:
+    def test_true_when_address_in_a_cached_roster(self, platform_config):
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter._roster_cache["13"] = (
+            1.0,
+            [{"name": "Alice", "address": "alice@example.com"}],
+        )
+
+        assert real_adapter._is_address_in_known_rosters("ALICE@EXAMPLE.COM") is True
+
+    def test_false_when_no_roster_has_it(self, platform_config):
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter._roster_cache["13"] = (
+            1.0,
+            [{"name": "Alice", "address": "alice@example.com"}],
+        )
+
+        assert real_adapter._is_address_in_known_rosters("bob@example.com") is False
+
+    def test_false_with_no_cached_rosters(self, platform_config):
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+
+        assert real_adapter._is_address_in_known_rosters("alice@example.com") is False

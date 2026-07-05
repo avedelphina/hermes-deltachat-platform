@@ -713,6 +713,19 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._roster_cache[key] = (now, roster)
         return roster
 
+    def _is_address_in_known_rosters(self, address: str) -> bool:
+        """Whether *address* appears in any group roster this bot has already fetched.
+
+        Used to guard cold-DM sends (dc_send_message's ``address`` param): an
+        address is only reachable if it's a member of a group this bot
+        participates in, not an arbitrary Delta Chat address.
+        """
+        address = address.lower()
+        return any(
+            any(contact.get("address", "").lower() == address for contact in roster)
+            for _, roster in self._roster_cache.values()
+        )
+
     def _message_metadata(
         self,
         chat_id: Any,
@@ -2942,11 +2955,13 @@ def register_rpc_tools(ctx) -> None:
         """Send text to a chat proactively (not as a reply to an inbound message).
 
         Used for cron/scheduled pushes or agent-to-agent chatter where there
-        is no incoming [dc:chat=...] token in hand yet.
+        is no incoming [dc:chat=...] token in hand yet, or to cold-DM a
+        contact this bot has already seen in a group (see 'address' below).
         """
         args = args or {}
         text = (args.get("text") or "").strip()
         chat_token = args.get("chat_token")
+        address = (args.get("address") or "").strip().lower()
         adapter = _active_adapter
         if adapter is None or adapter.rpc is None:
             return json.dumps({"error": "Delta Chat is not connected"})
@@ -2964,13 +2979,49 @@ def register_rpc_tools(ctx) -> None:
                         "from a message in that chat"
                     }
                 )
+        elif address:
+            if not _is_valid_email(address):
+                return json.dumps(
+                    {"error": f"'{address}' is not a valid email address"}
+                )
+            # why: without this, any agent could cold-DM an arbitrary Delta Chat
+            # address it merely knows the string of. Restricting to addresses
+            # already seen via get_chat_contacts (i.e. a current member of a
+            # group this bot participates in) keeps the blast radius to
+            # contacts this bot already has a legitimate reason to know about.
+            if not adapter._is_address_in_known_rosters(address):
+                return json.dumps(
+                    {
+                        "error": f"'{address}' is not visible in any group roster "
+                        "this bot has fetched — cold-DMing an address outside a "
+                        "shared group is not allowed."
+                    }
+                )
+            try:
+                contact_id = await adapter.rpc.lookup_contact_id_by_addr(
+                    adapter.account_id, address
+                )
+                if contact_id is None:
+                    contact_id = await adapter.rpc.create_contact(
+                        adapter.account_id, address, None
+                    )
+                real_chat_id = await adapter.rpc.create_chat_by_contact_id(
+                    adapter.account_id, contact_id
+                )
+            except Exception as e:
+                logger.error(
+                    "dc_send_message address resolution failed: %s", e, exc_info=True
+                )
+                return json.dumps(
+                    {"error": f"Could not open a chat with {address}: {e}"}
+                )
         else:
             home_channel = os.getenv("DELTACHAT_HOME_CHANNEL")
             if not home_channel:
                 return json.dumps(
                     {
-                        "error": "No chat_token given and DELTACHAT_HOME_CHANNEL is "
-                        "not configured — there is no default chat to send to."
+                        "error": "No chat_token/address given and DELTACHAT_HOME_CHANNEL "
+                        "is not configured — there is no default chat to send to."
                     }
                 )
             try:
@@ -3180,7 +3231,11 @@ def register_rpc_tools(ctx) -> None:
                 "one agent needs to post into a shared group without having an inbound "
                 "[dc:chat=...] token in hand yet (e.g. a multi-agent group where other "
                 "bots run on different servers). If chat_token is omitted, sends to "
-                "DELTACHAT_HOME_CHANNEL if configured."
+                "DELTACHAT_HOME_CHANNEL if configured. To message a specific contact "
+                "directly instead of a chat you've already seen traffic in, use "
+                "'address' — this opens (or reuses) a 1:1 chat with that contact, but "
+                "only works for an address that is a current member of a group this "
+                "bot participates in; it cannot cold-DM an arbitrary address."
             ),
             "parameters": {
                 "type": "object",
@@ -3196,6 +3251,17 @@ def register_rpc_tools(ctx) -> None:
                             "message from that chat. Omit to fall back to "
                             "DELTACHAT_HOME_CHANNEL. Never use a token from a "
                             "different conversation."
+                        ),
+                    },
+                    "address": {
+                        "type": "string",
+                        "description": (
+                            "Delta Chat email address to message directly, opening a "
+                            "1:1 chat if one doesn't already exist. Only usable when "
+                            "the address belongs to a member of a group this bot is "
+                            "in (e.g. another bot seen in a shared group) — an "
+                            "unknown/arbitrary address is rejected. Ignored if "
+                            "chat_token is also given."
                         ),
                     },
                 },
