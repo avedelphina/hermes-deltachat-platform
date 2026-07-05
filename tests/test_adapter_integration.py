@@ -1127,3 +1127,122 @@ class TestUrlImageSending:
         assert result.success is False
         assert "25" in result.error or "limit" in result.error.lower()
         mock_rpc.send_msg.assert_not_called()
+
+
+class TestGroupRoster:
+    """Test group roster fetching and caching for _get_group_roster."""
+
+    @pytest.mark.asyncio
+    async def test_fetches_and_excludes_self(self, platform_config, mock_rpc):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+
+        mock_rpc.get_chat_contacts = AsyncMock(return_value=[1, 2, 3])
+        mock_rpc.get_contact = AsyncMock(
+            side_effect=lambda account_id, cid: {
+                2: {"name": "Alice", "address": "alice@x.com"},
+                3: {"name": "Holly", "address": "holly@x.com"},
+            }[cid]
+        )
+
+        roster = await adapter._get_group_roster("13")
+
+        assert mock_rpc.get_contact.await_count == 2
+        assert {"name": "Alice", "address": "alice@x.com"} in roster
+        assert {"name": "Holly", "address": "holly@x.com"} in roster
+        assert all(r["address"] != "" or r["name"] for r in roster)
+
+    @pytest.mark.asyncio
+    async def test_caches_and_skips_rpc_on_second_call(self, platform_config, mock_rpc):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+
+        mock_rpc.get_chat_contacts = AsyncMock(return_value=[1, 2])
+        mock_rpc.get_contact = AsyncMock(
+            return_value={"name": "Alice", "address": "alice@x.com"}
+        )
+
+        await adapter._get_group_roster("13")
+        await adapter._get_group_roster("13")
+
+        mock_rpc.get_chat_contacts.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_refetches_after_ttl_expires(self, platform_config, mock_rpc):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+        adapter._ROSTER_CACHE_TTL = 0
+
+        mock_rpc.get_chat_contacts = AsyncMock(return_value=[1, 2])
+        mock_rpc.get_contact = AsyncMock(
+            return_value={"name": "Alice", "address": "alice@x.com"}
+        )
+
+        await adapter._get_group_roster("13")
+        await adapter._get_group_roster("13")
+
+        assert mock_rpc.get_chat_contacts.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_rpc_failure_falls_back_to_stale_cache(
+        self, platform_config, mock_rpc
+    ):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+
+        mock_rpc.get_chat_contacts = AsyncMock(return_value=[1, 2])
+        mock_rpc.get_contact = AsyncMock(
+            return_value={"name": "Alice", "address": "alice@x.com"}
+        )
+        roster = await adapter._get_group_roster("13")
+
+        mock_rpc.get_chat_contacts = AsyncMock(side_effect=RuntimeError("rpc down"))
+        adapter._ROSTER_CACHE_TTL = 0
+        fallback = await adapter._get_group_roster("13")
+
+        assert fallback == roster
+
+    @pytest.mark.asyncio
+    async def test_rpc_failure_with_no_cache_returns_empty(
+        self, platform_config, mock_rpc
+    ):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+
+        mock_rpc.get_chat_contacts = AsyncMock(side_effect=RuntimeError("rpc down"))
+
+        roster = await adapter._get_group_roster("13")
+
+        assert roster == []
+
+
+class TestMessageMetadataRoster:
+    """Test that _message_metadata includes participants only for groups."""
+
+    def test_group_metadata_includes_participants(self, platform_config):
+        adapter = DeltaChatAdapter(platform_config)
+        roster = [{"name": "Alice", "address": "alice@x.com"}]
+
+        meta = adapter._message_metadata("13", "5", "2", True, "tok", roster)
+
+        assert meta["participants"] == roster
+
+    def test_dm_metadata_omits_participants(self, platform_config):
+        adapter = DeltaChatAdapter(platform_config)
+        roster = [{"name": "Alice", "address": "alice@x.com"}]
+
+        meta = adapter._message_metadata("13", "5", "2", False, "tok", roster)
+
+        assert "participants" not in meta
+
+    def test_no_roster_omits_participants(self, platform_config):
+        adapter = DeltaChatAdapter(platform_config)
+
+        meta = adapter._message_metadata("13", "5", "2", True, "tok", None)
+
+        assert "participants" not in meta

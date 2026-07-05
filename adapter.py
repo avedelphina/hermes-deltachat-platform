@@ -660,11 +660,58 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._lock = threading.RLock()
         self._self_addr: Optional[str] = None
         self._invite_link: Optional[str] = None
+        self._roster_cache: dict[str, tuple[float, list]] = {}
 
     def _bump_stat(self, key: str, count: int = 1) -> None:
         """Increment an internal counter under the adapter lock."""
         with self._lock:
             self._stats[key] = self._stats.get(key, 0) + count
+
+    # Group rosters change rarely; a plain TTL avoids an RPC round-trip per
+    # message. ponytail: no invalidation on membership-change events — if
+    # rosters go stale in practice, listen for DC's ChatModified event instead.
+    _ROSTER_CACHE_TTL = 300
+
+    async def _get_group_roster(self, chat_id: Any) -> list[dict]:
+        """Return [{"name", "address"}, ...] for a group's members, excluding self.
+
+        Cached per chat_id for _ROSTER_CACHE_TTL seconds to avoid an RPC
+        round-trip on every inbound message.
+        """
+        key = str(chat_id)
+        now = time.monotonic()
+        cached = self._roster_cache.get(key)
+        if cached and now - cached[0] < self._ROSTER_CACHE_TTL:
+            return cached[1]
+        try:
+            contact_ids = await self.rpc.get_chat_contacts(
+                self.account_id, int(chat_id)
+            )
+        except Exception as e:
+            logger.debug("Could not fetch group roster for chat %s: %s", chat_id, e)
+            return cached[1] if cached else []
+        roster = []
+        for cid in contact_ids:
+            if cid == 1:  # DC_CONTACT_ID_SELF
+                continue
+            try:
+                contact = await self.rpc.get_contact(self.account_id, int(cid))
+            except Exception as e:
+                logger.debug("Could not fetch contact %s for roster: %s", cid, e)
+                continue
+            roster.append(
+                {
+                    "name": (
+                        contact.get("name")
+                        or contact.get("display_name")
+                        or contact.get("address")
+                        or f"Contact {cid}"
+                    ),
+                    "address": contact.get("address") or "",
+                }
+            )
+        self._roster_cache[key] = (now, roster)
+        return roster
 
     def _message_metadata(
         self,
@@ -673,6 +720,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
         from_id: Any,
         is_group: bool,
         token: Optional[str] = None,
+        roster: Optional[list] = None,
     ) -> Dict[str, Any]:
         """Build metadata dict for an incoming MessageEvent."""
         meta: Dict[str, Any] = {
@@ -684,6 +732,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
             meta["from_id"] = str(from_id)
         if token:
             meta["dc_token"] = token
+        if is_group and roster is not None:
+            meta["participants"] = roster
         return meta
 
     def _send_result(
@@ -2118,6 +2168,10 @@ body {{
                 )
                 text_with_token = f"{text}\n[dc:chat={token}]"
 
+            roster = (
+                await self._get_group_roster(chat_id) if chat_type == "group" else None
+            )
+
             # Build and handle message event
             message_event = MessageEvent(
                 text=text_with_token,
@@ -2125,7 +2179,7 @@ body {{
                 source=source,
                 message_id=str(msg_id),
                 metadata=self._message_metadata(
-                    chat_id, msg_id, from_id, chat_type == "group", token
+                    chat_id, msg_id, from_id, chat_type == "group", token, roster
                 ),
             )
             await self.handle_message(message_event)
@@ -2265,8 +2319,9 @@ body {{
         if not await self._check_mention(caption, chat_type, chat_id):
             return
 
+        roster = await self._get_group_roster(chat_id) if chat_type == "group" else None
         meta = self._message_metadata(
-            chat_id, msg_id, from_id, chat_type == "group", token
+            chat_id, msg_id, from_id, chat_type == "group", token, roster
         )
 
         from deltachat2.types import MessageViewtype
