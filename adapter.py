@@ -2158,31 +2158,37 @@ body {{
             chat_type = "group" if chat.get("chat_type") == "Group" else "dm"
             chat_name = chat.get("name", f"Chat {chat_id}")
 
-            should_process, should_warn = self._check_loop_guard(chat_id, from_id)
-            if not should_process:
-                self._bump_stat("loop_guard_tripped")
-                if should_warn and self._send_rejection_replies:
-                    await self.send(
-                        str(chat_id),
-                        f"Pausing replies in this chat — {self._max_consecutive_replies} "
-                        "in a row from the same sender with no one else joining in "
-                        "(looks like a bot loop). Send a message to resume.",
-                    )
-                return
+            # Both guards below assume a shared group with a changing/checkable
+            # participant set. A DM has exactly one counterparty by
+            # definition, so "someone else chiming in" can never happen —
+            # from_id never changes and the streak would only grow, tripping
+            # permanently with no way to recover. Restrict to groups.
+            if chat_type == "group":
+                should_process, should_warn = self._check_loop_guard(chat_id, from_id)
+                if not should_process:
+                    self._bump_stat("loop_guard_tripped")
+                    if should_warn and self._send_rejection_replies:
+                        await self.send(
+                            str(chat_id),
+                            f"Pausing replies in this chat — {self._max_consecutive_replies} "
+                            "in a row from the same sender with no one else joining in "
+                            "(looks like a bot loop). Send a message to resume.",
+                        )
+                    return
 
-            should_process, should_warn = self._check_bot_exchange_guard(
-                chat_id, sender_email
-            )
-            if not should_process:
-                self._bump_stat("bot_exchange_guard_tripped")
-                if should_warn and self._send_rejection_replies:
-                    await self.send(
-                        str(chat_id),
-                        f"Pausing replies in this chat — {self._max_bot_exchanges} "
-                        "bot-to-bot messages with no human check-in. Send a message "
-                        "to resume.",
-                    )
-                return
+                should_process, should_warn = self._check_bot_exchange_guard(
+                    chat_id, sender_email
+                )
+                if not should_process:
+                    self._bump_stat("bot_exchange_guard_tripped")
+                    if should_warn and self._send_rejection_replies:
+                        await self.send(
+                            str(chat_id),
+                            f"Pausing replies in this chat — {self._max_bot_exchanges} "
+                            "bot-to-bot messages with no human check-in. Send a message "
+                            "to resume.",
+                        )
+                    return
 
             # A quote-reply to one of this bot's own messages is an implicit
             # mention (continues the thread even under require_mention), and

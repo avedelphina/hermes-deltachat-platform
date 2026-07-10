@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.10] - 2026-07-05
+
+### Fixed
+- The consecutive-reply and bot-exchange loop guards are now scoped to group chats only. In a DM the counterparty never changes, so the guards would trip permanently and lock out the only other participant.
+
+### Tests
+- Added `TestLoopGuardChatScope` with DM-ignored and group-still-tripped cases.
+
 ## [1.5.9] - 2026-07-05
 
 ### Added

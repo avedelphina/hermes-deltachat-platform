@@ -1038,6 +1038,74 @@ class TestMentions:
         adapter.handle_message.assert_not_called()
 
 
+class TestLoopGuardChatScope:
+    """The consecutive-reply and bot-exchange guards assume a group with a
+    changing participant set ("no one else joining in" only means something
+    when a third party *could* join). A DM has exactly one counterparty by
+    definition, so from_id never changes turn to turn — applying the guard
+    there would trip permanently after max_consecutive_replies messages with
+    no way to recover. Guards must be scoped to group chats only.
+    """
+
+    async def _send_n_messages(self, adapter, chat_id, n, from_id=11):
+        for msg_id in range(1, n + 1):
+            await adapter._handle_incoming_message(
+                {"kind": "IncomingMsg", "chat_id": chat_id, "msg_id": msg_id}
+            )
+
+    @pytest.mark.asyncio
+    async def test_loop_guard_does_not_trip_in_dm(self, platform_config, mock_rpc):
+        platform_config.extra = {"max_consecutive_replies": 2, "dm_policy": "open"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "hello there",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Single", "name": "DM"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+
+        await self._send_n_messages(adapter, chat_id=7, n=10)
+
+        assert adapter.handle_message.await_count == 10
+        adapter.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_loop_guard_still_trips_in_group(self, platform_config, mock_rpc):
+        platform_config.extra = {"max_consecutive_replies": 2}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "hello there",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+
+        await self._send_n_messages(adapter, chat_id=1, n=10)
+
+        # max_consecutive_replies=2 lets the first 2 from the same sender
+        # through; the 3rd trips the guard and it stays tripped (same
+        # from_id every time in this test), so the rest are dropped.
+        assert adapter.handle_message.await_count == 2
+
+
 class TestMetadata:
     """Test incoming/outgoing metadata enrichment."""
 
