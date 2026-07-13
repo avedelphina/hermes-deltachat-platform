@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.11] - 2026-07-05
+
+### Fixed
+- Mention matching now requires an explicit `@` prefix. A bare display name in prose (e.g. "napiš Alici") is about the bot, not addressed to it.
+- The mention gate now runs on the reply body only, before quoted text is spliced in, so quoting an old message that mentioned the bot does not count as a fresh mention.
+- Updated mention tests to expect `@`-prefixed mentions.
+
 ## [1.5.10] - 2026-07-05
 
 ### Fixed

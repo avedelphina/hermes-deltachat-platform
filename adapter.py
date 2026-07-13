@@ -289,19 +289,23 @@ def _parse_chatmail_servers(raw: str) -> list[str]:
 
 
 def _build_mention_pattern(name: str) -> Optional[re.Pattern]:
-    """Build a mention regex for *name*, tolerant of short case-ending
-    variation (e.g. Czech declension: Alice -> Alici/Alicí, Anikke ->
-    Anikko) by matching a stem plus up to 2 trailing word characters.
+    """Build an @mention regex for *name*, tolerant of short case-ending
+    variation (e.g. Czech declension: Alice -> @Alici/@Alicí, Anikke ->
+    @Anikko) by matching a stem plus up to 2 trailing word characters.
 
     Falls back to an exact word match for names too short to safely stem
     (the stem must be >=3 chars — otherwise a short/generic stem could
     match unrelated words that happen to share a prefix).
+
+    Requires a leading "@" so a bare name used in prose (e.g. "napis
+    Alici", asking someone else to message Alice) does not count as
+    addressing the bot directly.
     """
     if not name:
         return None
     stem = name[:-1]
     core = re.escape(stem) + r"\w{0,2}" if len(stem) >= 3 else re.escape(name)
-    return re.compile(rf"(?:^|\W)@?{core}(?:\W|$)", re.IGNORECASE)
+    return re.compile(rf"(?:^|\W)@{core}(?:\W|$)", re.IGNORECASE)
 
 
 class _RateLimiter:
@@ -834,13 +838,15 @@ class DeltaChatAdapter(BasePlatformAdapter):
         return None
 
     def _is_mentioned(self, text: str) -> bool:
-        """Return True if the message text mentions the bot by display name.
+        """Return True if the message text @mentions the bot by display name.
 
-        Matches whole-word `@DisplayName` or `DisplayName`, case-insensitive,
-        tolerant of short case-ending variation (e.g. Czech declension:
-        "napiš Alici" mentions display_name "Alice"). Also checks any
-        configured DELTACHAT_MENTION_ALIASES. Substrings like `Hermesss`
-        (more than ~2 extra trailing characters) do not count.
+        Requires a leading "@" — a bare display name in prose (e.g. "napis
+        Alici", asking someone else to message Alice) is about the bot, not
+        addressed to it. Case-insensitive, tolerant of short case-ending
+        variation (e.g. Czech declension: "@Alici" mentions display_name
+        "Alice"). Also checks any configured DELTACHAT_MENTION_ALIASES.
+        Substrings like `@Hermesss` (more than ~2 extra trailing characters)
+        do not count.
         """
         if not text or not self._mention_patterns:
             return False
@@ -2202,16 +2208,19 @@ body {{
                 and quote["author_display_name"].strip().lower()
                 == self._display_name.strip().lower()
             )
+            # why: mention gate must run on the reply body only — matching inside
+            # spliced-in quoted text would treat "someone quoted an old message
+            # that once mentioned us" as a fresh mention of the new reply.
+            if not is_reply_to_self and not await self._check_mention(
+                text, chat_type, chat_id
+            ):
+                return
+
             if quote.get("kind") == "WithMessage" and quote.get("text"):
                 text = (
                     f'[replying to {quote.get("author_display_name") or "a message"}: '
                     f'"{quote["text"]}"]\n{text}'
                 )
-
-            if not is_reply_to_self and not await self._check_mention(
-                text, chat_type, chat_id
-            ):
-                return
 
             # Build source
             source = self.build_source(
