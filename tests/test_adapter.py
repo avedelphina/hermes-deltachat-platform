@@ -281,21 +281,24 @@ class TestMentionDetection:
         adapter = DeltaChatAdapter(platform_config)
         assert adapter._is_mentioned("Hello @Hermes, how are you?") is True
 
-    def test_bare_name_mention_matches(self, platform_config):
+    def test_bare_name_without_at_does_not_match(self, platform_config):
+        # Bare name in prose can be about the bot without addressing it
+        # (e.g. "napis Alici" = ask someone else to message Alice), so a
+        # mention requires an explicit "@" prefix.
         platform_config.extra = {"display_name": "Hermes"}
         adapter = DeltaChatAdapter(platform_config)
-        assert adapter._is_mentioned("Hermes please help") is True
+        assert adapter._is_mentioned("Hermes please help") is False
 
     def test_case_insensitive(self, platform_config):
         platform_config.extra = {"display_name": "Hermes"}
         adapter = DeltaChatAdapter(platform_config)
         assert adapter._is_mentioned("hey @hermes") is True
-        assert adapter._is_mentioned("HERMES do this") is True
+        assert adapter._is_mentioned("@HERMES do this") is True
 
     def test_substring_does_not_match(self, platform_config):
         platform_config.extra = {"display_name": "Hermes"}
         adapter = DeltaChatAdapter(platform_config)
-        assert adapter._is_mentioned("Hermesssss") is False
+        assert adapter._is_mentioned("@Hermesssss") is False
         assert adapter._is_mentioned("@Hermesss") is False
 
     def test_punctuation_boundary_still_matches(self, platform_config):
@@ -316,22 +319,24 @@ class TestCzechDeclensionMentions:
     def test_alice_dative_and_instrumental(self, platform_config):
         platform_config.extra = {"display_name": "Alice"}
         adapter = DeltaChatAdapter(platform_config)
-        assert adapter._is_mentioned("napiš Alici, aby to udělala") is True
-        assert adapter._is_mentioned("mluvil jsem s Alicí") is True
-        assert adapter._is_mentioned("Alice, jsi tu?") is True
+        assert adapter._is_mentioned("napiš @Alici, aby to udělala") is True
+        assert adapter._is_mentioned("mluvil jsem s @Alicí") is True
+        assert adapter._is_mentioned("@Alice, jsi tu?") is True
+        # bare name, no "@" — about Alice, not addressed to her
+        assert adapter._is_mentioned("napiš Alici, aby to udělala") is False
 
     def test_anikke_vocative_and_indeclinable_form(self, platform_config):
         platform_config.extra = {"display_name": "Anikke"}
         adapter = DeltaChatAdapter(platform_config)
-        assert adapter._is_mentioned("zeptej se Anikke") is True
+        assert adapter._is_mentioned("zeptej se @Anikke") is True
         # Bots sometimes wrongly decline this indeclinable name; tolerated
         # on the receiving end too, even though the LLM shouldn't produce it.
-        assert adapter._is_mentioned("Anikko, co si o tom myslíš?") is True
+        assert adapter._is_mentioned("@Anikko, co si o tom myslíš?") is True
 
     def test_holly_dative_unchanged(self, platform_config):
         platform_config.extra = {"display_name": "Holly"}
         adapter = DeltaChatAdapter(platform_config)
-        assert adapter._is_mentioned("řekni to Holly") is True
+        assert adapter._is_mentioned("řekni to @Holly") is True
 
     def test_short_name_does_not_stem_match(self, platform_config):
         # "Tom" stems to "To" (2 chars, below the 3-char safety floor), so
@@ -339,8 +344,8 @@ class TestCzechDeclensionMentions:
         # unrelated words like "Tomas" or "Tone".
         platform_config.extra = {"display_name": "Tom"}
         adapter = DeltaChatAdapter(platform_config)
-        assert adapter._is_mentioned("Tom, jsi tu?") is True
-        assert adapter._is_mentioned("Tomasi, jsi tu?") is False
+        assert adapter._is_mentioned("@Tom, jsi tu?") is True
+        assert adapter._is_mentioned("@Tomasi, jsi tu?") is False
 
     def test_mention_aliases_config(self, platform_config):
         platform_config.extra = {
@@ -348,15 +353,15 @@ class TestCzechDeclensionMentions:
             "mention_aliases": "Anička, Aničko",
         }
         adapter = DeltaChatAdapter(platform_config)
-        assert adapter._is_mentioned("Aničko, pomoz mi") is True
-        assert adapter._is_mentioned("Anička už odpověděla") is True
+        assert adapter._is_mentioned("@Aničko, pomoz mi") is True
+        assert adapter._is_mentioned("@Anička už odpověděla") is True
 
     def test_unrelated_word_sharing_prefix_does_not_match(self, platform_config):
         # "Hollywood" shares the "Holl" stem but has far more than 2 extra
         # trailing characters, so it must not count as a mention of Holly.
         platform_config.extra = {"display_name": "Holly"}
         adapter = DeltaChatAdapter(platform_config)
-        assert adapter._is_mentioned("I watched a Hollywood movie") is False
+        assert adapter._is_mentioned("I watched a @Hollywood movie") is False
 
 
 class TestApplyYamlConfig:
