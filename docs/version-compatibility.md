@@ -7,8 +7,8 @@ The plugin requires Delta Chat core version **2.51.0** or higher.
 When the plugin connects, it automatically checks the Delta Chat core version:
 
 - **Older version**: Connection will be **rejected** (plugin requires 2.51.0+)
-- **Newer version**: A **WARNING** is logged (API may have changed)
-- **Compatible**: No warning for exact match
+- **Newer version**: An **INFO**-level note is logged (API may have changed, untested). `MIN_DC_VERSION` is a floor, not a pin, so this is the common case — not something that needs WARNING-level attention on every startup.
+- **Compatible**: No log line for exact match
 
 ## Minimum Version
 

@@ -135,3 +135,21 @@ class TestFilterLocalDeliveryPaths:
         result = adapter.filter_local_delivery_paths(["/workspace/missing.xdc"])
 
         assert result == []
+
+    def test_accepts_session_key_kwarg(self, platform_config):
+        """Regression: Hermes core calls these as
+        self.filter_media_delivery_paths(media_files, session_key=...) /
+        self.filter_local_delivery_paths(file_paths, session_key=...).
+        Dropping the extra kwarg silently (no session_key param, no
+        **kwargs) breaks every reply with a MEDIA directive at runtime."""
+        adapter = _make_adapter(platform_config)
+
+        local_result = adapter.filter_local_delivery_paths(
+            ["/home/user/report.pdf"], session_key="agent:main:deltachat:dm:12"
+        )
+        media_result = adapter.filter_media_delivery_paths(
+            [("/home/user/app.xdc", False)], session_key="agent:main:deltachat:dm:12"
+        )
+
+        assert local_result == ["/home/user/report.pdf"]
+        assert media_result == [("/home/user/app.xdc", False)]

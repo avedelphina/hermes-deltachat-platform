@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.2] - 2026-08-25
+
+### Fixed
+- `filter_media_delivery_paths`/`filter_local_delivery_paths` now accept the `session_key: str = ""` keyword argument Hermes core passes when calling them on the adapter instance (`self.filter_media_delivery_paths(media_files, session_key=session_key)`), and forward it to `BasePlatformAdapter`'s implementation. Without it every reply containing a MEDIA directive or local file path crashed with `TypeError: ... got an unexpected keyword argument 'session_key'`, surfaced to the user as "Sorry, I encountered an error (TypeError)." Every other overridden `BasePlatformAdapter` method was audited against the installed Hermes core and either matches exactly or already absorbs new keyword arguments via `**kwargs`.
+
+### Tests
+- Added `test_accepts_session_key_kwarg` to `TestFilterLocalDeliveryPaths` covering the exact call shape Hermes core uses.
+- Updated `MockBasePlatformAdapter.filter_media_delivery_paths`/`filter_local_delivery_paths` in `tests/conftest.py` to accept `session_key` too, matching the real base class.
+
+## [1.6.1] - 2026-08-25
+
+### Changed
+- The "Delta Chat version is newer than the minimum required version" message now logs at `INFO` instead of `WARNING`. `MIN_DC_VERSION` is a floor, not a pin, so running a newer core is the common case and was producing a WARNING-level line on every single startup for no actionable reason. The "too old" rejection case is unchanged (still logged at `ERROR`, connection still refused).
+
+### Tests
+- `test_version_newer_warns` → `test_version_newer_logs_info_and_allows`: asserts the message is captured at `INFO` and that no `WARNING`-level record is emitted for this case.
+
 ## [1.6.0] - 2026-08-25
 
 ### Added

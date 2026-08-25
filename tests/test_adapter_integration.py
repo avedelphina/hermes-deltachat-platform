@@ -137,15 +137,20 @@ class TestVersionCheckIntegration:
         assert "too old" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_version_newer_warns(self, mock_rpc, caplog):
-        """Test version check with newer version warns but allows."""
+    async def test_version_newer_logs_info_and_allows(self, mock_rpc, caplog):
+        """Newer-than-floor version is logged at INFO (not WARNING) and allowed.
+
+        MIN_DC_VERSION is a floor, not a pin, so this is the common/expected
+        case — not something that should warn on every startup.
+        """
         mock_rpc.get_system_info = AsyncMock(
             return_value={"deltachat_core_version": "3.0.0"}
         )
-        with caplog.at_level("WARNING"):
+        with caplog.at_level("INFO"):
             result = await _check_dc_version(mock_rpc)
         assert result is True
         assert "newer than" in caplog.text
+        assert not any(r.levelname == "WARNING" for r in caplog.records)
 
 
 class TestSendMessage:
