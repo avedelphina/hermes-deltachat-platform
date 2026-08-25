@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.0] - 2026-08-25
+
+### Added
+- `dc_send_message` gains a `file_path` parameter: pushes a proactive attachment (e.g. an agent-generated `.md` report) instead of/alongside `text`. Routed through `filter_local_delivery_paths()` — the same pipeline the reply-flow MEDIA directive uses — so a `/workspace/` path (Docker sandbox) goes through the cache-copy guard, and any other absolute path (non-Docker deployments) flows to Hermes's own denylist-aware host-path validator. Sent via `send_document` with `text` (if given) as the caption. At least one of `text`/`file_path` is now required (previously `text` alone).
+- `DELTACHAT_REQUIRE_MENTION_CHANNELS` (comma-separated group chat IDs): the inverse of `DELTACHAT_FREE_RESPONSE_CHANNELS`. When `DELTACHAT_REQUIRE_MENTION=false` (the default), every group responds freely except the chat IDs listed here, which stay mention-gated. Lets most groups stay conversational while a specific noisy support/ops group requires `@DisplayName`.
+- Non-Docker file delivery, adapted from an unmerged fix upstream (`Simon-Laux/hermes-deltachat-platform#3`, branch `fix/workspace-path-resolution-v2`): `extract_local_files`'s bare-`.xdc` regex now matches any absolute or `~/`-relative path, not just `/workspace/` (mirroring `extract_media`, which already did). The platform hint and the `webxdc-converter` skill now tell the agent to write output to its current working directory and reference it by absolute path, noting that the working directory is `/workspace/` specifically in the Docker sandbox. `_container_workspace_to_host`'s traversal-containment check (`.resolve()` + `is_relative_to()`) was already present here independent of that upstream branch.
+
+### Changed
+- **Breaking:** Plugin renamed from `deltachat-platform` to `deltachat` — `plugin.yaml`'s `name`, the registered `Platform` id, and the `hermes plugins enable`/`disable` argument all change. If your Hermes `config.yaml` has a `platforms: deltachat-platform:` block, rename that key to `platforms: deltachat:`. `DELTACHAT_*` env vars are unaffected. The recommended install directory is now `~/.hermes/plugins/deltachat/`; the `webxdc-converter` skill reference is now `plugin:deltachat:webxdc-converter`.
+- Default Delta Chat account-data directory renamed from `~/.hermes/deltachat-platform/` to `~/.hermes/deltachat/` (`_default_dc_data_dir()` in `adapter.py`, mirrored in `setup.py`). Falls back to the old directory automatically when it already holds an account and the new one doesn't, so existing installs need no manual migration — just enable the plugin under its new name and reconnect.
+
+### Fixed
+- `dc_send_message`'s `file_path` no longer hard-requires `/workspace/` — it now accepts any path a non-Docker deployment's agent can reach, validated the same way the reply-flow MEDIA pipeline validates one, instead of a plugin-local `/workspace/`-only check.
+
+### Tests
+- Added `TestDcSendMessageFilePath` (file-path validation, sandbox-copy failure, success-with-caption, non-Docker path passthrough).
+- Added `TestRequireMentionChannels` (unit) and 3 new `TestMentions` cases (integration) covering the opt-in mention mode alongside the existing legacy `require_mention=true` behavior.
+- Added `tests/test_workspace_paths.py`: `_container_workspace_to_host` mapping + traversal containment, generalized `.xdc` extractors, and `filter_local_delivery_paths` remap-vs-passthrough split. Added matching mocks (`extract_media`, `extract_local_files`, `filter_media_delivery_paths`, `filter_local_delivery_paths`) to `MockBasePlatformAdapter` in `tests/conftest.py` — this pipeline had no test coverage before.
+- Added `TestDefaultDcDataDir` and an integration test covering the deltachat-platform -> deltachat data-dir fallback.
+
 ## [1.5.11] - 2026-07-05
 
 ### Fixed

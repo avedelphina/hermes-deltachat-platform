@@ -14,7 +14,7 @@ All Delta Chat platform settings are read from environment variables (or from `c
 |----------|---------|-------------|
 | `DELTACHAT_EMAIL` | `auto` | Bot email address, or `auto` to create a free chatmail account automatically. |
 | `DELTACHAT_PASSWORD` | — | Email password. Required when `DELTACHAT_EMAIL` is set to a real address. |
-| `DELTACHAT_DATA_DIR` | `~/.hermes/deltachat-platform` | Directory for Delta Chat account data. Created with `0o700` permissions. |
+| `DELTACHAT_DATA_DIR` | `~/.hermes/deltachat` | Directory for Delta Chat account data. Created with `0o700` permissions. Falls back to the pre-rename `~/.hermes/deltachat-platform` if that already holds an account and the new path doesn't. |
 | `DELTACHAT_CHATMAIL_SERVER` | `nine.testrun.org` | Chatmail server used for auto accounts. |
 | `DELTACHAT_CHATMAIL_SERVERS` | — | Comma-separated list of chatmail servers to try in order. Overrides `DELTACHAT_CHATMAIL_SERVER`. |
 | `DELTACHAT_DISPLAY_NAME` | `Hermes` | Display name shown to contacts. |
@@ -31,6 +31,8 @@ All Delta Chat platform settings are read from environment variables (or from `c
 | `DELTACHAT_GROUP_POLICY` | `open` | Group-chat policy: `open`, `allowlist`, or `disabled`. |
 | `DELTACHAT_GROUP_ALLOWED_USERS` | — | Comma-separated emails allowed for `allowlist` group policy. |
 | `DELTACHAT_REQUIRE_MENTION` | `false` | In group chats, only respond to messages that mention the bot (`@DisplayName` or whole-word name). Applies to text and media captions. |
+| `DELTACHAT_FREE_RESPONSE_CHANNELS` | — | Comma-separated group chat IDs exempt from `DELTACHAT_REQUIRE_MENTION=true` — those groups always respond, no mention needed. |
+| `DELTACHAT_REQUIRE_MENTION_CHANNELS` | — | Comma-separated group chat IDs that stay mention-gated when `DELTACHAT_REQUIRE_MENTION=false` (the default) — inverse of `DELTACHAT_FREE_RESPONSE_CHANNELS`. Use this to keep most groups conversational while a specific noisy support/ops group requires `@DisplayName`. |
 | `DELTACHAT_SEND_REJECTION_REPLIES` | `true` | Send an explanation when a message is rejected by policy. |
 
 ## Behavior
@@ -64,4 +66,8 @@ DELTACHAT_CHATMAIL_SERVERS=nine.testrun.org,mail.example.com
 # Restrict to a group that must @-mention the bot
 DELTACHAT_REQUIRE_MENTION=true
 DELTACHAT_DISPLAY_NAME="My Assistant"
+
+# Free response everywhere, except two mention-gated support/ops groups
+DELTACHAT_REQUIRE_MENTION=false
+DELTACHAT_REQUIRE_MENTION_CHANNELS=13,14
 ```

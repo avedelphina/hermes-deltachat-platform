@@ -6,7 +6,7 @@
 
 This is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) platform plugin that adds **Delta Chat** as a gateway channel. It lets users talk to an AI assistant through Delta Chat — a decentralized, end-to-end encrypted messenger built on email — supporting text, voice messages, images, files, locations, live voice calls, and webxdc mini-apps.
 
-The project is a pure-Python plugin (no compiled extensions of its own). It is loaded by Hermes at runtime from `~/.hermes/plugins/deltachat-platform/` and communicates with the Delta Chat core through the `deltachat-rpc-server` binary via line-delimited JSON-RPC.
+The project is a pure-Python plugin (no compiled extensions of its own). It is loaded by Hermes at runtime from `~/.hermes/plugins/deltachat/` and communicates with the Delta Chat core through the `deltachat-rpc-server` binary via line-delimited JSON-RPC.
 
 ## Technology Stack
 
@@ -43,7 +43,7 @@ The project is a pure-Python plugin (no compiled extensions of its own). It is l
 3. `register_rpc_tools()` registers Delta Chat-specific tools (`dc_rpc_spec`, `dc_chat_rpc_spec`, `dc_safe_rpc_call`, `dc_start_call`, `dc_end_call`, `dc_send_message`, and optionally `dc_rpc_call`).
 4. When the gateway starts, `DeltaChatAdapter.connect()`:
    - Resolves `DELTACHAT_RPC_SERVER` / config `extra.rpc_server`.
-   - Starts `deltachat-rpc-server` with `DC_ACCOUNTS_PATH` set to `<HERMES_HOME>/deltachat-platform/`.
+   - Starts `deltachat-rpc-server` with `DC_ACCOUNTS_PATH` set to `<HERMES_HOME>/deltachat/` (or the pre-rename `<HERMES_HOME>/deltachat-platform/`, if that already holds an account and the new path doesn't — see `_default_dc_data_dir` in `adapter.py`).
    - Verifies the core version is at least `MIN_DC_VERSION` (`2.51.0`).
    - Uses the first existing account or errors out (account creation is done via `setup.py`).
    - Enables bot mode, starts IO, and launches the async event listener.
@@ -170,14 +170,16 @@ python3 -m py_compile vendor/deltachat2/*.py
 - **Rate limiting**: per-sender sliding window, default 30 messages / 60 seconds.
 - **Raw RPC is opt-in and filtered**: `dc_rpc_call` (unrestricted RPC access) is only registered when `DELTACHAT_ENABLE_RAW_RPC=1` is set. It logs every call at `WARNING`, blocks all destructive methods (`delete_*`, `remove_*`, and the internal destructive list), and supports an optional allowlist (`DELTACHAT_RAW_RPC_ALLOWLIST=method1,method2`) or extra blocklist (`DELTACHAT_RAW_RPC_BLOCKLIST=method1`). Prefer `dc_safe_rpc_call`, which validates the chat token, injects `accountId`/`chatId`, and blocks destructive methods.
 - **Chat tokens**: Opaque per-chat tokens (`[dc:chat=<token>]`) are appended to incoming message text so the LLM can call `dc_safe_rpc_call`. They are persisted in Delta Chat UI config keys (`ui.hermes.chat_token.<chat_id>`) and cached in-process under an `asyncio.Lock`.
-- **Proactive sends (`dc_send_message`)**: lets the agent push text to a chat outside the reply flow — e.g. a cron/scheduled task, or one agent posting into a shared multi-agent group without having seen an inbound message from it yet. Still token-gated like `dc_safe_rpc_call` (no raw chat_id parameter, so it can't target an arbitrary/unauthorized chat); omitting `chat_token` falls back to `DELTACHAT_HOME_CHANNEL` if configured, and errors otherwise. An optional `address` param cold-opens a 1:1 chat with a Delta Chat email instead of a `chat_token` — guarded by `_is_address_in_known_rosters()` to addresses already seen via `get_chat_contacts` in a group this bot participates in (populated by the same roster cache `_get_group_roster` builds for group message metadata); an address outside every cached roster is rejected. `chat_token` takes precedence if both are given. Resolution is `lookup_contact_id_by_addr` → `create_contact` (only if unknown) → `create_chat_by_contact_id`.
+- **Proactive sends (`dc_send_message`)**: lets the agent push text to a chat outside the reply flow — e.g. a cron/scheduled task, or one agent posting into a shared multi-agent group without having seen an inbound message from it yet. Still token-gated like `dc_safe_rpc_call` (no raw chat_id parameter, so it can't target an arbitrary/unauthorized chat); omitting `chat_token` falls back to `DELTACHAT_HOME_CHANNEL` if configured, and errors otherwise. An optional `address` param cold-opens a 1:1 chat with a Delta Chat email instead of a `chat_token` — guarded by `_is_address_in_known_rosters()` to addresses already seen via `get_chat_contacts` in a group this bot participates in (populated by the same roster cache `_get_group_roster` builds for group message metadata); an address outside every cached roster is rejected. `chat_token` takes precedence if both are given. Resolution is `lookup_contact_id_by_addr` → `create_contact` (only if unknown) → `create_chat_by_contact_id`. An optional `file_path` attaches a file (e.g. an agent-generated `.md` report) instead of/alongside `text`; it is routed through `filter_local_delivery_paths()` — the same pipeline the reply-flow MEDIA directive uses — so a `/workspace/` path (Docker sandbox) goes through the `_copy_container_file_to_cache()` sandbox-escape/symlink guard, and any other absolute path (non-Docker deployments) flows to Hermes's own denylist-aware host-path validator; a path either function rejects returns an error rather than falling back to the raw path. The result is sent via `send_document` with `text` (if any) as the caption. At least one of `text`/`file_path` is required.
 - **Bot-loop guard**: `DELTACHAT_MAX_CONSECUTIVE_REPLIES` (default 20, `<=0` disables) stops the adapter from processing further messages from the same sender in a chat once they've sent that many in a row with no other participant chiming in — guards against two bots ping-ponging (one single other sender, from this bot's view) forever. Sends one notice (subject to `DELTACHAT_SEND_REJECTION_REPLIES`) the first time a streak trips; resets as soon as anyone else speaks.
 - **Bot-exchange guard**: `DELTACHAT_MAX_BOT_EXCHANGES` (default 12) caps total messages in a chat from any sender not in `DELTACHAT_HUMAN_USERS`, before requiring a check-in from one of those addresses. Covers what the bot-loop guard above can't: 3+ bots round-robining a shared group, where the sender keeps changing so no single-sender streak ever trips. Inactive unless `DELTACHAT_HUMAN_USERS` is set (with no known human address there is no way to detect a "check-in").
 - **Free-response channels**: `DELTACHAT_FREE_RESPONSE_CHANNELS` (comma-separated group chat IDs) exempts those groups from `DELTACHAT_REQUIRE_MENTION` — e.g. a shared multi-bot group where every message should get a reply without an `@mention`. Use alongside the bot-exchange guard above to keep that group's cross-bot chatter open but bounded.
+- **Opt-in mention gating**: `DELTACHAT_REQUIRE_MENTION_CHANNELS` (comma-separated group chat IDs) is the inverse of `DELTACHAT_FREE_RESPONSE_CHANNELS`, for the opposite default. With `DELTACHAT_REQUIRE_MENTION=false` (the default), every group responds freely *except* the chat IDs listed here, which stay mention-gated — e.g. most groups conversational, but a noisy support/ops group requires an explicit `@mention`. `_check_mention` in `adapter.py` picks the mode from the global `require_mention` flag: `true` → gate everything except `free_response_channels`; `false` → gate nothing except `require_mention_channels`. The two allowlists are independent and only one is consulted, based on which mode is active.
 - **Mention gate is silent by design**: an unmentioned group message under `DELTACHAT_REQUIRE_MENTION` is dropped without any reply, even when `DELTACHAT_SEND_REJECTION_REPLIES=true` — this check does not honor that flag. In a multi-bot group every bot enforces the gate independently, so a "please mention me" notice would fire once per bot per unmentioned message; silence is the only option that doesn't spam the chat.
 - **Mention matching requires an explicit `@` and tolerates case-ending variation** (`_build_mention_pattern` in `adapter.py`): a bare display name in prose (e.g. "napiš Alici, aby to udělala" — asking someone else to message Alice) is *about* the bot, not addressed to it, so only `@Name`-style tokens count as a mention. Case-ending tolerance is built for Czech declension (e.g. `display_name: Alice` also matches "@Alici"/"@Alicí"; "Anikke" also matches the incorrectly-declined "@Anikko"), implemented generically as stem + up to 2 trailing word characters, not a Czech-specific grammar table. The stem must be ≥3 chars — shorter names (e.g. "Tom") fall back to an exact match instead, to avoid matching unrelated words that happen to share a short prefix. `DELTACHAT_MENTION_ALIASES` (comma-separated) adds extra exact-ish forms (each still gets the same stem-tolerant treatment, and each still requires the `@` prefix) for names/nicknames the automatic stemming doesn't cover.
 - **File paths from containers**: When an agent writes files to `/workspace/` inside the Docker sandbox, the adapter resolves the path, verifies it stays inside the sandbox (rejects `..` and symlink escapes), rejects symlinks, and copies the file to the Hermes documents cache before validation/sending.
-- **Secrets**: Do not commit real accounts, keys, or `.env` files. `DC_ACCOUNTS_PATH` lives under the Hermes profile directory (default `~/.hermes/deltachat-platform/`). The account password is cleared from memory as soon as configuration completes or fails.
+- **Non-Docker file delivery**: on deployments without the Docker LLM sandbox, an agent's output file never has a `/workspace/` path to begin with — it lives at the agent's real cwd. `extract_media`/`extract_local_files` pick up any bare or `MEDIA:`-tagged `.xdc` path (absolute or `~/`-relative, not just `/workspace/`), and `filter_media_delivery_paths`/`filter_local_delivery_paths` only remap paths that start with `/workspace/`; anything else flows unchanged to Hermes's own denylist-aware host-path validator (`gateway.platforms.base.BasePlatformAdapter`'s filter methods), which is the actual safety boundary for those paths — the adapter does not duplicate that logic. `dc_send_message`'s `file_path` (see below) reuses this same `filter_local_delivery_paths` call rather than only accepting `/workspace/`, since it has no other downstream validator of its own.
+- **Secrets**: Do not commit real accounts, keys, or `.env` files. `DC_ACCOUNTS_PATH` lives under the Hermes profile directory (default `~/.hermes/deltachat/`). The account password is cleared from memory as soon as configuration completes or fails.
 - **Inbound access control is fail-closed**: If the adapter cannot fetch chat info to determine DM/group policy, the message is rejected. RPC/version-check failures also reject instead of falling through.
 - **Voice-call audio buffering is capped**: Continuous speech is forced to flush after a 60-second ceiling so the incoming audio buffer cannot grow without bound.
 
@@ -224,14 +226,14 @@ Group messages carry additional context beyond the per-message sender: `metadata
 The plugin is not a standalone executable; it is installed into the Hermes plugins directory:
 
 ```bash
-git clone https://github.com/Simon-Laux/hermes-deltachat-platform ~/.hermes/plugins/deltachat-platform
-hermes plugins enable deltachat-platform
+git clone https://github.com/avedelphina/hermes-deltachat-platform ~/.hermes/plugins/deltachat
+hermes plugins enable deltachat
 ```
 
 Then create the Delta Chat account:
 
 ```bash
-python3 ~/.hermes/plugins/deltachat-platform/setup.py
+python3 ~/.hermes/plugins/deltachat/setup.py
 ```
 
 And start the gateway:
@@ -248,7 +250,7 @@ hermes gateway start
   nix build --impure --expr 'with import <nixpkgs> {}; python312.withPackages(ps: [ps.aiortc])' -o ~/.hermes/aiortc-env
   ```
   Then add its site-packages to `PYTHONPATH` in `~/.hermes/.env`.
-- The `flake.nix` also provides a `packages.default` derivation that installs the plugin files to `$out/share/hermes/plugins/deltachat-platform/`.
+- The `flake.nix` also provides a `packages.default` derivation that installs the plugin files to `$out/share/hermes/plugins/deltachat/`.
 
 ## Environment / Configuration Reference
 
@@ -270,6 +272,7 @@ hermes gateway start
 | `DELTACHAT_REQUIRE_MENTION` | No | `false` | Require `@mention` in group chats before responding |
 | `DELTACHAT_MENTION_ALIASES` | No | — | Comma-separated extra names/forms that also count as a mention, beyond `DELTACHAT_DISPLAY_NAME` and its auto-tolerated case endings |
 | `DELTACHAT_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated group chat IDs exempt from `DELTACHAT_REQUIRE_MENTION` |
+| `DELTACHAT_REQUIRE_MENTION_CHANNELS` | No | — | Comma-separated group chat IDs that stay mention-gated when `DELTACHAT_REQUIRE_MENTION=false` (inverse of `DELTACHAT_FREE_RESPONSE_CHANNELS`) |
 | `DELTACHAT_CALL_STT_VOXTRAL` | No | `false` | Use Mistral Voxtral cloud STT for calls |
 | `DELTACHAT_CALL_MODEL` | No | unset | Per-call LLM override |
 | `DELTACHAT_DEBUG` | No | unset | Enables debug logging for `deltachat2` |

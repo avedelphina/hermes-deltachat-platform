@@ -12,7 +12,7 @@ HERMES_PLUGINS_DEBUG=1 hermes plugins list
 ```
 
 **Common causes:**
-- Plugin not in correct directory: `~/.hermes/plugins/deltachat-platform/`
+- Plugin not in correct directory: `~/.hermes/plugins/deltachat/`
 - Missing `plugin.yaml` or `__init__.py`
 - Syntax error in plugin files
 - Missing dependencies
@@ -20,11 +20,11 @@ HERMES_PLUGINS_DEBUG=1 hermes plugins list
 **Fix:**
 ```bash
 # Verify directory structure
-ls -la ~/.hermes/plugins/deltachat-platform/
+ls -la ~/.hermes/plugins/deltachat/
 
 # Check for syntax errors
-python3 -m py_compile ~/.hermes/plugins/deltachat-platform/__init__.py
-python3 -m py_compile ~/.hermes/plugins/deltachat-platform/adapter.py
+python3 -m py_compile ~/.hermes/plugins/deltachat/__init__.py
+python3 -m py_compile ~/.hermes/plugins/deltachat/adapter.py
 
 # Install dependencies
 pip install deltachat2
@@ -70,11 +70,15 @@ pip install deltachat-rpc-server
 
 **Check:**
 ```bash
-# Verify deltachat-platform directory exists
-ls -la ~/.hermes/deltachat-platform/
+# Verify deltachat directory exists
+ls -la ~/.hermes/deltachat/
 
 # Or for specific profile
-ls -la ~/.hermes/profiles/<name>/deltachat-platform/
+ls -la ~/.hermes/profiles/<name>/deltachat/
+
+# Renamed from deltachat-platform/ to deltachat/ — if you're on an existing
+# install and see nothing above, check the old name too:
+ls -la ~/.hermes/deltachat-platform/
 ```
 
 **Common causes:**
@@ -197,12 +201,18 @@ top -p $(pgrep -f deltachat-rpc-server)
 **To completely remove the plugin:**
 ```bash
 # Remove plugin files
-rm -rf ~/.hermes/plugins/deltachat-platform/
+rm -rf ~/.hermes/plugins/deltachat/
 
 # Remove profile-specific config
+rm -rf ~/.hermes/profiles/*/deltachat/
+rm -rf ~/.hermes/deltachat/
+
+# On an install predating the deltachat-platform -> deltachat rename, also
+# check the old directory names:
+rm -rf ~/.hermes/plugins/deltachat-platform/
 rm -rf ~/.hermes/profiles/*/deltachat-platform/
 rm -rf ~/.hermes/deltachat-platform/
 
 # Remove from enabled plugins
-hermes plugins disable deltachat-platform
+hermes plugins disable deltachat
 ```

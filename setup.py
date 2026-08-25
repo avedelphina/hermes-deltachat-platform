@@ -351,8 +351,22 @@ if __name__ == "__main__":
     # Auto-detect and select profile
     profile_name, hermes_home = select_profile()
 
-    # Set accounts directory
-    dc_accounts_path = os.path.join(hermes_home, "deltachat-platform")
+    # Set accounts directory. Renamed from deltachat-platform/ to deltachat/
+    # alongside the plugin rename — keep using the old directory if it
+    # already holds an account and the new one doesn't, so re-running setup
+    # on an existing install doesn't create a second, empty account store.
+    new_accounts_path = os.path.join(hermes_home, "deltachat")
+    old_accounts_path = os.path.join(hermes_home, "deltachat-platform")
+
+    def _has_account_data(p):
+        return os.path.isdir(p) and any(os.scandir(p))
+
+    if _has_account_data(old_accounts_path) and not _has_account_data(
+        new_accounts_path
+    ):
+        dc_accounts_path = old_accounts_path
+    else:
+        dc_accounts_path = new_accounts_path
     os.makedirs(dc_accounts_path, exist_ok=True)
     os.environ["DC_ACCOUNTS_PATH"] = dc_accounts_path
     os.environ["HERMES_HOME"] = hermes_home

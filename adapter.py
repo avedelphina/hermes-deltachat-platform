@@ -152,6 +152,28 @@ def _safe_data_dir(path: str, create: bool = False) -> Path:
     return p
 
 
+def _default_dc_data_dir() -> str:
+    """Default Delta Chat account-data directory (when DELTACHAT_DATA_DIR unset).
+
+    Renamed from <HERMES_HOME>/deltachat-platform/ to <HERMES_HOME>/deltachat/
+    alongside the plugin's own rename. Falls back to the old directory name
+    when it already holds account data and the new one doesn't, so existing
+    installs keep working without a manual migration step.
+    """
+    from gateway.config import get_hermes_home
+
+    home = get_hermes_home()
+    new_path = os.path.join(home, "deltachat")
+    old_path = os.path.join(home, "deltachat-platform")
+
+    def _has_data(p: str) -> bool:
+        return os.path.isdir(p) and any(os.scandir(p))
+
+    if _has_data(old_path) and not _has_data(new_path):
+        return old_path
+    return new_path
+
+
 def _validate_rpc_server_path(path: str, strict: bool = True) -> str:
     """Resolve the RPC server binary path. Raise ValueError if invalid."""
     if not path:
@@ -546,7 +568,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
         Args:
             config: Hermes PlatformConfig for this profile
         """
-        super().__init__(config, Platform("deltachat-platform"))
+        super().__init__(config, Platform("deltachat"))
         self.rpc = None
         self._transport = None
         self.account_id: Optional[int] = None
@@ -630,6 +652,18 @@ class DeltaChatAdapter(BasePlatformAdapter):
         )
         self._free_response_channels = (
             _parse_email_list(raw_free_response) if raw_free_response else set()
+        )
+        # Inverse of free_response_channels: when require_mention is off
+        # (free response by default), these chat IDs opt back into mention
+        # gating instead — e.g. a noisy multi-agent group that should stay
+        # conversational vs. a support/ops group that shouldn't.
+        raw_require_mention_channels = g(
+            "DELTACHAT_REQUIRE_MENTION_CHANNELS", "require_mention_channels"
+        )
+        self._require_mention_channels = (
+            _parse_email_list(raw_require_mention_channels)
+            if raw_require_mention_channels
+            else set()
         )
 
         # Guards against bot-to-bot auto-reply loops (e.g. multiple agents in
@@ -860,12 +894,23 @@ class DeltaChatAdapter(BasePlatformAdapter):
         notice would fire once per bot per unmentioned message; silence is
         the only option that doesn't spam the chat.
 
+        Two modes, selected by the global require_mention default:
+        - require_mention=true (legacy): every group is gated, except chat
+          IDs listed in free_response_channels.
+        - require_mention=false (default): every group responds freely,
+          except chat IDs listed in require_mention_channels, which stay
+          gated.
+
         Returns True if the message should be processed.
         """
-        if chat_type != "group" or not self._require_mention:
+        if chat_type != "group":
             return True
-        if str(chat_id) in self._free_response_channels:
-            return True
+        if self._require_mention:
+            if str(chat_id) in self._free_response_channels:
+                return True
+        else:
+            if str(chat_id) not in self._require_mention_channels:
+                return True
         if not text or text.startswith("/"):
             return True
         if self._is_mentioned(text):
@@ -1015,16 +1060,16 @@ class DeltaChatAdapter(BasePlatformAdapter):
         """Get Delta Chat config directory path.
 
         Uses DELTACHAT_DATA_DIR if set, otherwise falls back to
-        <HERMES_HOME>/deltachat-platform/ for backward compatibility.
-        The directory is created with restrictive permissions when first accessed.
+        <HERMES_HOME>/deltachat/ (or the pre-rename <HERMES_HOME>/deltachat-platform/
+        if that's where an existing account already lives — see
+        _default_dc_data_dir). The directory is created with restrictive
+        permissions when first accessed.
         """
         if self._dc_config_dir is None:
             if self._data_dir:
                 path = self._data_dir
             else:
-                from gateway.config import get_hermes_home
-
-                path = os.path.join(get_hermes_home(), "deltachat-platform")
+                path = _default_dc_data_dir()
             # Validate/create the directory, but keep the original (unresolved) path
             # so that existing tests and relative-path configs stay stable.
             expanded = os.path.expanduser(path)
@@ -1935,18 +1980,24 @@ body {{
         return media_files, remaining
 
     def extract_local_files(self, content: str):
-        """Extend base to also pick up bare /workspace/*.xdc paths.
+        """Extend base to also pick up bare .xdc paths.
 
-        The base staticmethod checks os.path.isfile() on the host — container
-        paths like /workspace/app.xdc don't exist there, so we add them
-        explicitly.  filter_local_delivery_paths then does the host mapping.
+        .xdc is not in Hermes's MEDIA_DELIVERY_EXTS, so the base staticmethod
+        never picks up bare .xdc paths. We add them explicitly for both
+        deployment shapes:
+          * Docker sandbox container paths like /workspace/app.xdc, which
+            don't exist on the host — filter_local_delivery_paths then maps
+            them to the host sandbox before validation.
+          * Non-Docker deployments where the agent writes to its real host
+            cwd and references it by absolute (or ~/) path — these flow
+            unchanged to the base validator, same as extract_media above.
         """
         import re
         from gateway.platforms.base import BasePlatformAdapter
 
         files, remaining = BasePlatformAdapter.extract_local_files(content)
 
-        xdc_re = re.compile(r"(?<![/:\w.])(/workspace/[\w./\-]+\.xdc)\b", re.IGNORECASE)
+        xdc_re = re.compile(r"(?<![/:\w.])((?:~/|/)[\w./\-]+\.xdc)\b", re.IGNORECASE)
         for match in xdc_re.finditer(content):
             path = match.group(1)
             if path not in files:
@@ -2606,10 +2657,8 @@ def validate_config(config) -> bool:
         raise ValueError(f"Invalid DELTACHAT_GROUP_POLICY: {group_policy!r}")
 
     # Lightweight path checks (do not create directories or require the binary).
-    from gateway.config import get_hermes_home
-
     data_dir = os.getenv("DELTACHAT_DATA_DIR") or extra.get(
-        "data_dir", os.path.join(get_hermes_home(), "deltachat-platform")
+        "data_dir", _default_dc_data_dir()
     )
     _safe_data_dir(data_dir, create=False)
 
@@ -2655,7 +2704,7 @@ def _apply_yaml_config(
     """Bridge YAML config values to env-style extra keys for the platform adapter.
 
     The gateway config loader calls this hook with the parsed YAML tree and the
-    deltachat-platform config block (which may be nested under ``platforms``).
+    deltachat config block (which may be nested under ``platforms``).
     Values returned here are merged into ``platform_config.extra`` and are then
     read by the adapter constructor.
     """
@@ -2687,6 +2736,7 @@ def _apply_yaml_config(
         ("require_mention", "require_mention"),
         ("mention_aliases", "mention_aliases"),
         ("free_response_channels", "free_response_channels"),
+        ("require_mention_channels", "require_mention_channels"),
         ("auto_delete_interval", "auto_delete_interval"),
         ("max_message_length", "max_message_length"),
     ):
@@ -2714,14 +2764,10 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     result = {"rpc_server": rpc_server}
 
     # Add onboarding / profile fields if set
-    from gateway.config import get_hermes_home
-
     email = os.getenv("DELTACHAT_EMAIL")
     if email:
         result["email"] = email
-    result["data_dir"] = os.getenv(
-        "DELTACHAT_DATA_DIR", os.path.join(get_hermes_home(), "deltachat-platform")
-    )
+    result["data_dir"] = os.getenv("DELTACHAT_DATA_DIR", _default_dc_data_dir())
     display_name = os.getenv("DELTACHAT_DISPLAY_NAME")
     if display_name:
         result["display_name"] = display_name
@@ -2747,7 +2793,7 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
 def register_platform(ctx):
     """Register Delta Chat platform adapter with Hermes."""
     ctx.register_platform(
-        name="deltachat-platform",
+        name="deltachat",
         label="Delta Chat",
         adapter_factory=lambda cfg: DeltaChatAdapter(cfg),
         check_fn=check_requirements,
@@ -2776,12 +2822,13 @@ def register_platform(ctx):
             "Location messages can be sent to share points of interest on a map. "
             "You CAN build and send webxdc mini apps and other files (PDF, HTML, etc.). "
             "MANDATORY: before attempting to build any webxdc app, you MUST first call "
-            "skill_view('plugin:deltachat-platform:webxdc-converter') "
+            "skill_view('plugin:deltachat:webxdc-converter') "
             "to load the build instructions. "
-            "For file delivery from the Docker sandbox: write output files "
-            "to /workspace/ (NOT /tmp/), "
-            "then use a MEDIA directive — e.g. 'MEDIA:/workspace/app.xdc'. "
-            "The adapter maps /workspace/ paths to the host and sends via send_document. "
+            "For file delivery: write output files to your current working directory "
+            "(run `pwd` to find it), NOT /tmp/. "
+            "Then reference the file by ABSOLUTE path in a MEDIA directive — e.g. "
+            "'MEDIA:/abs/path/app.xdc'. In the Docker sandbox the working directory "
+            "is /workspace/, so there it is 'MEDIA:/workspace/app.xdc'. "
             "DC core auto-detects .xdc as webxdc — just send it as a regular file. "
             "Each message ends with a [dc:chat=<token>] metadata tag. "
             "IGNORE this tag during normal conversation — it is only needed "
@@ -2793,7 +2840,7 @@ def register_platform(ctx):
         max_message_length=DC_MESSAGE_MAX_LEN,
     )
 
-    # Register bundled skills so skill_view('deltachat-platform:<name>') resolves them.
+    # Register bundled skills so skill_view('deltachat:<name>') resolves them.
     from pathlib import Path as _Path
 
     skills_dir = _Path(_plugin_dir) / "skills"
@@ -3022,13 +3069,14 @@ def register_rpc_tools(ctx) -> None:
         """
         args = args or {}
         text = (args.get("text") or "").strip()
+        file_path = (args.get("file_path") or "").strip()
         chat_token = args.get("chat_token")
         address = (args.get("address") or "").strip().lower()
         adapter = _active_adapter
         if adapter is None or adapter.rpc is None:
             return json.dumps({"error": "Delta Chat is not connected"})
-        if not text:
-            return json.dumps({"error": "Provide 'text' to send."})
+        if not text and not file_path:
+            return json.dumps({"error": "Provide 'text' and/or 'file_path' to send."})
 
         if chat_token:
             real_chat_id = await _resolve_chat_token(
@@ -3093,11 +3141,37 @@ def register_rpc_tools(ctx) -> None:
                     {"error": "DELTACHAT_HOME_CHANNEL is not a valid chat id"}
                 )
 
-        try:
-            result = await adapter.send(str(real_chat_id), text)
-        except Exception as e:
-            logger.error("dc_send_message failed: %s", e, exc_info=True)
-            return json.dumps({"error": "Send failed"})
+        if file_path:
+            # why: reuses the same remap-then-validate pipeline the reply-flow
+            # MEDIA directive uses — /workspace/ paths (Docker sandbox) go
+            # through _copy_container_file_to_cache, anything else flows to
+            # Hermes's own denylist-aware host-path validator. dc_send_message
+            # has no other downstream validator of its own, so this call is
+            # the only thing standing between an agent-supplied path and an
+            # arbitrary host file read.
+            validated_paths = adapter.filter_local_delivery_paths([file_path])
+            if not validated_paths:
+                return json.dumps(
+                    {
+                        "error": f"'{file_path}' could not be delivered — not found, "
+                        "or blocked by policy. In the Docker sandbox write to "
+                        "/workspace/; otherwise use an absolute path that exists "
+                        "on the host."
+                    }
+                )
+            try:
+                result = await adapter.send_document(
+                    str(real_chat_id), validated_paths[0], caption=text or None
+                )
+            except Exception as e:
+                logger.error("dc_send_message file send failed: %s", e, exc_info=True)
+                return json.dumps({"error": "Send failed"})
+        else:
+            try:
+                result = await adapter.send(str(real_chat_id), text)
+            except Exception as e:
+                logger.error("dc_send_message failed: %s", e, exc_info=True)
+                return json.dumps({"error": "Send failed"})
         if not result.success:
             return json.dumps({"error": result.error or "Send failed"})
         return json.dumps({"success": True, "message_id": result.message_id})
@@ -3297,14 +3371,34 @@ def register_rpc_tools(ctx) -> None:
                 "directly instead of a chat you've already seen traffic in, use "
                 "'address' — this opens (or reuses) a 1:1 chat with that contact, but "
                 "only works for an address that is a current member of a group this "
-                "bot participates in; it cannot cold-DM an arbitrary address."
+                "bot participates in; it cannot cold-DM an arbitrary address. "
+                "To push a generated file (e.g. a .md report) instead of/alongside "
+                "text, write it to your current working directory (run `pwd` to "
+                "find it — in the Docker sandbox that's /workspace/) and pass its "
+                "absolute path as 'file_path' — text becomes the caption. DC "
+                "auto-detects the viewtype from the extension."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "The message text to send.",
+                        "description": (
+                            "The message text to send. Optional if 'file_path' is given "
+                            "(used as the file's caption); required otherwise."
+                        ),
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path to a file to attach, e.g. "
+                            "'/workspace/report.md' in the Docker sandbox, or any "
+                            "absolute host path in a non-Docker deployment. Write "
+                            "the file to your current working directory first. "
+                            "Sent as a document; 'text' (if given) becomes its "
+                            "caption. Rejected if the file doesn't exist or is "
+                            "blocked by delivery policy."
+                        ),
                     },
                     "chat_token": {
                         "type": "string",
@@ -3327,7 +3421,6 @@ def register_rpc_tools(ctx) -> None:
                         ),
                     },
                 },
-                "required": ["text"],
             },
         },
         handler=_send_message_handler,

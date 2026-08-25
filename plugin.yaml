@@ -1,12 +1,12 @@
-name: deltachat-platform
+name: deltachat
 label: Delta Chat
 kind: platform
-version: 1.5.11
+version: 1.6.0
 description: Delta Chat messaging platform adapter for Hermes Agent. Supports text, webxdc mini apps, voice messages, images, and videos.
 author: Simon Laux
 requires_env:
   - name: DELTACHAT_RPC_SERVER
-    description: "Path to deltachat-rpc-server binary. After setting, run: python ~/.hermes/plugins/deltachat-platform/setup.py"
+    description: "Path to deltachat-rpc-server binary. After setting, run: python ~/.hermes/plugins/deltachat/setup.py"
 optional_env:
   - name: DELTACHAT_EMAIL
     description: "Email for the bot account. Use 'auto' to create a free chatmail account automatically during connect"
@@ -17,7 +17,7 @@ optional_env:
     prompt: "Email password (optional)"
     password: true
   - name: DELTACHAT_DATA_DIR
-    description: "Directory for Delta Chat account data (default: ~/.hermes/deltachat-platform)"
+    description: "Directory for Delta Chat account data (default: ~/.hermes/deltachat)"
     prompt: "Data directory"
     password: false
   - name: DELTACHAT_CHATMAIL_SERVER
@@ -75,6 +75,10 @@ optional_env:
   - name: DELTACHAT_FREE_RESPONSE_CHANNELS
     description: "Comma-separated group chat IDs exempt from DELTACHAT_REQUIRE_MENTION (e.g. a shared multi-bot group where messages should always be answered)"
     prompt: "Free-response group chat IDs (optional)"
+    password: false
+  - name: DELTACHAT_REQUIRE_MENTION_CHANNELS
+    description: "Comma-separated group chat IDs that require @mention even when DELTACHAT_REQUIRE_MENTION is false (inverse of DELTACHAT_FREE_RESPONSE_CHANNELS — e.g. a noisy support/ops group that should stay mention-gated while other groups respond freely)"
+    prompt: "Mention-gated group chat IDs (optional)"
     password: false
   - name: DELTACHAT_SEND_REJECTION_REPLIES
     description: "Send explanation messages when a sender is rejected (default: true)"

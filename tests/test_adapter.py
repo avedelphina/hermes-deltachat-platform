@@ -488,6 +488,73 @@ class TestFreeResponseChannels:
         assert await adapter._check_mention("hello", "group", "15") is False
 
 
+class TestRequireMentionChannels:
+    """require_mention=false (default): free response everywhere except the
+    chat IDs opted back into mention-gating via require_mention_channels."""
+
+    @pytest.mark.asyncio
+    async def test_default_is_free_response_with_no_channels_configured(
+        self, platform_config
+    ):
+        platform_config.extra = {"display_name": "Bot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.send = AsyncMock()
+        assert await adapter._check_mention("hello", "group", "13") is True
+
+    @pytest.mark.asyncio
+    async def test_listed_channel_requires_mention(self, platform_config):
+        platform_config.extra = {
+            "require_mention": False,
+            "display_name": "Bot",
+            "require_mention_channels": "13,14",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.send = AsyncMock()
+        assert await adapter._check_mention("hello", "group", "13") is False
+        assert await adapter._check_mention("hello", "group", "14") is False
+        adapter.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_listed_channel_allows_mentioned_message(self, platform_config):
+        platform_config.extra = {
+            "require_mention": False,
+            "display_name": "Bot",
+            "require_mention_channels": "13",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        assert await adapter._check_mention("hey @Bot", "group", "13") is True
+
+    @pytest.mark.asyncio
+    async def test_unlisted_channel_responds_freely(self, platform_config):
+        platform_config.extra = {
+            "require_mention": False,
+            "display_name": "Bot",
+            "require_mention_channels": "13,14",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        assert await adapter._check_mention("hello", "group", "15") is True
+
+    @pytest.mark.asyncio
+    async def test_require_mention_channels_ignored_when_require_mention_true(
+        self, platform_config
+    ):
+        """require_mention_channels only applies in the require_mention=false
+        mode; the legacy true+free_response_channels behavior takes over
+        otherwise and require_mention_channels is not consulted."""
+        platform_config.extra = {
+            "require_mention": True,
+            "display_name": "Bot",
+            "require_mention_channels": "13",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        # chat 13 is in require_mention_channels but that list is irrelevant
+        # here — require_mention=true gates every group unless listed in
+        # free_response_channels, which is empty, so it's still gated.
+        assert await adapter._check_mention("hello", "group", "13") is False
+        # chat 20 isn't in either list — also gated under legacy mode.
+        assert await adapter._check_mention("hello", "group", "20") is False
+
+
 class TestUnmentionedGroupMessageIsSilent:
     """The mention gate must never reply — see CLAUDE.md bot-loop history:
     every bot in a shared group enforcing this independently would spam a

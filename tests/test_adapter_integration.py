@@ -26,37 +26,58 @@ from adapter import (
 class TestConfigDirectoryIntegration:
     """Test config directory integration with mocked Hermes."""
 
-    def test_dc_config_dir_uses_hermes_home(self, platform_config):
+    def test_dc_config_dir_uses_hermes_home(
+        self, platform_config, monkeypatch, tmp_path
+    ):
         """Test that _get_dc_config_dir uses HERMES_HOME correctly."""
+        # Isolated HERMES_HOME so the deltachat-platform/ backward-compat
+        # fallback (_default_dc_data_dir) can't pick up a leftover directory
+        # from another test run.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
         adapter = DeltaChatAdapter(platform_config)
         config_dir = adapter._get_dc_config_dir()
 
-        # MockHermesConfig.get_hermes_home returns a default path
-        # The adapter should append "deltachat-platform" to it
-        from tests.conftest import MockHermesConfig
-
-        expected_home = MockHermesConfig.get_hermes_home()
-        expected = os.path.join(expected_home, "deltachat-platform")
+        # The adapter should append "deltachat" to HERMES_HOME
+        expected = os.path.join(str(tmp_path), "deltachat")
         assert config_dir == expected
 
-    def test_dc_config_dir_creates_directory(self, platform_config, tmp_path):
+    def test_dc_config_dir_creates_directory(
+        self, platform_config, monkeypatch, tmp_path
+    ):
         """Test that _get_dc_config_dir creates the directory if it doesn't exist."""
         # Set a custom HERMES_HOME for this test
         test_home = str(tmp_path / "hermes")
-        import os
-
-        os.environ["HERMES_HOME"] = test_home
+        monkeypatch.setenv("HERMES_HOME", test_home)
 
         # Clear the cached config dir
         adapter = DeltaChatAdapter(platform_config)
         adapter._dc_config_dir = None
 
         config_dir = adapter._get_dc_config_dir()
-        expected_dir = os.path.join(test_home, "deltachat-platform")
+        expected_dir = os.path.join(test_home, "deltachat")
 
         assert os.path.exists(config_dir)
         assert os.path.isdir(config_dir)
         assert config_dir == expected_dir
+
+    def test_dc_config_dir_falls_back_to_old_name_for_existing_install(
+        self, platform_config, monkeypatch, tmp_path
+    ):
+        """An install that predates the deltachat-platform -> deltachat
+        rename keeps working without a manual migration step."""
+        test_home = str(tmp_path / "hermes")
+        os.makedirs(test_home)
+        old_dir = os.path.join(test_home, "deltachat-platform")
+        os.makedirs(os.path.join(old_dir, "1"))  # pre-existing account
+        monkeypatch.setenv("HERMES_HOME", test_home)
+
+        adapter = DeltaChatAdapter(platform_config)
+        adapter._dc_config_dir = None
+
+        config_dir = adapter._get_dc_config_dir()
+
+        assert config_dir == old_dir
 
 
 class TestRPCServerPath:
@@ -1037,6 +1058,100 @@ class TestMentions:
 
         adapter.handle_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_default_free_response_processes_unmentioned_group_message(
+        self, platform_config, mock_rpc, group_event
+    ):
+        """require_mention defaults to false — with no require_mention_channels
+        configured, an unmentioned group message is still processed."""
+        platform_config.extra = {"display_name": "Bot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "hello there",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_require_mention_channels_gates_only_listed_chat(
+        self, platform_config, mock_rpc, group_event
+    ):
+        """require_mention=false + require_mention_channels: chat 1 (from the
+        group_event fixture) is listed, so it stays mention-gated even though
+        the global default is free response."""
+        platform_config.extra = {
+            "require_mention": "false",
+            "display_name": "Bot",
+            "require_mention_channels": "1",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "hello there",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_not_called()
+        adapter.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_require_mention_channels_other_chat_responds_freely(
+        self, platform_config, mock_rpc
+    ):
+        """A chat not in require_mention_channels responds freely even though
+        another chat is gated."""
+        platform_config.extra = {
+            "require_mention": "false",
+            "display_name": "Bot",
+            "require_mention_channels": "13",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "hello there",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+
+        await adapter._handle_incoming_message(
+            {"kind": "IncomingMsg", "chat_id": 1, "msg_id": 10}
+        )
+
+        adapter.handle_message.assert_awaited_once()
+
 
 class TestLoopGuardChatScope:
     """The consecutive-reply and bot-exchange guards assume a group with a
@@ -1513,6 +1628,150 @@ class TestDcSendMessageAddress:
 
             assert result["success"] is True
             mock_rpc.lookup_contact_id_by_addr.assert_not_called()
+        finally:
+            adapter._active_adapter = None
+            _chat_token_to_id.pop("tok123", None)
+
+
+class TestDcSendMessageFilePath:
+    """dc_send_message's 'file_path' param: attach a file, routed through the
+    same filter_local_delivery_paths pipeline the reply-flow MEDIA directive
+    uses — /workspace/ (Docker sandbox) goes through the cache-copy guard,
+    anything else flows to Hermes's own denylist-aware host-path validator."""
+
+    @pytest.mark.asyncio
+    async def test_requires_text_or_file_path(self, platform_config, mock_rpc):
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter.rpc = mock_rpc
+        real_adapter.account_id = 1
+        adapter._active_adapter = real_adapter
+        try:
+            handler = _get_registered_tool_handler("dc_send_message")
+
+            result = json.loads(await handler({}))
+
+            assert "error" in result
+        finally:
+            adapter._active_adapter = None
+
+    @pytest.mark.asyncio
+    async def test_rejects_path_the_delivery_validator_refuses(
+        self, platform_config, mock_rpc
+    ):
+        """A path Hermes's own denylist-aware validator refuses (missing,
+        denylisted, etc.) comes back empty from filter_local_delivery_paths —
+        dc_send_message must not silently fall back to the raw path."""
+        from adapter import _chat_token_to_id
+
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter.rpc = mock_rpc
+        real_adapter.account_id = 1
+        adapter._active_adapter = real_adapter
+        _chat_token_to_id["tok123"] = 7
+        try:
+            handler = _get_registered_tool_handler("dc_send_message")
+            with patch.object(
+                real_adapter, "filter_local_delivery_paths", return_value=[]
+            ):
+                result = json.loads(
+                    await handler({"chat_token": "tok123", "file_path": "/etc/passwd"})
+                )
+
+            assert "error" in result
+        finally:
+            adapter._active_adapter = None
+            _chat_token_to_id.pop("tok123", None)
+
+    @pytest.mark.asyncio
+    async def test_sends_non_workspace_path_when_validator_accepts_it(
+        self, platform_config, mock_rpc
+    ):
+        """Non-Docker deployment: an absolute host path outside /workspace/
+        flows through unchanged and is delivered once the (mocked) base
+        validator accepts it — see TestFilterLocalDeliveryPaths for the
+        remap-vs-passthrough split this relies on."""
+        from adapter import _chat_token_to_id
+
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter.rpc = mock_rpc
+        real_adapter.account_id = 1
+        adapter._active_adapter = real_adapter
+        _chat_token_to_id["tok123"] = 7
+        try:
+            mock_rpc.send_msg = AsyncMock(return_value=777)
+            handler = _get_registered_tool_handler("dc_send_message")
+
+            result = json.loads(
+                await handler(
+                    {"chat_token": "tok123", "file_path": "/home/user/report.md"}
+                )
+            )
+
+            assert result["success"] is True
+            sent_msg_data = mock_rpc.send_msg.call_args.args[2]
+            assert sent_msg_data.file == "/home/user/report.md"
+        finally:
+            adapter._active_adapter = None
+            _chat_token_to_id.pop("tok123", None)
+
+    @pytest.mark.asyncio
+    async def test_errors_when_cache_copy_fails(self, platform_config, mock_rpc):
+        from adapter import _chat_token_to_id
+
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter.rpc = mock_rpc
+        real_adapter.account_id = 1
+        adapter._active_adapter = real_adapter
+        _chat_token_to_id["tok123"] = 7
+        try:
+            handler = _get_registered_tool_handler("dc_send_message")
+            with patch.object(
+                real_adapter, "_copy_container_file_to_cache", return_value=None
+            ):
+                result = json.loads(
+                    await handler(
+                        {"chat_token": "tok123", "file_path": "/workspace/report.md"}
+                    )
+                )
+
+            assert "error" in result
+        finally:
+            adapter._active_adapter = None
+            _chat_token_to_id.pop("tok123", None)
+
+    @pytest.mark.asyncio
+    async def test_sends_file_with_text_as_caption(self, platform_config, mock_rpc):
+        from adapter import _chat_token_to_id
+
+        real_adapter = adapter.DeltaChatAdapter(platform_config)
+        real_adapter.rpc = mock_rpc
+        real_adapter.account_id = 1
+        adapter._active_adapter = real_adapter
+        _chat_token_to_id["tok123"] = 7
+        try:
+            mock_rpc.send_msg = AsyncMock(return_value=555)
+            handler = _get_registered_tool_handler("dc_send_message")
+            with patch.object(
+                real_adapter,
+                "_copy_container_file_to_cache",
+                return_value="/cache/documents/report.md",
+            ) as mock_copy:
+                result = json.loads(
+                    await handler(
+                        {
+                            "chat_token": "tok123",
+                            "file_path": "/workspace/report.md",
+                            "text": "here's the report",
+                        }
+                    )
+                )
+
+            assert result["success"] is True
+            assert result["message_id"] == "555"
+            mock_copy.assert_called_once_with("/workspace/report.md")
+            sent_msg_data = mock_rpc.send_msg.call_args.args[2]
+            assert sent_msg_data.file == "/cache/documents/report.md"
+            assert sent_msg_data.text == "here's the report"
         finally:
             adapter._active_adapter = None
             _chat_token_to_id.pop("tok123", None)

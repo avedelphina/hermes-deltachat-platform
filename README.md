@@ -33,7 +33,7 @@ Delta Chat is a decentralized private messenger with end-to-end encryption, and 
 
 **Advanced:**
 - Drop the agent into a **group chat** to assist everyone
-- Require `@DisplayName` mentions in groups so the bot only replies when addressed
+- Require `@DisplayName` mentions in groups so the bot only replies when addressed — or flip the default and gate only specific noisy groups
 - Send images by URL; the adapter downloads and forwards them safely
 - Rich metadata on every incoming/outgoing message for skills and downstream tooling
 - Run **multiple independent agents** with their own Delta Chat accounts
@@ -53,13 +53,13 @@ pip install deltachat-rpc-server
 pip install aiortc
 
 # 3. Clone plugin to Hermes
-git clone https://github.com/Simon-Laux/hermes-deltachat-platform ~/.hermes/plugins/deltachat-platform
+git clone https://github.com/avedelphina/hermes-deltachat-platform ~/.hermes/plugins/deltachat
 
 # 4. Enable plugin
-hermes plugins enable deltachat-platform
+hermes plugins enable deltachat
 
 # 5. Run setup — auto-detects your Hermes profiles, creates a Delta Chat account
-python ~/.hermes/plugins/deltachat-platform/setup.py
+python ~/.hermes/plugins/deltachat/setup.py
 
 # 6. Start gateway
 hermes gateway start
@@ -100,6 +100,8 @@ echo 'DELTACHAT_HOME_CHANNEL=<chat_id>' >> ~/.hermes/.env
 ```
 
 From there you can schedule daily briefings, reminders, or any recurring task — and the AI can also place outgoing voice calls from those tasks.
+
+Proactive sends aren't limited to text: the AI can write a file (e.g. a `.md` report) to its working directory and push it as an attachment via the `dc_send_message` tool's `file_path` parameter, with the message text becoming the caption. Works both in the Docker sandbox (`/workspace/`) and on non-Docker deployments (any absolute host path).
 
 ### Webxdc Mini-Apps
 Ask the AI to build a small interactive app (a game, a form, a calculator, a data viewer) and it delivers a `.xdc` file straight into the chat. The app runs locally inside Delta Chat — no server, no install. Built-in `webxdc-converter` skill handles the packaging.
@@ -175,13 +177,13 @@ echo 'DELTACHAT_RPC_SERVER=/path/to/deltachat-rpc-server' >> ~/.hermes/.env
 ### 3. Enable Plugin
 
 ```bash
-hermes plugins enable deltachat-platform
+hermes plugins enable deltachat
 ```
 
 ### 4. Create Account
 
 ```bash
-python ~/.hermes/plugins/deltachat-platform/setup.py
+python ~/.hermes/plugins/deltachat/setup.py
 ```
 
 The script auto-detects your Hermes profiles, lets you pick one, creates the DC account, and prints an **invite link**. Scan or tap it in Delta Chat — do not just add the email address manually, as the invite link is required for encrypted key exchange.
@@ -203,6 +205,7 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full environment-vari
 | `DELTACHAT_EMAIL` | No | `auto` | Bot email or `auto` for chatmail |
 | `DELTACHAT_DISPLAY_NAME` | No | `Hermes` | Name shown to contacts |
 | `DELTACHAT_REQUIRE_MENTION` | No | `false` | Require `@DisplayName` mention in groups |
+| `DELTACHAT_REQUIRE_MENTION_CHANNELS` | No | — | Group chat IDs that stay mention-gated when `DELTACHAT_REQUIRE_MENTION=false` (inverse of `DELTACHAT_FREE_RESPONSE_CHANNELS`) |
 | `DELTACHAT_HOME_CHANNEL` | No | — | Chat ID for cron/proactive delivery (or use `/sethome` in chat) |
 | `DELTACHAT_ENABLE_RAW_RPC` | No | — | Enable unrestricted `dc_rpc_call` tool |
 
