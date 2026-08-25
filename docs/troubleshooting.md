@@ -92,6 +92,14 @@ ls -la ~/.hermes/deltachat-platform/
 # Then the account will be in the correct directory
 ```
 
+## Plugin Shows "not enabled" / "'deltachat-platform' is not a valid Platform"
+
+**Symptom:** After updating past v1.6.0, `hermes plugins list` shows `deltachat` as `not enabled`, and/or the gateway log is full of `Skipping invalid routing entry '...': 'deltachat-platform' is not a valid Platform`.
+
+**Cause:** v1.6.0 renamed the plugin from `deltachat-platform` to `deltachat`. `config.yaml`'s `plugins.enabled`/`platforms:` keys and Hermes's persisted chat routing state both still reference the old name after a plain `git pull`.
+
+**Fix:** See [docs/UPGRADING.md](UPGRADING.md) — two `config.yaml` key renames plus a one-time migration script for existing chat sessions.
+
 ## Version Warning
 
 **Symptom:** "Delta Chat version X.X.X is newer than expected" warning

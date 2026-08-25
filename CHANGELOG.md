@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.3] - 2026-08-25
+
+### Added
+- `docs/UPGRADING.md`: documents the update path from v1.5.x to v1.6.0+, previously undocumented — the three things a plain `git pull` doesn't handle after the `deltachat-platform` → `deltachat` rename: the (optional) install directory rename, the two `config.yaml` keys (`plugins.enabled`, `platforms.<name>`) that must be renamed by hand or the plugin silently shows as "not enabled", and existing chat routing/session state that's orphaned unless migrated.
+- `scripts/migrate_deltachat_platform_rename.py`: a checked-in, dry-run-by-default migration tool for the routing/session part of the above — rewrites `session_key`/`platform`/`origin.platform` in a profile's `state.db` (`gateway_routing` table) and its `sessions.json` mirror from the old platform id to the new one. Backs up both files before writing (`*.bak-rename-<timestamp>`), never touches `session_id` or message content, and is safe to re-run (idempotent). This generalizes the ad-hoc script used to migrate the two profiles that hit the issue live.
+- `docs/troubleshooting.md`: new "Plugin Shows 'not enabled' / 'not a valid Platform'" section pointing at the upgrade guide.
+
 ## [1.6.2] - 2026-08-25
 
 ### Fixed

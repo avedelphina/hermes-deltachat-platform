@@ -225,6 +225,7 @@ hermes -p personal gateway start
 
 ## Documentation
 
+- [Upgrading](docs/UPGRADING.md) — updating an existing install, incl. the deltachat-platform → deltachat rename migration
 - [Configuration](docs/CONFIGURATION.md) — full environment-variable reference
 - [Security](docs/SECURITY.md) — URL image restrictions, permissions, RPC access
 - [Voice Calls](docs/voice-calls.md) — setup, tuning, TURN servers, Voxtral STT
