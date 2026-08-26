@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.4] - 2026-08-26
+
+### Fixed
+- `_apply_profile` (runs on every `connect()`, including reconnects) now checks the account's current `displayname`/`bot` config via `get_config` before calling `set_config`, and skips the call when the value is already correct. Unconditionally re-setting an unchanged `displayname` on every reconnect causes DC core to gossip an updated Autocrypt header to 1:1 chat partners, which their Delta Chat clients surface as a "verification changed" system message in the chat on every gateway restart — even though nothing about the bot's identity or verification actually changed. `selfavatar` is left unconditional (DC stores its own copy at an internal blob path, so a simple value comparison against the source path would never match).
+
+### Tests
+- Added `test_apply_profile_skips_unchanged_displayname_and_bot`.
+- Updated the three existing `_apply_profile`/`_configure_account` tests to mock `get_config` so the (now-conditional) `set_config` calls still fire as expected.
+
 ## [1.6.3] - 2026-08-25
 
 ### Added

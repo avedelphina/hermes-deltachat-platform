@@ -750,6 +750,7 @@ class TestOnboarding:
         }
         adapter = DeltaChatAdapter(platform_config)
         mock_rpc.set_config = AsyncMock()
+        mock_rpc.get_config = AsyncMock(return_value="")
         adapter.rpc = mock_rpc
 
         await adapter._apply_profile(adapter.rpc, 1)
@@ -771,6 +772,7 @@ class TestOnboarding:
         adapter = DeltaChatAdapter(platform_config)
         adapter.rpc = mock_rpc
         mock_rpc.set_config = AsyncMock()
+        mock_rpc.get_config = AsyncMock(return_value="")
 
         await adapter._apply_profile(adapter.rpc, 1)
 
@@ -780,6 +782,33 @@ class TestOnboarding:
         assert not any(c[1] == "selfavatar" for c in calls)
 
     @pytest.mark.asyncio
+    async def test_apply_profile_skips_unchanged_displayname_and_bot(
+        self, platform_config, mock_rpc
+    ):
+        """_apply_profile must not re-set displayname/bot when already correct.
+
+        This runs on every connect() including reconnects. Unconditionally
+        re-setting an unchanged displayname causes DC core to gossip an
+        updated Autocrypt header to 1:1 chat partners, which their clients
+        surface as a "verification changed" system message on every gateway
+        restart even though nothing actually changed.
+        """
+        platform_config.extra = {"display_name": "TestBot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        mock_rpc.set_config = AsyncMock()
+        mock_rpc.get_config = AsyncMock(
+            side_effect=lambda account_id, key: {
+                "displayname": "TestBot",
+                "bot": "1",
+            }.get(key)
+        )
+
+        await adapter._apply_profile(adapter.rpc, 1)
+
+        mock_rpc.set_config.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_configure_account_reuses_existing_account(
         self, platform_config, mock_rpc
     ):
@@ -787,6 +816,7 @@ class TestOnboarding:
         adapter = DeltaChatAdapter(platform_config)
         mock_rpc.get_all_accounts = AsyncMock(return_value=[{"id": 7}])
         mock_rpc.set_config = AsyncMock()
+        mock_rpc.get_config = AsyncMock(return_value="")
 
         result = await adapter._configure_account(mock_rpc)
 

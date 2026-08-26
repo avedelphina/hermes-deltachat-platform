@@ -1101,17 +1101,28 @@ class DeltaChatAdapter(BasePlatformAdapter):
     async def _apply_profile(self, rpc, account_id: int) -> None:
         """Apply display name, avatar, and bot mode to the account.
 
-        Failures are logged but do not abort the connection.
+        Failures are logged but do not abort the connection. displayname and
+        bot are skipped when already set to the target value — this runs on
+        every connect() including reconnects, and re-setting an unchanged
+        displayname causes DC core to gossip an updated Autocrypt header to
+        1:1 chat partners, which their clients surface as a "verification
+        changed" system message on every gateway restart even though nothing
+        actually changed (#observed: banner on every restart, no re-pairing
+        actually required).
         """
         try:
-            await rpc.set_config(account_id, "displayname", self._display_name)
-            logger.debug("Set display name to %r", self._display_name)
+            current_name = await rpc.get_config(account_id, "displayname")
+            if current_name != self._display_name:
+                await rpc.set_config(account_id, "displayname", self._display_name)
+                logger.debug("Set display name to %r", self._display_name)
         except Exception as e:
             logger.warning("Could not set display name: %s", e)
 
         try:
-            await rpc.set_config(account_id, "bot", "1")
-            logger.debug("Bot mode enabled")
+            current_bot = await rpc.get_config(account_id, "bot")
+            if current_bot != "1":
+                await rpc.set_config(account_id, "bot", "1")
+                logger.debug("Bot mode enabled")
         except Exception as e:
             logger.warning("Could not enable bot mode: %s", e)
 
