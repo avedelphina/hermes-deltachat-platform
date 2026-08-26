@@ -6,9 +6,11 @@ The plugin requires Delta Chat core version **2.51.0** or higher.
 
 When the plugin connects, it automatically checks the Delta Chat core version:
 
-- **Older version**: Connection will be **rejected** (plugin requires 2.51.0+)
 - **Newer version**: An **INFO**-level note is logged (API may have changed, untested). `MIN_DC_VERSION` is a floor, not a pin, so this is the common case — not something that needs WARNING-level attention on every startup.
 - **Compatible**: No log line for exact match
+- **Unknown**: Connection is **rejected** too. An unreadable version string
+  parses as `0.0.0` and compares as too old, and a `get_system_info` that
+  raises means the RPC transport is broken anyway.
 
 ## Minimum Version
 
@@ -30,8 +32,9 @@ deltachat-rpc-server --version
 # On NixOS
 nix run nixpkgs#deltachat-rpc-server -- --version
 
-# Via RPC
-rpc.call("get_system_info")["deltachat_version"]
+# Via RPC — the key is deltachat_core_version, and the value carries a
+# leading "v" (e.g. "v2.51.0")
+rpc.call("get_system_info")["deltachat_core_version"]
 ```
 
 ## Updating the Minimum Version
