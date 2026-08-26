@@ -30,7 +30,7 @@ class TestConfigDirectoryIntegration:
         self, platform_config, monkeypatch, tmp_path
     ):
         """Test that _get_dc_config_dir uses HERMES_HOME correctly."""
-        # Isolated HERMES_HOME so the deltachat-platform/ backward-compat
+        # Isolated HERMES_HOME so the v1.6.x-install backward-compat
         # fallback (_default_dc_data_dir) can't pick up a leftover directory
         # from another test run.
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -38,8 +38,8 @@ class TestConfigDirectoryIntegration:
         adapter = DeltaChatAdapter(platform_config)
         config_dir = adapter._get_dc_config_dir()
 
-        # The adapter should append "deltachat" to HERMES_HOME
-        expected = os.path.join(str(tmp_path), "deltachat")
+        # The adapter should append "deltachat-platform" to HERMES_HOME
+        expected = os.path.join(str(tmp_path), "deltachat-platform")
         assert config_dir == expected
 
     def test_dc_config_dir_creates_directory(
@@ -55,20 +55,20 @@ class TestConfigDirectoryIntegration:
         adapter._dc_config_dir = None
 
         config_dir = adapter._get_dc_config_dir()
-        expected_dir = os.path.join(test_home, "deltachat")
+        expected_dir = os.path.join(test_home, "deltachat-platform")
 
         assert os.path.exists(config_dir)
         assert os.path.isdir(config_dir)
         assert config_dir == expected_dir
 
-    def test_dc_config_dir_falls_back_to_old_name_for_existing_install(
+    def test_dc_config_dir_falls_back_to_v16x_name_for_existing_install(
         self, platform_config, monkeypatch, tmp_path
     ):
-        """An install that predates the deltachat-platform -> deltachat
-        rename keeps working without a manual migration step."""
+        """An install made during the v1.6.0-v1.6.4 window (plugin named
+        "deltachat") keeps working without a manual migration step."""
         test_home = str(tmp_path / "hermes")
         os.makedirs(test_home)
-        old_dir = os.path.join(test_home, "deltachat-platform")
+        old_dir = os.path.join(test_home, "deltachat")
         os.makedirs(os.path.join(old_dir, "1"))  # pre-existing account
         monkeypatch.setenv("HERMES_HOME", test_home)
 

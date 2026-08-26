@@ -1,12 +1,12 @@
-name: deltachat
+name: deltachat-platform
 label: Delta Chat
 kind: platform
-version: 1.6.4
+version: 1.7.0
 description: Delta Chat messaging platform adapter for Hermes Agent. Supports text, webxdc mini apps, voice messages, images, and videos.
 author: Simon Laux
 requires_env:
   - name: DELTACHAT_RPC_SERVER
-    description: "Path to deltachat-rpc-server binary. After setting, run: python ~/.hermes/plugins/deltachat/setup.py"
+    description: "Path to deltachat-rpc-server binary. After setting, run: python ~/.hermes/plugins/deltachat-platform/setup.py"
 optional_env:
   - name: DELTACHAT_EMAIL
     description: "Email for the bot account. Use 'auto' to create a free chatmail account automatically during connect"
@@ -17,7 +17,7 @@ optional_env:
     prompt: "Email password (optional)"
     password: true
   - name: DELTACHAT_DATA_DIR
-    description: "Directory for Delta Chat account data (default: ~/.hermes/deltachat)"
+    description: "Directory for Delta Chat account data (default: ~/.hermes/deltachat-platform)"
     prompt: "Data directory"
     password: false
   - name: DELTACHAT_CHATMAIL_SERVER

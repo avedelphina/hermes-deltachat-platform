@@ -53,13 +53,13 @@ pip install deltachat-rpc-server
 pip install aiortc
 
 # 3. Clone plugin to Hermes
-git clone https://github.com/avedelphina/hermes-deltachat-platform ~/.hermes/plugins/deltachat
+git clone https://github.com/avedelphina/hermes-deltachat-platform ~/.hermes/plugins/deltachat-platform
 
 # 4. Enable plugin
-hermes plugins enable deltachat
+hermes plugins enable deltachat-platform
 
 # 5. Run setup — auto-detects your Hermes profiles, creates a Delta Chat account
-python ~/.hermes/plugins/deltachat/setup.py
+python ~/.hermes/plugins/deltachat-platform/setup.py
 
 # 6. Start gateway
 hermes gateway start
@@ -177,13 +177,13 @@ echo 'DELTACHAT_RPC_SERVER=/path/to/deltachat-rpc-server' >> ~/.hermes/.env
 ### 3. Enable Plugin
 
 ```bash
-hermes plugins enable deltachat
+hermes plugins enable deltachat-platform
 ```
 
 ### 4. Create Account
 
 ```bash
-python ~/.hermes/plugins/deltachat/setup.py
+python ~/.hermes/plugins/deltachat-platform/setup.py
 ```
 
 The script auto-detects your Hermes profiles, lets you pick one, creates the DC account, and prints an **invite link**. Scan or tap it in Delta Chat — do not just add the email address manually, as the invite link is required for encrypted key exchange.
@@ -225,7 +225,7 @@ hermes -p personal gateway start
 
 ## Documentation
 
-- [Upgrading](docs/UPGRADING.md) — updating an existing install, incl. the deltachat-platform → deltachat rename migration
+- [Upgrading](docs/UPGRADING.md) — updating an existing install, incl. migrating a v1.6.0–v1.6.4 install back to the deltachat-platform name
 - [Configuration](docs/CONFIGURATION.md) — full environment-variable reference
 - [Security](docs/SECURITY.md) — URL image restrictions, permissions, RPC access
 - [Voice Calls](docs/voice-calls.md) — setup, tuning, TURN servers, Voxtral STT

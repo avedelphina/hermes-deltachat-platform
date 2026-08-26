@@ -1,40 +1,45 @@
 # Upgrading
 
-## From v1.5.x to v1.6.0+ (plugin rename: deltachat-platform → deltachat)
+## Coming from v1.5.x or earlier, straight to v1.7.0+
 
-v1.6.0 renamed the plugin's registered platform id from `deltachat-platform`
-to `deltachat` (see the [CHANGELOG](../CHANGELOG.md)). A plain `git pull` in
-your existing install picks up the code, but three things need attention
-afterward.
+Nothing to do. The plugin's name (`deltachat-platform`), install directory
+convention, and account-data directory are all unchanged from v1.5.x — see
+below for why.
+
+## If you have a v1.6.0–v1.6.4 install
+
+v1.6.0 renamed the plugin from `deltachat-platform` to `deltachat`; v1.7.0
+reverted that rename (`-platform` turned out to be Hermes's own naming
+convention for messaging platform plugins, not something to drop). If you
+updated to any version in the v1.6.0–v1.6.4 range, a plain `git pull` to
+v1.7.0+ picks up the code, but three things need attention afterward.
 
 ### 1. The plugin install directory (optional)
 
 Not required — the plugin's identity comes from `plugin.yaml`'s `name:`
-field, not the directory name, so `~/.hermes/plugins/deltachat-platform/`
-keeps working fine after a `git pull` inside it. Rename it to
-`~/.hermes/plugins/deltachat/` only if you want the directory name to match
-current docs/examples:
+field, not the directory name. Rename it back only if you want the
+directory name to match current docs/examples:
 
 ```bash
-mv ~/.hermes/plugins/deltachat-platform ~/.hermes/plugins/deltachat
+mv ~/.hermes/plugins/deltachat ~/.hermes/plugins/deltachat-platform
 ```
 
 ### 2. `config.yaml` (required — the plugin will show as "not enabled" otherwise)
 
 Each Hermes profile that runs this plugin has its own `config.yaml`
 (`~/.hermes/profiles/<profile>/config.yaml`, or `~/.hermes/config.yaml` for
-the default profile). Two keys there are keyed by the *old* plugin name and
-must be renamed by hand — Hermes matches plugin enablement by exact key, so
-leaving these as `deltachat-platform` silently disables the plugin (no
+the default profile). Two keys there are keyed by the *v1.6.x* plugin name
+and must be renamed back by hand — Hermes matches plugin enablement by
+exact key, so leaving these as `deltachat` silently disables the plugin (no
 error, it just stops loading):
 
 ```yaml
 plugins:
   enabled:
-    - deltachat-platform   # → deltachat
+    - deltachat   # → deltachat-platform
 
 platforms:
-  deltachat-platform:      # → deltachat
+  deltachat:      # → deltachat-platform
     enabled: true
     extra:
       ... (leave all nested settings exactly as they are)
@@ -44,7 +49,7 @@ Edit both keys, keep every nested `extra:` value under `platforms:` as-is,
 then verify:
 
 ```bash
-hermes -p <profile> plugins list   # deltachat should show "enabled"
+hermes -p <profile> plugins list   # deltachat-platform should show "enabled"
 ```
 
 (`hermes plugins list` with no `-p` checks the default profile.)
@@ -52,10 +57,10 @@ hermes -p <profile> plugins list   # deltachat should show "enabled"
 ### 3. Existing chat routing/session history (required to avoid losing it)
 
 Hermes persists which chat maps to which conversation session keyed by
-`agent:<name>:<platform>:...`. Those keys embed the *old* platform id too —
-left alone, every existing DM/group chat becomes unparseable at startup
-("`'deltachat-platform' is not a valid Platform`") and warnings get skipped,
-which orphans that chat's session (it starts fresh instead of resuming).
+`agent:<name>:<platform>:...`. Those keys embed the *v1.6.x* platform id too
+— left alone, every existing DM/group chat becomes unparseable at startup
+("`'deltachat' is not a valid Platform`") and gets skipped, which orphans
+that chat's session (it starts fresh instead of resuming).
 
 Run the migration script per affected profile, gateway stopped first:
 
@@ -74,7 +79,8 @@ hermes gateway start -p <profile>
 For the default profile, point it at `~/.hermes` instead of a profile
 subdirectory. Repeat for every profile that has ever run this plugin.
 
-The script only rewrites the platform id (`session_key`, `platform`,
+The script's default direction restores `deltachat-platform` (what you want
+here). It only rewrites the platform id (`session_key`, `platform`,
 `origin.platform`); it never touches `session_id` or message content, and
 it's safe to re-run (a second run finds nothing left to migrate).
 
@@ -83,3 +89,14 @@ it's safe to re-run (a second run finds nothing left to migrate).
 That combination (stale `config.yaml` keys + un-migrated routing state) is
 exactly what produces it — double check step 2 actually took effect with
 `hermes plugins list` before re-running the migration script.
+
+## Reference: the v1.5.x → v1.6.x direction
+
+If you ever need to go the other way (`deltachat-platform` → `deltachat` —
+e.g. testing a v1.6.x checkout against a fresh profile), the same three
+steps apply with the names swapped, and the migration script takes
+`--reverse`:
+
+```bash
+python3 scripts/migrate_deltachat_platform_rename.py --apply --reverse ~/.hermes/profiles/<profile>
+```

@@ -16,14 +16,14 @@ echo 'DELTACHAT_RPC_SERVER=/home/$USER/.nix-profile/bin/deltachat-rpc-server' >>
 ### 2. Clone and enable the plugin
 
 ```bash
-git clone https://github.com/avedelphina/hermes-deltachat-platform ~/.hermes/plugins/deltachat
-hermes plugins enable deltachat
+git clone https://github.com/avedelphina/hermes-deltachat-platform ~/.hermes/plugins/deltachat-platform
+hermes plugins enable deltachat-platform
 ```
 
 ### 3. Create a Delta Chat account
 
 ```bash
-python3 ~/.hermes/plugins/deltachat/setup.py
+python3 ~/.hermes/plugins/deltachat-platform/setup.py
 ```
 
 ### 4. Start the gateway
@@ -119,7 +119,7 @@ For development and testing (not for the running Hermes daemon), a nix dev
 shell with all dependencies is available:
 
 ```bash
-cd ~/.hermes/plugins/deltachat
+cd ~/.hermes/plugins/deltachat-platform
 nix develop          # enter dev shell with aiortc, deltachat2, pytest, etc.
 nix develop --command pytest   # run tests
 ```

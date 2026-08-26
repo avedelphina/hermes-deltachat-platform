@@ -12,7 +12,7 @@ HERMES_PLUGINS_DEBUG=1 hermes plugins list
 ```
 
 **Common causes:**
-- Plugin not in correct directory: `~/.hermes/plugins/deltachat/`
+- Plugin not in correct directory: `~/.hermes/plugins/deltachat-platform/`
 - Missing `plugin.yaml` or `__init__.py`
 - Syntax error in plugin files
 - Missing dependencies
@@ -20,11 +20,11 @@ HERMES_PLUGINS_DEBUG=1 hermes plugins list
 **Fix:**
 ```bash
 # Verify directory structure
-ls -la ~/.hermes/plugins/deltachat/
+ls -la ~/.hermes/plugins/deltachat-platform/
 
 # Check for syntax errors
-python3 -m py_compile ~/.hermes/plugins/deltachat/__init__.py
-python3 -m py_compile ~/.hermes/plugins/deltachat/adapter.py
+python3 -m py_compile ~/.hermes/plugins/deltachat-platform/__init__.py
+python3 -m py_compile ~/.hermes/plugins/deltachat-platform/adapter.py
 
 # Install dependencies
 pip install deltachat2
@@ -70,15 +70,15 @@ pip install deltachat-rpc-server
 
 **Check:**
 ```bash
-# Verify deltachat directory exists
-ls -la ~/.hermes/deltachat/
+# Verify deltachat-platform directory exists
+ls -la ~/.hermes/deltachat-platform/
 
 # Or for specific profile
-ls -la ~/.hermes/profiles/<name>/deltachat/
+ls -la ~/.hermes/profiles/<name>/deltachat-platform/
 
-# Renamed from deltachat-platform/ to deltachat/ — if you're on an existing
-# install and see nothing above, check the old name too:
-ls -la ~/.hermes/deltachat-platform/
+# On a v1.6.x install, the account may still be under the old (temporary)
+# name — check that too:
+ls -la ~/.hermes/deltachat/
 ```
 
 **Common causes:**
@@ -92,13 +92,13 @@ ls -la ~/.hermes/deltachat-platform/
 # Then the account will be in the correct directory
 ```
 
-## Plugin Shows "not enabled" / "'deltachat-platform' is not a valid Platform"
+## Plugin Shows "not enabled" / "... is not a valid Platform"
 
-**Symptom:** After updating past v1.6.0, `hermes plugins list` shows `deltachat` as `not enabled`, and/or the gateway log is full of `Skipping invalid routing entry '...': 'deltachat-platform' is not a valid Platform`.
+**Symptom:** `hermes plugins list` shows `deltachat`/`deltachat-platform` as `not enabled`, and/or the gateway log is full of `Skipping invalid routing entry '...': '...' is not a valid Platform`.
 
-**Cause:** v1.6.0 renamed the plugin from `deltachat-platform` to `deltachat`. `config.yaml`'s `plugins.enabled`/`platforms:` keys and Hermes's persisted chat routing state both still reference the old name after a plain `git pull`.
+**Cause:** v1.6.0 renamed the plugin from `deltachat-platform` to `deltachat`; v1.7.0 reverted that rename. Either transition leaves `config.yaml`'s `plugins.enabled`/`platforms:` keys and Hermes's persisted chat routing state pointing at the plugin's *previous* name after a plain `git pull`.
 
-**Fix:** See [docs/UPGRADING.md](UPGRADING.md) — two `config.yaml` key renames plus a one-time migration script for existing chat sessions.
+**Fix:** See [docs/UPGRADING.md](UPGRADING.md) — two `config.yaml` key renames plus a one-time migration script for existing chat sessions, for whichever transition applies to you.
 
 ## Version Warning
 
@@ -209,18 +209,17 @@ top -p $(pgrep -f deltachat-rpc-server)
 **To completely remove the plugin:**
 ```bash
 # Remove plugin files
-rm -rf ~/.hermes/plugins/deltachat/
+rm -rf ~/.hermes/plugins/deltachat-platform/
 
 # Remove profile-specific config
-rm -rf ~/.hermes/profiles/*/deltachat/
-rm -rf ~/.hermes/deltachat/
-
-# On an install predating the deltachat-platform -> deltachat rename, also
-# check the old directory names:
-rm -rf ~/.hermes/plugins/deltachat-platform/
 rm -rf ~/.hermes/profiles/*/deltachat-platform/
 rm -rf ~/.hermes/deltachat-platform/
 
+# On a v1.6.x install, also check the (temporary) renamed directories:
+rm -rf ~/.hermes/plugins/deltachat/
+rm -rf ~/.hermes/profiles/*/deltachat/
+rm -rf ~/.hermes/deltachat/
+
 # Remove from enabled plugins
-hermes plugins disable deltachat
+hermes plugins disable deltachat-platform
 ```

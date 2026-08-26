@@ -14,7 +14,7 @@ All Delta Chat platform settings are read from environment variables (or from `c
 |----------|---------|-------------|
 | `DELTACHAT_EMAIL` | `auto` | Bot email address, or `auto` to create a free chatmail account automatically. |
 | `DELTACHAT_PASSWORD` | — | Email password. Required when `DELTACHAT_EMAIL` is set to a real address. |
-| `DELTACHAT_DATA_DIR` | `~/.hermes/deltachat` | Directory for Delta Chat account data. Created with `0o700` permissions. Falls back to the pre-rename `~/.hermes/deltachat-platform` if that already holds an account and the new path doesn't. |
+| `DELTACHAT_DATA_DIR` | `~/.hermes/deltachat-platform` | Directory for Delta Chat account data. Created with `0o700` permissions. Falls back to `~/.hermes/deltachat` (a v1.6.x install) if that already holds an account and the restored default doesn't. |
 | `DELTACHAT_CHATMAIL_SERVER` | `nine.testrun.org` | Chatmail server used for auto accounts. |
 | `DELTACHAT_CHATMAIL_SERVERS` | — | Comma-separated list of chatmail servers to try in order. Overrides `DELTACHAT_CHATMAIL_SERVER`. |
 | `DELTACHAT_DISPLAY_NAME` | `Hermes` | Display name shown to contacts. |

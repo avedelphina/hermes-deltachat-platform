@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.0] - 2026-08-26
+
+### Changed
+- **Breaking (reverts v1.6.0):** Plugin renamed back from `deltachat` to `deltachat-platform`. `-platform` turned out to be Hermes's own naming convention for messaging platform plugins, not something to drop — v1.6.0's rename was a mistake. `plugin.yaml`'s `name`, the registered `Platform` id, the `hermes plugins enable`/`disable` argument, and `skill_view('plugin:deltachat-platform:webxdc-converter')` are all back to the pre-v1.6.0 values. If your Hermes `config.yaml` has a `platforms: deltachat:` block from a v1.6.x install, rename that key back to `platforms: deltachat-platform:`. `DELTACHAT_*` env vars are unaffected — they were never part of the rename.
+- Default Delta Chat account-data directory restored to `~/.hermes/deltachat-platform/` (`_default_dc_data_dir()` in `adapter.py`, mirrored in `setup.py`). Falls back to a v1.6.x install's `~/.hermes/deltachat/` automatically when it already holds an account and the restored default doesn't, so v1.6.x installs need no manual data migration — just update `config.yaml` (see below) and reconnect.
+- `scripts/migrate_deltachat_platform_rename.py`'s default direction now restores `deltachat-platform` (matching this release); pass `--reverse` for the old v1.5.x→v1.6.x direction.
+- `docs/UPGRADING.md` rewritten around this reversal: anyone coming from v1.5.x or earlier straight to v1.7.0+ has nothing to do; anyone on a v1.6.0–v1.6.4 install follows the same three steps as before (optional directory rename, two `config.yaml` keys, routing/session migration script) with the names swapped.
+
 ## [1.6.4] - 2026-08-26
 
 ### Fixed

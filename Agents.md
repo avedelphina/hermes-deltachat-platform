@@ -6,7 +6,7 @@
 
 This is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) platform plugin that adds **Delta Chat** as a gateway channel. It lets users talk to an AI assistant through Delta Chat — a decentralized, end-to-end encrypted messenger built on email — supporting text, voice messages, images, files, locations, live voice calls, and webxdc mini-apps.
 
-The project is a pure-Python plugin (no compiled extensions of its own). It is loaded by Hermes at runtime from `~/.hermes/plugins/deltachat/` and communicates with the Delta Chat core through the `deltachat-rpc-server` binary via line-delimited JSON-RPC.
+The project is a pure-Python plugin (no compiled extensions of its own). It is loaded by Hermes at runtime from `~/.hermes/plugins/deltachat-platform/` and communicates with the Delta Chat core through the `deltachat-rpc-server` binary via line-delimited JSON-RPC.
 
 ## Technology Stack
 
@@ -43,7 +43,7 @@ The project is a pure-Python plugin (no compiled extensions of its own). It is l
 3. `register_rpc_tools()` registers Delta Chat-specific tools (`dc_rpc_spec`, `dc_chat_rpc_spec`, `dc_safe_rpc_call`, `dc_start_call`, `dc_end_call`, `dc_send_message`, and optionally `dc_rpc_call`).
 4. When the gateway starts, `DeltaChatAdapter.connect()`:
    - Resolves `DELTACHAT_RPC_SERVER` / config `extra.rpc_server`.
-   - Starts `deltachat-rpc-server` with `DC_ACCOUNTS_PATH` set to `<HERMES_HOME>/deltachat/` (or the pre-rename `<HERMES_HOME>/deltachat-platform/`, if that already holds an account and the new path doesn't — see `_default_dc_data_dir` in `adapter.py`).
+   - Starts `deltachat-rpc-server` with `DC_ACCOUNTS_PATH` set to `<HERMES_HOME>/deltachat-platform/` (or `<HERMES_HOME>/deltachat/` from a v1.6.x install, if that's where an existing account already lives — see `_default_dc_data_dir` in `adapter.py`).
    - Verifies the core version is at least `MIN_DC_VERSION` (`2.51.0`).
    - Uses the first existing account or errors out (account creation is done via `setup.py`).
    - Enables bot mode, starts IO, and launches the async event listener.
@@ -179,7 +179,7 @@ python3 -m py_compile vendor/deltachat2/*.py
 - **Mention matching requires an explicit `@` and tolerates case-ending variation** (`_build_mention_pattern` in `adapter.py`): a bare display name in prose (e.g. "napiš Alici, aby to udělala" — asking someone else to message Alice) is *about* the bot, not addressed to it, so only `@Name`-style tokens count as a mention. Case-ending tolerance is built for Czech declension (e.g. `display_name: Alice` also matches "@Alici"/"@Alicí"; "Anikke" also matches the incorrectly-declined "@Anikko"), implemented generically as stem + up to 2 trailing word characters, not a Czech-specific grammar table. The stem must be ≥3 chars — shorter names (e.g. "Tom") fall back to an exact match instead, to avoid matching unrelated words that happen to share a short prefix. `DELTACHAT_MENTION_ALIASES` (comma-separated) adds extra exact-ish forms (each still gets the same stem-tolerant treatment, and each still requires the `@` prefix) for names/nicknames the automatic stemming doesn't cover.
 - **File paths from containers**: When an agent writes files to `/workspace/` inside the Docker sandbox, the adapter resolves the path, verifies it stays inside the sandbox (rejects `..` and symlink escapes), rejects symlinks, and copies the file to the Hermes documents cache before validation/sending.
 - **Non-Docker file delivery**: on deployments without the Docker LLM sandbox, an agent's output file never has a `/workspace/` path to begin with — it lives at the agent's real cwd. `extract_media`/`extract_local_files` pick up any bare or `MEDIA:`-tagged `.xdc` path (absolute or `~/`-relative, not just `/workspace/`), and `filter_media_delivery_paths`/`filter_local_delivery_paths` only remap paths that start with `/workspace/`; anything else flows unchanged to Hermes's own denylist-aware host-path validator (`gateway.platforms.base.BasePlatformAdapter`'s filter methods), which is the actual safety boundary for those paths — the adapter does not duplicate that logic. `dc_send_message`'s `file_path` (see below) reuses this same `filter_local_delivery_paths` call rather than only accepting `/workspace/`, since it has no other downstream validator of its own.
-- **Secrets**: Do not commit real accounts, keys, or `.env` files. `DC_ACCOUNTS_PATH` lives under the Hermes profile directory (default `~/.hermes/deltachat/`). The account password is cleared from memory as soon as configuration completes or fails.
+- **Secrets**: Do not commit real accounts, keys, or `.env` files. `DC_ACCOUNTS_PATH` lives under the Hermes profile directory (default `~/.hermes/deltachat-platform/`). The account password is cleared from memory as soon as configuration completes or fails.
 - **Inbound access control is fail-closed**: If the adapter cannot fetch chat info to determine DM/group policy, the message is rejected. RPC/version-check failures also reject instead of falling through.
 - **Voice-call audio buffering is capped**: Continuous speech is forced to flush after a 60-second ceiling so the incoming audio buffer cannot grow without bound.
 
@@ -226,14 +226,14 @@ Group messages carry additional context beyond the per-message sender: `metadata
 The plugin is not a standalone executable; it is installed into the Hermes plugins directory:
 
 ```bash
-git clone https://github.com/avedelphina/hermes-deltachat-platform ~/.hermes/plugins/deltachat
-hermes plugins enable deltachat
+git clone https://github.com/avedelphina/hermes-deltachat-platform ~/.hermes/plugins/deltachat-platform
+hermes plugins enable deltachat-platform
 ```
 
 Then create the Delta Chat account:
 
 ```bash
-python3 ~/.hermes/plugins/deltachat/setup.py
+python3 ~/.hermes/plugins/deltachat-platform/setup.py
 ```
 
 And start the gateway:
@@ -250,7 +250,7 @@ hermes gateway start
   nix build --impure --expr 'with import <nixpkgs> {}; python312.withPackages(ps: [ps.aiortc])' -o ~/.hermes/aiortc-env
   ```
   Then add its site-packages to `PYTHONPATH` in `~/.hermes/.env`.
-- The `flake.nix` also provides a `packages.default` derivation that installs the plugin files to `$out/share/hermes/plugins/deltachat/`.
+- The `flake.nix` also provides a `packages.default` derivation that installs the plugin files to `$out/share/hermes/plugins/deltachat-platform/`.
 
 ## Environment / Configuration Reference
 

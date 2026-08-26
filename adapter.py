@@ -155,16 +155,19 @@ def _safe_data_dir(path: str, create: bool = False) -> Path:
 def _default_dc_data_dir() -> str:
     """Default Delta Chat account-data directory (when DELTACHAT_DATA_DIR unset).
 
-    Renamed from <HERMES_HOME>/deltachat-platform/ to <HERMES_HOME>/deltachat/
-    alongside the plugin's own rename. Falls back to the old directory name
-    when it already holds account data and the new one doesn't, so existing
-    installs keep working without a manual migration step.
+    v1.6.0 briefly renamed the plugin (and this default) from
+    deltachat-platform to deltachat; v1.7.0 reverted the rename, since
+    "-platform" turned out to be Hermes's own naming convention for
+    messaging platform plugins. Falls back to a v1.6.x install's
+    <HERMES_HOME>/deltachat/ directory when it already holds account data
+    and the (restored) default doesn't, so installs made during that
+    window keep working without a manual migration step.
     """
     from gateway.config import get_hermes_home
 
     home = get_hermes_home()
-    new_path = os.path.join(home, "deltachat")
-    old_path = os.path.join(home, "deltachat-platform")
+    new_path = os.path.join(home, "deltachat-platform")
+    old_path = os.path.join(home, "deltachat")
 
     def _has_data(p: str) -> bool:
         return os.path.isdir(p) and any(os.scandir(p))
@@ -571,7 +574,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
         Args:
             config: Hermes PlatformConfig for this profile
         """
-        super().__init__(config, Platform("deltachat"))
+        super().__init__(config, Platform("deltachat-platform"))
         self.rpc = None
         self._transport = None
         self.account_id: Optional[int] = None
@@ -1063,10 +1066,10 @@ class DeltaChatAdapter(BasePlatformAdapter):
         """Get Delta Chat config directory path.
 
         Uses DELTACHAT_DATA_DIR if set, otherwise falls back to
-        <HERMES_HOME>/deltachat/ (or the pre-rename <HERMES_HOME>/deltachat-platform/
-        if that's where an existing account already lives — see
-        _default_dc_data_dir). The directory is created with restrictive
-        permissions when first accessed.
+        <HERMES_HOME>/deltachat-platform/ (or <HERMES_HOME>/deltachat/ from
+        a v1.6.x install, if that's where an existing account already lives
+        — see _default_dc_data_dir). The directory is created with
+        restrictive permissions when first accessed.
         """
         if self._dc_config_dir is None:
             if self._data_dir:
@@ -2722,7 +2725,7 @@ def _apply_yaml_config(
     """Bridge YAML config values to env-style extra keys for the platform adapter.
 
     The gateway config loader calls this hook with the parsed YAML tree and the
-    deltachat config block (which may be nested under ``platforms``).
+    deltachat-platform config block (which may be nested under ``platforms``).
     Values returned here are merged into ``platform_config.extra`` and are then
     read by the adapter constructor.
     """
@@ -2811,7 +2814,7 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
 def register_platform(ctx):
     """Register Delta Chat platform adapter with Hermes."""
     ctx.register_platform(
-        name="deltachat",
+        name="deltachat-platform",
         label="Delta Chat",
         adapter_factory=lambda cfg: DeltaChatAdapter(cfg),
         check_fn=check_requirements,
@@ -2840,7 +2843,7 @@ def register_platform(ctx):
             "Location messages can be sent to share points of interest on a map. "
             "You CAN build and send webxdc mini apps and other files (PDF, HTML, etc.). "
             "MANDATORY: before attempting to build any webxdc app, you MUST first call "
-            "skill_view('plugin:deltachat:webxdc-converter') "
+            "skill_view('plugin:deltachat-platform:webxdc-converter') "
             "to load the build instructions. "
             "For file delivery: write output files to your current working directory "
             "(run `pwd` to find it), NOT /tmp/. "
@@ -2858,7 +2861,7 @@ def register_platform(ctx):
         max_message_length=DC_MESSAGE_MAX_LEN,
     )
 
-    # Register bundled skills so skill_view('deltachat:<name>') resolves them.
+    # Register bundled skills so skill_view('deltachat-platform:<name>') resolves them.
     from pathlib import Path as _Path
 
     skills_dir = _Path(_plugin_dir) / "skills"

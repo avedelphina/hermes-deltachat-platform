@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Migrate persisted Hermes routing/session state after the deltachat-platform
--> deltachat plugin rename (v1.6.0).
+"""Migrate persisted Hermes routing/session state between the plugin's
+deltachat-platform and deltachat platform ids.
 
-Renaming the plugin's registered Platform id from ``deltachat-platform`` to
-``deltachat`` orphans two things Hermes persists under the old id:
+v1.6.0 renamed the plugin's registered Platform id from
+``deltachat-platform`` to ``deltachat``; v1.7.0 reverted that rename
+(``-platform`` turned out to be Hermes's own naming convention for
+messaging platform plugins, not something to drop). Either transition
+orphans two things Hermes persists under the *previous* id:
 
   1. ``<profile>/state.db``'s ``gateway_routing`` table (the primary routing
      store) -- ``session_key`` plus the ``platform``/``origin.platform``
@@ -12,8 +15,8 @@ Renaming the plugin's registered Platform id from ``deltachat-platform`` to
      used by ``hermes plugins list`` / `/sessions` style tooling).
 
 Without this migration, every existing DM/group chat's routing entry becomes
-unparseable ("'deltachat-platform' is not a valid Platform") and the
-conversation history for that chat effectively starts over.
+unparseable ("'<old-id>' is not a valid Platform") and the conversation
+history for that chat effectively starts over.
 
 This script only rewrites the platform id in those two stores. It never
 touches ``session_id`` (the pointer to the actual conversation) or any
@@ -22,6 +25,10 @@ for the (manual, two-line) config.yaml edit this migration does NOT do for
 you.
 
 Usage:
+    # If you're on a plugin version from the v1.6.0-v1.6.4 window and are
+    # updating to v1.7.0+ (the default direction below): restores
+    # deltachat-platform, undoing the temporary rename.
+    #
     # Dry run (default) -- reports what would change, writes nothing.
     python3 scripts/migrate_deltachat_platform_rename.py ~/.hermes/profiles/myprofile
 
@@ -31,6 +38,11 @@ Usage:
 
     # Default (no-profile) Hermes home also has its own state, e.g.:
     python3 scripts/migrate_deltachat_platform_rename.py --apply ~/.hermes
+
+    # Going the other way (deltachat-platform -> deltachat, e.g. testing a
+    # v1.6.x checkout): swap the direction.
+    python3 scripts/migrate_deltachat_platform_rename.py --apply --reverse \
+        ~/.hermes/profiles/myprofile
 
 Stop the Hermes gateway for the affected profile(s) before running with
 --apply -- this writes directly to state.db, which the gateway also holds
@@ -45,10 +57,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-OLD = "deltachat-platform"
-NEW = "deltachat"
-OLD_SEGMENT = f":{OLD}:"
-NEW_SEGMENT = f":{NEW}:"
+# Default direction restores deltachat-platform (the v1.7.0+ name).
+# --reverse swaps these (see main()).
+DEFAULT_OLD = "deltachat"
+DEFAULT_NEW = "deltachat-platform"
 
 
 def _backup(path: Path, timestamp: str) -> Path:
@@ -57,14 +69,18 @@ def _backup(path: Path, timestamp: str) -> Path:
     return backup_path
 
 
-def migrate_state_db(db_path: Path, *, apply: bool, timestamp: str) -> int:
+def migrate_state_db(
+    db_path: Path, *, old: str, new: str, apply: bool, timestamp: str
+) -> int:
+    old_segment = f":{old}:"
+    new_segment = f":{new}:"
     con = sqlite3.connect(str(db_path))
     try:
         cur = con.cursor()
         cur.execute(
             "SELECT rowid, session_key, entry_json FROM gateway_routing "
             "WHERE session_key LIKE ?",
-            (f"%{OLD_SEGMENT}%",),
+            (f"%{old_segment}%",),
         )
         rows = cur.fetchall()
         if not rows:
@@ -74,15 +90,15 @@ def migrate_state_db(db_path: Path, *, apply: bool, timestamp: str) -> int:
 
         _backup(db_path, timestamp)
         for rowid, session_key, entry_json in rows:
-            new_key = session_key.replace(OLD_SEGMENT, NEW_SEGMENT)
+            new_key = session_key.replace(old_segment, new_segment)
             entry = json.loads(entry_json)
             if entry.get("session_key") == session_key:
                 entry["session_key"] = new_key
-            if entry.get("platform") == OLD:
-                entry["platform"] = NEW
+            if entry.get("platform") == old:
+                entry["platform"] = new
             origin = entry.get("origin") or {}
-            if origin.get("platform") == OLD:
-                origin["platform"] = NEW
+            if origin.get("platform") == old:
+                origin["platform"] = new
             cur.execute(
                 "UPDATE gateway_routing SET session_key = ?, entry_json = ? "
                 "WHERE rowid = ?",
@@ -94,7 +110,11 @@ def migrate_state_db(db_path: Path, *, apply: bool, timestamp: str) -> int:
         con.close()
 
 
-def migrate_sessions_json(json_path: Path, *, apply: bool, timestamp: str) -> int:
+def migrate_sessions_json(
+    json_path: Path, *, old: str, new: str, apply: bool, timestamp: str
+) -> int:
+    old_segment = f":{old}:"
+    new_segment = f":{new}:"
     data = json.loads(json_path.read_text())
     changed = 0
     new_data = {}
@@ -102,14 +122,14 @@ def migrate_sessions_json(json_path: Path, *, apply: bool, timestamp: str) -> in
         if key == "_README" or not isinstance(value, dict):
             new_data[key] = value
             continue
-        new_key = key.replace(OLD_SEGMENT, NEW_SEGMENT) if OLD_SEGMENT in key else key
+        new_key = key.replace(old_segment, new_segment) if old_segment in key else key
         if value.get("session_key") == key:
             value["session_key"] = new_key
-        if value.get("platform") == OLD:
-            value["platform"] = NEW
+        if value.get("platform") == old:
+            value["platform"] = new
         origin = value.get("origin")
-        if isinstance(origin, dict) and origin.get("platform") == OLD:
-            origin["platform"] = NEW
+        if isinstance(origin, dict) and origin.get("platform") == old:
+            origin["platform"] = new
         if new_key != key:
             changed += 1
         new_data[new_key] = value
@@ -120,17 +140,21 @@ def migrate_sessions_json(json_path: Path, *, apply: bool, timestamp: str) -> in
     return changed
 
 
-def migrate_profile(profile_dir: Path, *, apply: bool, timestamp: str) -> None:
+def migrate_profile(
+    profile_dir: Path, *, old: str, new: str, apply: bool, timestamp: str
+) -> None:
     db_path = profile_dir / "state.db"
     sessions_path = profile_dir / "sessions" / "sessions.json"
 
     db_count = (
-        migrate_state_db(db_path, apply=apply, timestamp=timestamp)
+        migrate_state_db(db_path, old=old, new=new, apply=apply, timestamp=timestamp)
         if db_path.exists()
         else 0
     )
     json_count = (
-        migrate_sessions_json(sessions_path, apply=apply, timestamp=timestamp)
+        migrate_sessions_json(
+            sessions_path, old=old, new=new, apply=apply, timestamp=timestamp
+        )
         if sessions_path.exists()
         else 0
     )
@@ -158,7 +182,17 @@ def main() -> None:
         action="store_true",
         help="Actually write changes (default: dry run only)",
     )
+    parser.add_argument(
+        "--reverse",
+        action="store_true",
+        help=f"Migrate {DEFAULT_NEW} -> {DEFAULT_OLD} instead of the default "
+        f"{DEFAULT_OLD} -> {DEFAULT_NEW}",
+    )
     args = parser.parse_args()
+
+    old, new = (
+        (DEFAULT_NEW, DEFAULT_OLD) if args.reverse else (DEFAULT_OLD, DEFAULT_NEW)
+    )
 
     if not args.apply:
         print("Dry run (no changes written) -- pass --apply to migrate for real.\n")
@@ -169,7 +203,9 @@ def main() -> None:
         if not profile_dir.is_dir():
             print(f"{profile_dir}: not a directory, skipping", file=sys.stderr)
             continue
-        migrate_profile(profile_dir, apply=args.apply, timestamp=timestamp)
+        migrate_profile(
+            profile_dir, old=old, new=new, apply=args.apply, timestamp=timestamp
+        )
 
 
 if __name__ == "__main__":

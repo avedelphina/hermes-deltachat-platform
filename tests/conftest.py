@@ -63,7 +63,7 @@ class MockMessageEvent:
 class MockPlatform(Enum):
     """Mock of gateway.config.Platform."""
 
-    DELTACHAT = "deltachat"
+    DELTACHAT = "deltachat-platform"
     TELEGRAM = "telegram"
     DISCORD = "discord"
     SLACK = "slack"
@@ -206,7 +206,7 @@ import pytest  # noqa: E402
 def platform_config():
     """Create a mock PlatformConfig."""
     return MockPlatformConfig(
-        name="deltachat",
+        name="deltachat-platform",
         platform=MockPlatform.DELTACHAT,
         extra={"rpc_server": "deltachat-rpc-server"},
         enabled=True,
