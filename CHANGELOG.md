@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.1] - 2026-08-27
+
+### Fixed
+- `filter_media_delivery_paths`/`filter_local_delivery_paths` now forward `session_key` to `BasePlatformAdapter` only when the installed core's implementation actually declares that parameter (checked via `inspect.signature`, `_base_supports_session_key()`). v1.6.2 forwarded it unconditionally, which fixed newer cores but crashes on Hermes 0.15.1's single-positional-argument base with the exact same `TypeError` this was meant to fix — reported by upstream on [PR #6](https://github.com/Simon-Laux/hermes-deltachat-platform/pull/6).
+
+### Added
+- `enforces_own_access_policy` property (`True`), the documented `BasePlatformAdapter` contract Hermes core reads via `getattr(adapter, "enforces_own_access_policy", False)`. Lets core honor `dm_allowed_users`/`group_allowed_users` configured in `config.yaml`'s `extra:` block (as opposed to the `DELTACHAT_ALLOWED_USERS` env var) when the adapter's effective policy is exactly `"allowlist"` and no env allowlist is set at all — core previously had no way to know this adapter already gated such senders in that specific configuration and denied them regardless. Does not affect `dm_policy`/`group_policy: open` or `pairing` (core only trusts an actual `"allowlist"` policy) or any deployment using the `DELTACHAT_ALLOWED_USERS`/`DELTACHAT_ALLOW_ALL_USERS` env vars, which were already handled by the existing `allowed_users_env`/`allow_all_env` declaration.
+
+### Tests
+- Added `TestBaseSupportsSessionKey` and `TestEnforcesOwnAccessPolicy` (unit).
+- Added `test_omits_session_key_when_base_does_not_support_it` covering the old-core (single positional argument) case end to end.
+
 ## [1.7.0] - 2026-08-26
 
 ### Changed

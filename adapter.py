@@ -6,6 +6,7 @@ Integrates Delta Chat as a messaging platform using deltachat2 (direct JSON-RPC)
 import email.utils
 import functools
 import html
+import inspect
 import json
 import os
 import re
@@ -175,6 +176,22 @@ def _default_dc_data_dir() -> str:
     if _has_data(old_path) and not _has_data(new_path):
         return old_path
     return new_path
+
+
+def _base_supports_session_key(fn) -> bool:
+    """Whether a BasePlatformAdapter static method accepts a session_key kwarg.
+
+    Newer Hermes cores added ``session_key: str = ""`` to
+    ``filter_media_delivery_paths``/``filter_local_delivery_paths``; older
+    ones (e.g. 0.15.1) take a single positional argument. Forwarding the
+    kwarg unconditionally would crash on those older cores the exact same
+    way omitting it crashes on newer ones — inspect the installed base's
+    actual signature instead of assuming either.
+    """
+    try:
+        return "session_key" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _validate_rpc_server_path(path: str, strict: bool = True) -> str:
@@ -567,6 +584,26 @@ class DeltaChatAdapter(BasePlatformAdapter):
     Uses deltachat2 for direct JSON-RPC access (not abstracted away).
     Each Hermes profile runs its own instance with its own DC_ACCOUNTS_PATH.
     """
+
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        """Declares this adapter's dm_policy/group_policy as gateway.authz_mixin's
+        BasePlatformAdapter.enforces_own_access_policy contract expects.
+
+        Core's ``_is_user_authorized`` only consults this (via
+        ``getattr(adapter, "enforces_own_access_policy", False)``) as a
+        fallback when NO env-based allowlist (DELTACHAT_ALLOWED_USERS,
+        GATEWAY_ALLOWED_USERS, ...) is configured, and even then only trusts
+        it when the adapter's effective policy for that chat type
+        (``self._dm_policy`` / ``self._group_policy``, which core reads
+        directly) is exactly "allowlist" — never "open" or "pairing", which
+        would be the fail-open SECURITY.md forbids. Without this flag, an
+        operator who configures `dm_allowed_users`/`group_allowed_users` in
+        `config.yaml`'s `extra:` block (rather than the
+        DELTACHAT_ALLOWED_USERS env var) gets denied by core regardless —
+        core has no way to know this adapter already gated it.
+        """
+        return True
 
     def __init__(self, config: PlatformConfig):
         """Initialize the adapter.
@@ -2037,9 +2074,10 @@ body {{
                     continue
                 logger.warning("Could not resolve container path for delivery: %s", p)
             remapped.append((media_path, is_voice))
-        return BasePlatformAdapter.filter_media_delivery_paths(
-            remapped, session_key=session_key
-        )
+        base_fn = BasePlatformAdapter.filter_media_delivery_paths
+        if _base_supports_session_key(base_fn):
+            return base_fn(remapped, session_key=session_key)
+        return base_fn(remapped)
 
     def filter_local_delivery_paths(self, file_paths, session_key: str = ""):
         """Remap /workspace/ container paths to host cache before validation."""
@@ -2056,9 +2094,10 @@ body {{
                 logger.warning("Could not resolve container path for delivery: %s", p)
             else:
                 remapped.append(file_path)
-        return BasePlatformAdapter.filter_local_delivery_paths(
-            remapped, session_key=session_key
-        )
+        base_fn = BasePlatformAdapter.filter_local_delivery_paths
+        if _base_supports_session_key(base_fn):
+            return base_fn(remapped, session_key=session_key)
+        return base_fn(remapped)
 
     async def _event_listener(self) -> None:
         """Listen for Delta Chat events and forward to Hermes."""

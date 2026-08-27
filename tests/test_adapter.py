@@ -15,6 +15,7 @@ from adapter import (
     DeltaChatAdapter,
     _apply_yaml_config,
     _async_retry,
+    _base_supports_session_key,
     _cfg,
     _is_valid_email,
     _parse_chatmail_servers,
@@ -585,3 +586,39 @@ class TestUnmentionedGroupMessageIsSilent:
 
         assert result is True
         adapter.send.assert_not_called()
+
+
+class TestBaseSupportsSessionKey:
+    """_base_supports_session_key: detects whether the installed Hermes
+    core's filter_media/local_delivery_paths accepts session_key, so the
+    adapter forwards it only when the base actually declares it — avoids
+    crashing on an older core (single positional arg) the same way omitting
+    the kwarg crashes on a newer one (see upstream PR #6 follow-up)."""
+
+    def test_true_when_base_declares_session_key(self):
+        def base_fn(media_files, session_key: str = ""):
+            return media_files
+
+        assert _base_supports_session_key(base_fn) is True
+
+    def test_false_when_base_takes_single_positional_arg(self):
+        def base_fn(media_files):
+            return media_files
+
+        assert _base_supports_session_key(base_fn) is False
+
+    def test_false_for_uninspectable_callable(self):
+        assert _base_supports_session_key(object()) is False
+
+
+class TestEnforcesOwnAccessPolicy:
+    """enforces_own_access_policy: gateway.authz_mixin's documented
+    BasePlatformAdapter contract, read via getattr(adapter,
+    "enforces_own_access_policy", False). Only matters as a fallback when NO
+    env allowlist is configured, and even then core trusts it only when the
+    adapter's effective dm_policy/group_policy is exactly "allowlist" — never
+    "open"/"pairing" — so this does not weaken the "open" default."""
+
+    def test_returns_true(self, platform_config):
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter.enforces_own_access_policy is True
