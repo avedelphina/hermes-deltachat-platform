@@ -75,10 +75,11 @@ DELTACHAT_MAX_MESSAGE_LINES=15
 Delta Chat has no markdown rendering. Every outbound text reply runs through a
 deterministic plain-text pass immediately before sending:
 
-1. **Markdown is removed** — headings lose `#`, `*`/`_` emphasis is unwrapped,
-   `[label](url)` becomes `label (url)`, fenced-code delimiters are dropped
-   (code body and its indentation kept), and `*`/`+`/`•` bullets become `- `.
-   URLs and ordinary punctuation are left alone.
+1. **Markdown is removed** — pipe tables collapse to `Header: value` lines,
+   headings lose `#`, `*`/`_` emphasis is unwrapped, `[label](url)` becomes
+   `label (url)`, fenced-code delimiters are dropped (code body and its
+   indentation kept), and `*`/`+`/`•` bullets become `- `. URLs and ordinary
+   punctuation are left alone.
 2. **Long replies are split** — a reply over `DELTACHAT_MAX_MESSAGE_LINES`
    (default 20) or `DELTACHAT_MAX_MESSAGE_LENGTH` characters is broken at
    paragraph/line boundaries into several ordered messages, each within both

@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.6] - 2026-08-31
+
+### Changed
+- `_strip_markdown` now flattens GFM pipe tables in Delta Chat outbound text.
+  A line containing `|` immediately followed by a delimiter row
+  (`| --- | --- |`, alignment colons allowed, outer pipes optional) is
+  treated as a table: each body row becomes `header1: cell1, header2: cell2`
+  (or just the cells joined by `, ` when the row width doesn't match the
+  header). Lines with stray `|` but no delimiter row underneath are left
+  untouched. Runs first in the formatter, before fenced-code stripping — a
+  pipe table written inside a ``` fence would also be flattened (noted in
+  code; add fence tracking if it ever matters).
+
+### Tests
+- `tests/test_adapter.py`: added table cases to `TestStripMarkdown` — basic
+  flatten, no outer pipes, alignment colons, table surrounded by prose, and
+  stray non-table pipes left alone.
+
 ## [1.7.5] - 2026-08-31
 
 ### Changed
