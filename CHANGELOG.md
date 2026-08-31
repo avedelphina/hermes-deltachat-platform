@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.3] - 2026-08-31
+
+### Fixed
+- A dead `deltachat-rpc-server` no longer hangs its callers forever. `vendor/deltachat2/transport.py`'s `_Result.wait()` was a bare untimed `threading.Event.wait()`: when the RPC subprocess exited, the reader loop resolved every *in-flight* call with a disconnect error, but the writer loop then died silently on `BrokenPipeError`, so every *subsequent* `call()` queued a request that was never written and blocked its thread permanently — with `is_connected` still reporting `True`. `call()` now fast-fails when `process.poll()` shows the subprocess is gone, polls in 1s slices while it waits (a legitimate slow call keeps waiting as long as the server is alive), and raises `JsonRpcError` the moment the subprocess exits mid-call. The pending-caller wake-up (`_fail_all_pending()`) now fires from the writer loop's `finally` as well as the reader loop's. Reported by upstream as [issue #16](https://github.com/Simon-Laux/hermes-deltachat-platform/issues/16).
+- `_cleanup()` now marks the adapter disconnected. It is the failure path out of `connect()` as well as part of `disconnect()`, so a failed connect previously left the prior runtime status in place.
+- `disconnect()` wraps `CallManager.teardown()` in a guard. A raising teardown used to skip `_cleanup()` entirely, leaking the RPC subprocess and the accounts-dir lock — which then blocks any replacement adapter from connecting.
+- The event supervisor task gets a done-callback that retrieves its exception, so an escaped crash is logged when it happens rather than surfacing as "Task exception was never retrieved" whenever the GC gets to it.
+
+### Docs
+- `README.md`'s "Development" section now documents that `vendor/deltachat2/` has diverged from upstream `adbenitez/deltachat2` (the dead-server handling above, `to_attrdict()` on results, `close()` guards, and the `rpc_server=` vs upstream `rpc_executable=` constructor kwarg), and tells re-vendorers to diff rather than copy.
+
+### Tests
+- Added `tests/test_transport_death.py`: already-dead fast-fail, server dies mid-`wait()` (raises within 5s instead of hanging, abandoned request cleared), and writer-loop failure waking pending callers.
+
 ## [1.7.2] - 2026-08-31
 
 ### Fixed

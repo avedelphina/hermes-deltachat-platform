@@ -1333,6 +1333,10 @@ class DeltaChatAdapter(BasePlatformAdapter):
             # Start event listener with crash recovery.
             self._running = True
             self._event_loop_task = asyncio.create_task(self._event_supervisor())
+            # Retrieve the task's exception if it ever escapes the supervisor, so
+            # a crash is logged when it happens rather than surfacing as
+            # "Task exception was never retrieved" whenever the GC gets to it.
+            self._event_loop_task.add_done_callback(self._on_event_task_done)
 
             self._mark_connected()
             global _active_adapter
@@ -1357,6 +1361,14 @@ class DeltaChatAdapter(BasePlatformAdapter):
             self._cleanup()
             return False
 
+    def _on_event_task_done(self, task: asyncio.Task) -> None:
+        """Done-callback for the event supervisor task; logs an escaped crash."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("DeltaChat: event supervisor task crashed: %s", exc)
+
     def _cleanup(self) -> None:
         """Clean up resources."""
         global _active_adapter
@@ -1377,6 +1389,10 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._self_addr = None
         self._invite_link = None
         self._password = None
+        # _cleanup() is the failure path out of connect() as well as part of
+        # disconnect(); without this a failed connect leaves the previous
+        # runtime status in place.
+        self._mark_disconnected()
 
     def _signal_handler(self):
         """Handle SIGTERM/SIGINT by scheduling disconnect on the event loop."""
@@ -1398,7 +1414,13 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 pass
 
         if self._call_manager:
-            await self._call_manager.teardown()
+            # A raising teardown must not skip _cleanup() below — that would
+            # leak the RPC subprocess and the accounts-dir lock, which then
+            # blocks any replacement adapter from connecting.
+            try:
+                await self._call_manager.teardown()
+            except Exception as e:
+                logger.warning("DeltaChat: call manager teardown failed: %s", e)
             self._call_manager = None
         self._cleanup()
         self._mark_disconnected()
