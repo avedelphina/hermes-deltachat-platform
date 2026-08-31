@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.4] - 2026-08-31
+
+### Changed
+- Delta Chat outbound text messages are now kept short and plain by default.
+  The old behavior converted any reply over 40 lines into a styled HTML part
+  (`_format_html_message`, now removed); Delta Chat's HTML view is a poor fit
+  for conversational replies and the markdown markers still leaked into the
+  plain-text fallback. Every outbound text reply now runs through a
+  deterministic pipeline — markdown-strip → line/character split → send:
+  - `_strip_markdown` additionally normalizes `*`/`+`/`•` bullet markers to
+    `- `, handles closed ATX headings (`## x ##`), and drops fenced-code info
+    strings while keeping the code body and its indentation. Headings,
+    emphasis, links (`label (url)`), URLs, and ordinary punctuation are
+    handled as before.
+  - `_split_message` takes a new `max_lines` argument and splits a reply that
+    exceeds either the line limit or the character limit at paragraph/line
+    boundaries into ordered messages, each within both limits. Only a single
+    line longer than the character limit falls back to a hard word-boundary
+    split, which logs at `WARNING`. Nothing is truncated; only the first
+    message carries the quote-reply.
+  - New `DELTACHAT_MAX_MESSAGE_LINES` (config `max_message_lines`), default
+    `20`, range 1–200. `DELTACHAT_MAX_MESSAGE_LENGTH` is unchanged.
+  Attachments, voice messages, generated documents, replies, file delivery,
+  the stored conversation, and every non-Delta Chat surface are unaffected.
+
+### Docs
+- `docs/CONFIGURATION.md` gains an "Outbound message formatting" section with
+  the pipeline, the new variable, and profile-by-profile rollout/validation
+  notes. `Agents.md` and `plugin.yaml` document the new variable.
+
+### Tests
+- `tests/test_adapter.py`: extended `TestStripMarkdown` (bullets, numbered
+  lists, closed headings, fenced-code body, URL/punctuation/Unicode
+  preservation) and `TestSplitMessage` (line-count split, exact-boundary,
+  one-over boundary, long paragraph, lists, Unicode combining marks,
+  multi-part ordering, default line limit).
+- `tests/test_adapter_integration.py`: replaced `TestHTMLFormatting` with
+  `TestPlainTextDelivery`, covering markdown-free delivery, ordered
+  multi-message split, single-message short replies, and first-chunk-only
+  quote-reply through the real `send()` path.
+
 ## [1.7.3] - 2026-08-31
 
 ### Fixed

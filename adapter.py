@@ -5,7 +5,6 @@ Integrates Delta Chat as a messaging platform using deltachat2 (direct JSON-RPC)
 
 import email.utils
 import functools
-import html
 import inspect
 import json
 import os
@@ -58,6 +57,11 @@ MIN_DC_VERSION = "2.51.0"
 # DC truncates at ~3800; split conservatively
 DC_MESSAGE_MAX_LEN = 3600
 
+# Conservative conversational line ceiling for a single Delta Chat message.
+# Delta Chat has no markdown rendering and auto-converts long text to HTML;
+# keeping each outbound message short and plain reads like a chat, not a doc.
+DC_MESSAGE_MAX_LINES = 20
+
 # Maximum image download size for send_image_file() URLs (25 MiB)
 _MAX_IMAGE_SIZE = 25 * 1024 * 1024
 
@@ -77,13 +81,25 @@ def _cfg(config, env: str, key: str, default: str = "") -> str:
 
 
 def _strip_markdown(text: str) -> str:
-    """Delta Chat renders plain text only; strip common markdown syntax."""
+    """Render markdown down to plain text for Delta Chat.
+
+    Delta Chat has no markdown rendering, so markers would otherwise leak
+    into the delivered message. Headings lose their ``#``; emphasis loses
+    ``*``/``_``; links become ``label (URL)``; fenced-code delimiters are
+    removed but the code content (and its indentation) is kept; bullet
+    markers are normalised to ``- ``. Paragraph spacing and ordinary
+    punctuation/URLs are left untouched.
+    """
     if not text:
         return text
-    text = re.sub(r"```(?:\w*\n)?(.*?)```", r"\1", text, flags=re.DOTALL)
+    # Fenced code: drop the ``` delimiters (and any info string), keep body.
+    text = re.sub(r"```[^\n]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
     text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(r"^#{1,6}\s+(.*)$", r"\1", text, flags=re.MULTILINE)
+    # ATX headings, including the optional closing run of #.
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    # Bullet list markers (*, +, -, •) -> "- ", indentation preserved.
+    text = re.sub(r"(?m)^(\s*)[*+•-]\s+", r"\1- ", text)
     text = re.sub(r"(\*\*\*|___)(.+?)\1", r"\2", text)
     text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text)
     text = re.sub(r"(?<!\w)(\*|_)(.+?)\1(?!\w)", r"\2", text)
@@ -91,37 +107,81 @@ def _strip_markdown(text: str) -> str:
     return text
 
 
-def _split_message(text: str, max_len: int = DC_MESSAGE_MAX_LEN) -> list[str]:
-    """Split long text at paragraph/line/sentence/word boundaries."""
-    if not text:
-        return []
-    if max_len < 1:
-        max_len = DC_MESSAGE_MAX_LEN
-    if len(text) <= max_len:
-        return [text]
-    parts: list[str] = []
-    remaining = text
+def _hard_wrap_line(line: str, max_len: int) -> list[str]:
+    """Last-resort split of one over-long line, preferring word boundaries.
+
+    Only reached when a single line exceeds ``max_len`` with no newline to
+    break on. Prefers a sentence/word boundary; a mid-word cut (no boundary
+    found) logs a warning and steps back off any combining character so a
+    code point is never split.
+    """
+    out: list[str] = []
+    remaining = line
     while len(remaining) > max_len:
         split_at = -1
-        # Try in order: paragraph break, line break, sentence end, word boundary.
-        # Require split point past 25% of max_len so first chunk isn't tiny.
-        for rfind_str, extra in [("\n\n", 0), ("\n", 0), (". ", 1), (" ", 0)]:
-            idx = remaining.rfind(rfind_str, 0, max_len)
+        for sep, extra in ((". ", 1), (", ", 1), (" ", 0)):
+            idx = remaining.rfind(sep, 0, max_len)
             if idx > max_len * 0.25:
                 split_at = idx + extra
                 break
         if split_at <= 0:
             split_at = max_len
-            # Avoid splitting in the middle of a combining character.
             while split_at > 1 and unicodedata.combining(remaining[split_at]):
                 split_at -= 1
-        parts.append(remaining[:split_at].rstrip())
+            logger.warning(
+                "DeltaChat: hard character split of a %d-char line with no "
+                "word boundary; a token may be broken across messages",
+                len(line),
+            )
+        out.append(remaining[:split_at].rstrip())
         remaining = remaining[split_at:].lstrip()
-        if not remaining:
-            break
     if remaining:
-        parts.append(remaining)
-    return parts
+        out.append(remaining)
+    return out
+
+
+def _split_message(
+    text: str,
+    max_len: int = DC_MESSAGE_MAX_LEN,
+    max_lines: int = DC_MESSAGE_MAX_LINES,
+) -> list[str]:
+    """Split text so every chunk is within ``max_len`` chars and ``max_lines``
+    lines.
+
+    Splits at line and paragraph boundaries first; only a single line longer
+    than ``max_len`` falls back to a hard character split (which logs a
+    warning). Ordering is preserved and nothing is truncated.
+    """
+    if not text:
+        return []
+    if max_len < 1:
+        max_len = DC_MESSAGE_MAX_LEN
+    if max_lines < 1:
+        max_lines = DC_MESSAGE_MAX_LINES
+    if len(text) <= max_len and text.count("\n") + 1 <= max_lines:
+        return [text]
+
+    chunks: list[str] = []
+    cur: list[str] = []
+
+    def flush() -> None:
+        if cur:
+            chunk = "\n".join(cur).strip("\n")
+            if chunk:
+                chunks.append(chunk)
+            cur.clear()
+
+    for line in text.split("\n"):
+        if len(line) > max_len:
+            flush()
+            chunks.extend(_hard_wrap_line(line, max_len))
+            continue
+        would_be = ("\n".join(cur + [line])) if cur else line
+        if cur and (len(cur) + 1 > max_lines or len(would_be) > max_len):
+            flush()
+        cur.append(line)
+    flush()
+    return chunks
 
 
 def _is_valid_email(s: str) -> bool:
@@ -686,6 +746,26 @@ class DeltaChatAdapter(BasePlatformAdapter):
             )
             max_message_len = DC_MESSAGE_MAX_LEN
         self._max_message_len = max_message_len
+
+        try:
+            max_message_lines = int(
+                g(
+                    "DELTACHAT_MAX_MESSAGE_LINES",
+                    "max_message_lines",
+                    str(DC_MESSAGE_MAX_LINES),
+                )
+            )
+        except ValueError:
+            max_message_lines = DC_MESSAGE_MAX_LINES
+        if max_message_lines < 1 or max_message_lines > 200:
+            logger.warning(
+                "DELTACHAT_MAX_MESSAGE_LINES %s out of bounds (1-200), "
+                "using default %s",
+                max_message_lines,
+                DC_MESSAGE_MAX_LINES,
+            )
+            max_message_lines = DC_MESSAGE_MAX_LINES
+        self._max_message_lines = max_message_lines
 
         self._require_mention = g(
             "DELTACHAT_REQUIRE_MENTION", "require_mention", "false"
@@ -1491,53 +1571,6 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
         return None
 
-    def _format_html_message(self, text: str, max_lines: int = 40) -> tuple:
-        """Format long messages with HTML for better readability in Delta Chat.
-
-        If message is longer than max_lines, returns (text_part, html_part)
-        where text_part is the first max_lines and html_part is the full
-        message with proper styling. Otherwise returns (text, None).
-
-        Args:
-            text: The message text
-            max_lines: Maximum lines before using HTML (default: 40)
-
-        Returns:
-            Tuple of (plain_text, html_text) - html_text is None if not needed
-        """
-        lines = text.split("\n")
-        if len(lines) <= max_lines:
-            return (text, None)
-
-        # First max_lines as plain text
-        text_part = "\n".join(lines[:max_lines])
-
-        # Full message as HTML with nice formatting; escape to prevent injection
-        escaped = html.escape(text).replace("\n", "<br>\n")
-        html_part = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-body {{
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    font-size: 16px;
-    line-height: 1.5;
-    color: #333;
-    background-color: #fff;
-    padding: 16px;
-    max-width: 800px;
-    margin: 0 auto;
-}}
-</style>
-</head>
-<body>
-{escaped}
-</body>
-</html>"""
-
-        return (text_part, html_part)
-
     async def send(
         self,
         chat_id: str,
@@ -1583,43 +1616,22 @@ body {{
             async def _do_send() -> Optional[int]:
                 from deltachat2.types import MsgData
 
-                # Very long messages are split at natural boundaries and sent
-                # as multiple plain-text chunks.
-                chunks = _split_message(stripped, self._max_message_len)
-                if len(chunks) > 1:
-                    last_msg_id: Optional[int] = None
-                    for idx, chunk in enumerate(chunks):
-                        # Only quote-reply the first chunk.
-                        chunk_quoted = quoted_id if idx == 0 else None
-                        last_msg_id = await self.rpc.send_msg(
-                            self.account_id,
-                            int(chat_id),
-                            MsgData(text=chunk, quoted_message_id=chunk_quoted),
-                        )
-                    return last_msg_id
-
-                # Shorter messages may use HTML formatting when >40 lines.
-                text_part, html_part = self._format_html_message(stripped)
-                from deltachat2.types import MessageViewtype
-
-                if html_part:
-                    msg_id = await self.rpc.send_msg(
+                # Keep Delta Chat messages short and plain: over-limit
+                # responses are split at paragraph/line boundaries and sent
+                # as ordered plain-text chunks. Only the first chunk carries
+                # the quote-reply.
+                chunks = _split_message(
+                    stripped, self._max_message_len, self._max_message_lines
+                ) or [stripped]
+                last_msg_id: Optional[int] = None
+                for idx, chunk in enumerate(chunks):
+                    chunk_quoted = quoted_id if idx == 0 else None
+                    last_msg_id = await self.rpc.send_msg(
                         self.account_id,
                         int(chat_id),
-                        MsgData(
-                            text=text_part,
-                            html=html_part,
-                            viewtype=MessageViewtype.TEXT,
-                            quoted_message_id=quoted_id,
-                        ),
+                        MsgData(text=chunk, quoted_message_id=chunk_quoted),
                     )
-                else:
-                    msg_id = await self.rpc.send_msg(
-                        self.account_id,
-                        int(chat_id),
-                        MsgData(text=stripped, quoted_message_id=quoted_id),
-                    )
-                return msg_id
+                return last_msg_id
 
             msg_id = await _async_retry(_do_send, max_attempts=3, base_delay=1.0)
             logger.debug("Sent message %s to chat %s", msg_id, chat_id)
@@ -2804,6 +2816,19 @@ def validate_config(config) -> bool:
                 f"DELTACHAT_MAX_MESSAGE_LENGTH must be between 100 and 10000: {max_len!r}"
             )
 
+    max_lines = os.getenv("DELTACHAT_MAX_MESSAGE_LINES") or extra.get(
+        "max_message_lines"
+    )
+    if max_lines:
+        try:
+            max_lines_int = int(max_lines)
+        except ValueError:
+            raise ValueError(f"Invalid DELTACHAT_MAX_MESSAGE_LINES: {max_lines!r}")
+        if max_lines_int < 1 or max_lines_int > 200:
+            raise ValueError(
+                f"DELTACHAT_MAX_MESSAGE_LINES must be between 1 and 200: {max_lines!r}"
+            )
+
     return True
 
 
@@ -2848,6 +2873,7 @@ def _apply_yaml_config(
         ("require_mention_channels", "require_mention_channels"),
         ("auto_delete_interval", "auto_delete_interval"),
         ("max_message_length", "max_message_length"),
+        ("max_message_lines", "max_message_lines"),
     ):
         value = platform_cfg.get(yaml_key)
         if value is not None:
@@ -2922,7 +2948,9 @@ def register_platform(ctx):
         platform_hint=(
             "You are chatting via Delta Chat. "
             "Delta Chat does NOT support markdown formatting or message editing. "
-            "Messages longer than 40 lines will be automatically formatted with HTML. "
+            "Markdown markers are stripped and long replies are split into "
+            "several short plain-text messages, so keep responses brief and "
+            "conversational. "
             "For very long content, consider sending as a document file instead. "
             "You CAN send voice messages (use send_voice tool), videos, images, "
             "files, and delete messages. "

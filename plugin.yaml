@@ -1,7 +1,7 @@
 name: deltachat-platform
 label: Delta Chat
 kind: platform
-version: 1.7.3
+version: 1.7.4
 description: Delta Chat messaging platform adapter for Hermes Agent. Supports text, webxdc mini apps, voice messages, images, and videos.
 author: Simon Laux
 requires_env:
@@ -87,6 +87,10 @@ optional_env:
   - name: DELTACHAT_MAX_MESSAGE_LENGTH
     description: "Character limit for automatic message splitting (default: 3600, min: 100, max: 10000)"
     prompt: "Max message length"
+    password: false
+  - name: DELTACHAT_MAX_MESSAGE_LINES
+    description: "Line limit per outbound message; longer replies are split into ordered plain-text messages (default: 20, min: 1, max: 200)"
+    prompt: "Max message lines"
     password: false
   - name: DELTACHAT_RATE_LIMIT_MAX
     description: "Max inbound messages per sender per window (default: 30)"
