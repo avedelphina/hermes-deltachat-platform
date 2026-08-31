@@ -1187,6 +1187,122 @@ class TestMentions:
 
         adapter.handle_message.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_reply_to_own_message_is_implicit_mention(
+        self, platform_config, mock_rpc, group_event
+    ):
+        """In a mention-gated chat, a quote-reply to the bot's own message
+        (quoted from_id == DC_CONTACT_ID_SELF) is processed without an
+        @mention — even though core reports the quote author_display_name as
+        the localized "Me", not the configured display name."""
+        platform_config.extra = {
+            "require_mention": "false",
+            "display_name": "Alice",
+            "require_mention_channels": "1",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            side_effect=[
+                {
+                    "text": "yes do that",
+                    "view_type": "Text",
+                    "from_id": 11,
+                    "file": None,
+                    "quote": {
+                        "kind": "WithMessage",
+                        "text": "shall I proceed?",
+                        "message_id": 99,
+                        "author_display_name": "Me",
+                    },
+                },
+                {"from_id": 1, "text": "shall I proceed?"},
+            ]
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "OCEAN Support"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_awaited_once()
+        event_arg = adapter.handle_message.await_args[0][0]
+        # quoted-text splice uses the bot's real name, not the "Me" from core
+        assert '[replying to Alice: "shall I proceed?"]' in event_arg.text
+
+    @pytest.mark.asyncio
+    async def test_reply_to_other_member_still_gated(
+        self, platform_config, mock_rpc, group_event
+    ):
+        """A quote-reply to another member's message (quoted from_id != SELF)
+        in a mention-gated chat is still dropped when there is no @mention."""
+        platform_config.extra = {
+            "require_mention": "false",
+            "display_name": "Alice",
+            "require_mention_channels": "1",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            side_effect=[
+                {
+                    "text": "agreed",
+                    "view_type": "Text",
+                    "from_id": 11,
+                    "file": None,
+                    "quote": {
+                        "kind": "WithMessage",
+                        "text": "let's ship it",
+                        "message_id": 98,
+                        "author_display_name": "Bob",
+                    },
+                },
+                {"from_id": 12, "text": "let's ship it"},
+            ]
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "OCEAN Support"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reply_to_own_message_explicit_mention_still_works(
+        self, platform_config, mock_rpc, group_event
+    ):
+        """Explicit @mention keeps working alongside the quote-reply path."""
+        platform_config.extra = {
+            "require_mention": "false",
+            "display_name": "Alice",
+            "require_mention_channels": "1",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "@Alice test",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "OCEAN Support"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_awaited_once()
+
 
 class TestLoopGuardChatScope:
     """The consecutive-reply and bot-exchange guards assume a group with a
