@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.2] - 2026-08-31
+
+### Fixed
+- A quote-reply to one of the bot's own messages is again treated as an implicit mention in a mention-gated group (`DELTACHAT_REQUIRE_MENTION`, or a chat listed in `DELTACHAT_REQUIRE_MENTION_CHANNELS`). The reply-to-self check compared `quote.author_display_name` against the configured `display_name`, but Delta Chat core reports that field as the localized "Me" stock string (`"Me"`/`"Ich"`/`"Já"`…) for a self-authored quote, never the displayname, so the match always failed and the reply was silently dropped. Now `_quote_is_self_authored()` fetches the quoted message and checks `from_id == DC_CONTACT_ID_SELF` (locale-independent); the old name match is kept only as a fallback for when the quoted message is not available locally. The `[replying to …]` context spliced into the text now uses the bot's real display name instead of "Me". Explicit `@mention`, authorization, allowlist/open policy, and the bot-loop / bot-exchange guards are unaffected.
+
+### Tests
+- Added `test_reply_to_own_message_is_implicit_mention`, `test_reply_to_other_member_still_gated`, and `test_reply_to_own_message_explicit_mention_still_works` to `TestMentions` (integration), covering the real `MessageQuote.WithMessage` shape.
+
 ## [1.5.11] - 2026-07-05
 
 ### Fixed

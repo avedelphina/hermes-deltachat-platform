@@ -834,6 +834,31 @@ class DeltaChatAdapter(BasePlatformAdapter):
             return False
         return any(p.search(text) for p in self._mention_patterns)
 
+    async def _quote_is_self_authored(self, quote: dict) -> bool:
+        """Whether a ``WithMessage`` quote points at one of this bot's own messages.
+
+        A quote-reply to the bot's own message is treated as an implicit
+        mention (keeps a thread going under mention-gating). The reliable
+        signal is the quoted message's ``from_id == DC_CONTACT_ID_SELF`` —
+        core reports ``author_display_name`` for a self-authored quote as the
+        localized "Me" string ("Me"/"Ich"/"Já"...), never the configured
+        displayname, so a name comparison alone misses every reply-to-self.
+        Falls back to the name match only when the quoted message can't be
+        fetched locally (e.g. not downloaded).
+        """
+        msg_id = quote.get("message_id")
+        if msg_id:
+            try:
+                quoted = await self.rpc.get_message(self.account_id, int(msg_id))
+                if quoted and quoted.get("from_id") == 1:  # DC_CONTACT_ID_SELF
+                    return True
+            except Exception as e:
+                logger.debug("Could not fetch quoted message %s: %s", msg_id, e)
+        name = (quote.get("author_display_name") or "").strip().lower()
+        return bool(
+            name and self._display_name and name == self._display_name.strip().lower()
+        )
+
     async def _check_mention(self, text: str, chat_type: str, chat_id: str) -> bool:
         """Drop group messages that do not mention the bot when required.
 
@@ -2100,12 +2125,9 @@ body {{
             # the quoted text is surfaced so the LLM knows which earlier point
             # is being replied to.
             quote = msg.get("quote") or {}
-            is_reply_to_self = bool(
-                quote.get("kind") == "WithMessage"
-                and quote.get("author_display_name")
-                and self._display_name
-                and quote["author_display_name"].strip().lower()
-                == self._display_name.strip().lower()
+            is_with_message = quote.get("kind") == "WithMessage"
+            is_reply_to_self = is_with_message and await self._quote_is_self_authored(
+                quote
             )
             # why: mention gate must run on the reply body only — matching inside
             # spliced-in quoted text would treat "someone quoted an old message
@@ -2115,11 +2137,16 @@ body {{
             ):
                 return
 
-            if quote.get("kind") == "WithMessage" and quote.get("text"):
-                text = (
-                    f'[replying to {quote.get("author_display_name") or "a message"}: '
-                    f'"{quote["text"]}"]\n{text}'
+            if is_with_message and quote.get("text"):
+                # why: core reports author_display_name as the localized "Me"
+                # for self-authored quotes — substitute the bot's real name so
+                # the LLM sees "replying to <bot>" not "replying to Me".
+                quoted_author = (
+                    self._display_name
+                    if is_reply_to_self
+                    else (quote.get("author_display_name") or "a message")
                 )
+                text = f'[replying to {quoted_author}: "{quote["text"]}"]\n{text}'
 
             # Build source
             source = self.build_source(
