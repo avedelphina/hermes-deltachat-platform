@@ -12,6 +12,7 @@ import pytest
 
 from adapter import (
     DC_MESSAGE_MAX_LEN,
+    DC_MESSAGE_MAX_LINES,
     DeltaChatAdapter,
     _apply_yaml_config,
     _async_retry,
@@ -53,6 +54,29 @@ class TestStripMarkdown:
         assert _strip_markdown("__bold__") == "bold"
         assert _strip_markdown("_italic_") == "italic"
         assert _strip_markdown("~~strike~~") == "strike"
+
+    def test_closed_atx_heading(self):
+        assert _strip_markdown("## Section ##") == "Section"
+
+    def test_bullet_markers_normalized(self):
+        out = _strip_markdown("* first\n+ second\n- third\n  * nested")
+        assert out == "- first\n- second\n- third\n  - nested"
+
+    def test_numbered_list_kept_as_plain_text(self):
+        assert _strip_markdown("1. one\n2. two") == "1. one\n2. two"
+
+    def test_fenced_code_keeps_body(self):
+        out = _strip_markdown("```js\nconst x = 1;\n```")
+        assert "```" not in out
+        assert "const x = 1;" in out
+
+    def test_urls_and_punctuation_untouched(self):
+        text = "See https://example.com/a?b=1&c=2 — it's fine, e.g. this."
+        assert _strip_markdown(text) == text
+
+    def test_unicode_preserved(self):
+        text = "Ahoj, jak se máš? 日本語 — café ☕"
+        assert _strip_markdown(text) == text
 
 
 class TestSplitMessage:
@@ -96,6 +120,54 @@ class TestSplitMessage:
             parts = _split_message(text, max_len=bad_max)
             assert all(len(p) <= DC_MESSAGE_MAX_LEN for p in parts)
             assert "".join(parts) == text
+
+    def test_splits_on_line_count(self):
+        text = "\n".join(f"line {i}" for i in range(23))
+        parts = _split_message(text, max_lines=5)
+        assert len(parts) == 5  # 5+5+5+5+3
+        assert all(p.count("\n") + 1 <= 5 for p in parts)
+        # ordering preserved, nothing dropped
+        assert "\n".join(parts).split("\n") == text.split("\n")
+
+    def test_exact_line_boundary_not_split(self):
+        text = "\n".join(f"line {i}" for i in range(5))
+        assert _split_message(text, max_lines=5) == [text]
+
+    def test_one_over_line_boundary_splits(self):
+        text = "\n".join(f"line {i}" for i in range(6))
+        parts = _split_message(text, max_lines=5)
+        assert len(parts) == 2
+        assert parts[0] == "\n".join(f"line {i}" for i in range(5))
+        assert parts[1] == "line 5"
+
+    def test_long_paragraph_wraps_within_char_limit(self):
+        text = " ".join(["word"] * 400)  # ~2000 chars, single line
+        parts = _split_message(text, max_len=120, max_lines=20)
+        assert len(parts) > 1
+        assert all(len(p) <= 120 for p in parts)
+        assert " ".join(parts).split() == text.split()
+
+    def test_list_items_kept_on_their_own_lines(self):
+        text = "\n".join(f"- item {i}" for i in range(12))
+        parts = _split_message(text, max_lines=4)
+        assert len(parts) == 3
+        for p in parts:
+            for line in p.split("\n"):
+                assert line.startswith("- item ")
+
+    def test_unicode_not_split_mid_codepoint(self):
+        # base 'e' + combining acute accent (U+0301); a naive character
+        # split at the limit would land between the base char and its mark.
+        text = "e\u0301" * 200
+        parts = _split_message(text, max_len=101, max_lines=20)
+        assert "".join(parts) == text
+        for p in parts:
+            assert not p.endswith("e")  # never a base char without its mark
+
+    def test_default_line_limit_applies(self):
+        text = "\n".join(f"row {i}" for i in range(DC_MESSAGE_MAX_LINES + 5))
+        parts = _split_message(text)
+        assert len(parts) == 2
 
 
 class TestWorkspacePathMapping:

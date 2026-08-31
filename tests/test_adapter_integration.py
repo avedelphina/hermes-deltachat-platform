@@ -441,58 +441,87 @@ class TestDC2Availability:
             sys.modules["deltachat2"] = original_modules
 
 
-class TestHTMLFormatting:
-    """Test HTML message formatting for long messages."""
+class TestPlainTextDelivery:
+    """The outbound text path strips markdown and splits long replies into
+    ordered short plain-text messages (no HTML)."""
 
-    def test_short_message_no_html(self, platform_config):
-        """Test that short messages (< 40 lines) don't get HTML formatting."""
+    @pytest.mark.asyncio
+    async def test_markdown_is_stripped_before_send(self, platform_config, mock_rpc):
         adapter = DeltaChatAdapter(platform_config)
-        short_text = "This is a short message."
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+        sent = []
+        mock_rpc.send_msg = AsyncMock(
+            side_effect=lambda acc, chat, data: sent.append(data.text) or 1
+        )
 
-        text_part, html_part = adapter._format_html_message(short_text)
+        await adapter.send(
+            "5",
+            "# Title\n\nSome **bold** and a [link](https://x.test/a).\n" "* one\n* two",
+        )
 
-        assert text_part == short_text
-        assert html_part is None
+        body = "\n".join(sent)
+        assert "#" not in body
+        assert "**" not in body
+        assert "Title" in body
+        assert "bold" in body
+        assert "link (https://x.test/a)" in body
+        assert "- one" in body and "- two" in body
 
-    def test_long_message_with_html(self, platform_config):
-        """Test that long messages (> 40 lines) get HTML formatting."""
+    @pytest.mark.asyncio
+    async def test_long_reply_split_into_ordered_messages(
+        self, platform_config, mock_rpc
+    ):
+        platform_config.extra = {"max_message_lines": 5}
         adapter = DeltaChatAdapter(platform_config)
-        # Create a message with 50 lines
-        long_text = "\n".join([f"Line {i}" for i in range(50)])
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+        sent = []
+        mock_rpc.send_msg = AsyncMock(
+            side_effect=lambda acc, chat, data: sent.append(data.text) or len(sent)
+        )
 
-        text_part, html_part = adapter._format_html_message(long_text)
+        lines = [f"line {i}" for i in range(23)]
+        await adapter.send("5", "\n".join(lines))
 
-        # text_part should have first 40 lines
-        assert text_part == "\n".join([f"Line {i}" for i in range(40)])
-        # html_part should contain the full message
-        assert html_part is not None
-        assert "Line 40" in html_part
-        assert "Line 49" in html_part
-        # Check for HTML styling
-        assert "sans-serif" in html_part
-        assert "font-size: 16px" in html_part
+        assert len(sent) > 1
+        for part in sent:
+            assert part.count("\n") + 1 <= 5
+        # ordering + nothing dropped
+        assert "\n".join(sent).split("\n") == lines
 
-    def test_exactly_40_lines_no_html(self, platform_config):
-        """Test that exactly 40 lines doesn't trigger HTML formatting."""
+    @pytest.mark.asyncio
+    async def test_short_reply_sent_as_single_message(self, platform_config, mock_rpc):
         adapter = DeltaChatAdapter(platform_config)
-        text_40_lines = "\n".join([f"Line {i}" for i in range(40)])
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+        sent = []
+        mock_rpc.send_msg = AsyncMock(
+            side_effect=lambda acc, chat, data: sent.append(data.text) or 1
+        )
 
-        text_part, html_part = adapter._format_html_message(text_40_lines)
+        await adapter.send("5", "just a quick reply")
 
-        assert text_part == text_40_lines
-        assert html_part is None
+        assert sent == ["just a quick reply"]
 
-    def test_41_lines_with_html(self, platform_config):
-        """Test that 41 lines triggers HTML formatting."""
+    @pytest.mark.asyncio
+    async def test_only_first_chunk_carries_quote_reply(
+        self, platform_config, mock_rpc
+    ):
+        platform_config.extra = {"max_message_lines": 3}
         adapter = DeltaChatAdapter(platform_config)
-        text_41_lines = "\n".join([f"Line {i}" for i in range(41)])
+        adapter.rpc = mock_rpc
+        adapter.account_id = 1
+        quoted = []
+        mock_rpc.send_msg = AsyncMock(
+            side_effect=lambda acc, chat, data: quoted.append(data.quoted_message_id)
+            or len(quoted)
+        )
 
-        text_part, html_part = adapter._format_html_message(text_41_lines)
+        await adapter.send("5", "\n".join(f"l{i}" for i in range(10)), reply_to="99")
 
-        # text_part should have first 40 lines
-        assert text_part == "\n".join([f"Line {i}" for i in range(40)])
-        # html_part should exist
-        assert html_part is not None
+        assert quoted[0] == 99
+        assert all(q is None for q in quoted[1:])
 
 
 class TestLocationSending:

@@ -267,6 +267,8 @@ hermes gateway start
 | `DELTACHAT_MAX_CONSECUTIVE_REPLIES` | No | `20` | Stop auto-replying to same sender after N in a row with no other participant (bot-loop guard); `<=0` disables |
 | `DELTACHAT_HUMAN_USERS` | No | — | Comma-separated addresses treated as human check-ins for the bot-exchange guard |
 | `DELTACHAT_MAX_BOT_EXCHANGES` | No | `12` | Stop auto-replying after N messages from non-`DELTACHAT_HUMAN_USERS` senders (bot-exchange guard); active only when `DELTACHAT_HUMAN_USERS` is set |
+| `DELTACHAT_MAX_MESSAGE_LENGTH` | No | `3600` | Character limit per outbound message before splitting (100–10000) |
+| `DELTACHAT_MAX_MESSAGE_LINES` | No | `20` | Line limit per outbound message (1–200); longer replies are markdown-stripped and split into ordered plain-text messages |
 | `DELTACHAT_REQUIRE_MENTION` | No | `false` | Require `@mention` in group chats before responding |
 | `DELTACHAT_MENTION_ALIASES` | No | — | Comma-separated extra names/forms that also count as a mention, beyond `DELTACHAT_DISPLAY_NAME` and its auto-tolerated case endings |
 | `DELTACHAT_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated group chat IDs exempt from `DELTACHAT_REQUIRE_MENTION` |

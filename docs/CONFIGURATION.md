@@ -37,7 +37,8 @@ All Delta Chat platform settings are read from environment variables (or from `c
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DELTACHAT_MAX_MESSAGE_LENGTH` | `3600` | Character limit for automatic message splitting. |
+| `DELTACHAT_MAX_MESSAGE_LENGTH` | `3600` | Character limit for automatic message splitting (min 100, max 10000). |
+| `DELTACHAT_MAX_MESSAGE_LINES` | `20` | Line limit per outbound message (min 1, max 200). Replies over the limit are stripped of markdown and split at paragraph/line boundaries into ordered plain-text messages. |
 | `DELTACHAT_REQUIRE_MENTION` | `false` | Require `@DisplayName` mention in groups (see above). |
 | `DELTACHAT_RATE_LIMIT_MAX` | `30` | Max inbound messages per sender per window. |
 | `DELTACHAT_RATE_LIMIT_WINDOW` | `60` | Rate-limit window in seconds. |
@@ -64,4 +65,38 @@ DELTACHAT_CHATMAIL_SERVERS=nine.testrun.org,mail.example.com
 # Restrict to a group that must @-mention the bot
 DELTACHAT_REQUIRE_MENTION=true
 DELTACHAT_DISPLAY_NAME="My Assistant"
+
+# Shorter, chattier Delta Chat messages (default is already 20 lines)
+DELTACHAT_MAX_MESSAGE_LINES=15
 ```
+
+## Outbound message formatting
+
+Delta Chat has no markdown rendering. Every outbound text reply runs through a
+deterministic plain-text pass immediately before sending:
+
+1. **Markdown is removed** — headings lose `#`, `*`/`_` emphasis is unwrapped,
+   `[label](url)` becomes `label (url)`, fenced-code delimiters are dropped
+   (code body and its indentation kept), and `*`/`+`/`•` bullets become `- `.
+   URLs and ordinary punctuation are left alone.
+2. **Long replies are split** — a reply over `DELTACHAT_MAX_MESSAGE_LINES`
+   (default 20) or `DELTACHAT_MAX_MESSAGE_LENGTH` characters is broken at
+   paragraph/line boundaries into several ordered messages, each within both
+   limits. Only a single line longer than the character limit falls back to a
+   hard word-boundary split (logged at `WARNING`). Nothing is truncated; only
+   the first message carries the quote-reply.
+
+This applies **only** to the Delta Chat outbound text path — attachments, voice
+messages, generated documents, the stored conversation, and every non-Delta
+Chat surface are unchanged.
+
+### Rollout
+
+The defaults are conservative and safe for every Hermes profile; no config
+change is required to adopt this. To tune per profile, set
+`DELTACHAT_MAX_MESSAGE_LINES` (or `max_message_lines:` in the `extra:` block of
+`config.yaml`) and restart the gateway. Lower it for a more staccato feel,
+raise it (up to 200) to keep more content in one message. Validate against a
+Delta Chat test destination by sending a reply containing headings, a list, a
+link, and >20 lines, and confirm it arrives as ordered plain-text messages
+with no `#`/`*` markers.
