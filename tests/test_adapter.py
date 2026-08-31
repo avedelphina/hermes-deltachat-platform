@@ -79,6 +79,29 @@ class TestStripMarkdown:
         text = "Ahoj, jak se máš? 日本語 — café ☕"
         assert _strip_markdown(text) == text
 
+    def test_pipe_table_flattened_to_label_value_lines(self):
+        out = _strip_markdown(
+            "| Name | Role |\n" "| --- | --- |\n" "| Alice | Dev |\n" "| Bob | PM |"
+        )
+        assert "|" not in out
+        assert out == "Name: Alice, Role: Dev\nName: Bob, Role: PM"
+
+    def test_table_without_outer_pipes(self):
+        out = _strip_markdown("a | b\n--- | ---\n1 | 2")
+        assert out == "a: 1, b: 2"
+
+    def test_table_with_alignment_colons(self):
+        out = _strip_markdown("| L | R |\n|:---|---:|\n| x | y |")
+        assert out == "L: x, R: y"
+
+    def test_table_surrounded_by_prose(self):
+        out = _strip_markdown("Here:\n\n| K | V |\n| - | - |\n| a | b |\n\nDone.")
+        assert out == "Here:\n\nK: a, V: b\n\nDone."
+
+    def test_non_table_pipes_left_alone(self):
+        text = "run `foo | bar` then check\nresult is a | b here"
+        assert _strip_markdown(text) == "run foo | bar then check\nresult is a | b here"
+
 
 class TestSplitMessage:
     def test_short_unchanged(self):

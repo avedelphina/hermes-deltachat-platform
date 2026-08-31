@@ -80,18 +80,76 @@ def _cfg(config, env: str, key: str, default: str = "") -> str:
     return val if val is not None else default
 
 
+_TABLE_DELIM_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$")
+
+
+def _split_table_row(line: str) -> list:
+    """Split one ``| a | b |`` row into stripped cell values."""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _strip_md_tables(text: str) -> str:
+    """Flatten GFM pipe tables into plain ``Header: value`` lines.
+
+    A table is a line containing ``|`` immediately followed by a
+    delimiter row (``| --- | --- |``). Each body row becomes
+    ``h1: c1, h2: c2`` (or just the cells joined by ``, `` when the row
+    width doesn't match the header). Lines with stray pipes but no
+    delimiter row underneath are left untouched.
+    """
+    # ponytail: a pipe table written inside a ``` code fence would also be
+    # flattened here (this runs before fence stripping). Add fence tracking
+    # if a real case shows up.
+    lines = text.split("\n")
+    out: list = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if (
+            "|" in line
+            and i + 1 < n
+            and "|" in lines[i + 1]
+            and _TABLE_DELIM_RE.match(lines[i + 1])
+        ):
+            headers = _split_table_row(line)
+            i += 2
+            while i < n and lines[i].strip() and "|" in lines[i]:
+                cells = _split_table_row(lines[i])
+                if len(cells) == len(headers) and any(headers):
+                    pairs = [
+                        f"{h}: {c}" if h else c
+                        for h, c in zip(headers, cells)
+                        if c or h
+                    ]
+                    out.append(", ".join(p for p in pairs if p))
+                else:
+                    out.append(", ".join(c for c in cells if c))
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
 def _strip_markdown(text: str) -> str:
     """Render markdown down to plain text for Delta Chat.
 
     Delta Chat has no markdown rendering, so markers would otherwise leak
-    into the delivered message. Headings lose their ``#``; emphasis loses
-    ``*``/``_``; links become ``label (URL)``; fenced-code delimiters are
-    removed but the code content (and its indentation) is kept; bullet
-    markers are normalised to ``- ``. Paragraph spacing and ordinary
-    punctuation/URLs are left untouched.
+    into the delivered message. Pipe tables collapse to ``Header: value``
+    lines; headings lose their ``#``; emphasis loses ``*``/``_``; links
+    become ``label (URL)``; fenced-code delimiters are removed but the
+    code content (and its indentation) is kept; bullet markers are
+    normalised to ``- ``. Paragraph spacing and ordinary punctuation/URLs
+    are left untouched.
     """
     if not text:
         return text
+    text = _strip_md_tables(text)
     # Fenced code: drop the ``` delimiters (and any info string), keep body.
     text = re.sub(r"```[^\n]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
     text = re.sub(r"`([^`]+)`", r"\1", text)
