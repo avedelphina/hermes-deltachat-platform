@@ -612,6 +612,12 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._transport = None
         self.account_id: Optional[int] = None
         self._event_loop_task: Optional[asyncio.Task] = None
+        self._fatal_notify_task: Optional[asyncio.Task] = None
+        # why: _running is *shared* with BasePlatformAdapter — it is both this
+        # listener's loop condition and the base's `is_connected`. That is what
+        # makes the escalation guard in _event_listener correct (the loop can
+        # only go false via a deliberate teardown), so it cannot be stopped
+        # without also declaring the adapter disconnected.
         self._running = False
         self._dc_config_dir: Optional[str] = None
         self._call_manager = None
@@ -1214,13 +1220,16 @@ class DeltaChatAdapter(BasePlatformAdapter):
             except (NotImplementedError, ValueError, RuntimeError):
                 pass  # Signals may not be supported on this platform.
 
-            # Start event listener with crash recovery.
+            # Start the event listener. It escalates its own death to the
+            # gateway (see _event_listener); Hermes owns supervision and rebuilds
+            # a fresh adapter on a retryable fatal error, so there is no
+            # adapter-side restart loop to race that watcher.
             self._running = True
-            self._event_loop_task = asyncio.create_task(self._event_supervisor())
-            # Retrieve the task's exception if it ever escapes the supervisor, so
-            # a crash is logged when it happens rather than surfacing as
-            # "Task exception was never retrieved" whenever the GC gets to it.
-            self._event_loop_task.add_done_callback(self._on_event_task_done)
+            self._event_loop_task = asyncio.create_task(self._event_listener())
+            # Retrieve the task's exception if it ever escapes, so a crash is
+            # logged when it happens rather than surfacing as "Task exception
+            # was never retrieved" whenever the GC gets to it.
+            self._event_loop_task.add_done_callback(self._on_listener_done)
 
             self._mark_connected()
             global _active_adapter
@@ -1245,13 +1254,19 @@ class DeltaChatAdapter(BasePlatformAdapter):
             self._cleanup()
             return False
 
-    def _on_event_task_done(self, task: asyncio.Task) -> None:
-        """Done-callback for the event supervisor task; logs an escaped crash."""
+    @staticmethod
+    def _on_listener_done(task: asyncio.Task) -> None:
+        """Retrieve the listener task's outcome so an escaped crash can't vanish.
+
+        Without this, an exception escaping the task is only reported by asyncio
+        as "Task exception was never retrieved" whenever the garbage collector
+        happens to get to it — if at all.
+        """
         if task.cancelled():
             return
         exc = task.exception()
         if exc is not None:
-            logger.error("DeltaChat: event supervisor task crashed: %s", exc)
+            logger.error("Delta Chat event listener died: %s", exc, exc_info=exc)
 
     def _cleanup(self) -> None:
         """Clean up resources."""
@@ -1295,17 +1310,17 @@ class DeltaChatAdapter(BasePlatformAdapter):
             except (NotImplementedError, ValueError, RuntimeError):
                 pass
 
-        if self._call_manager:
-            # A raising teardown must not skip _cleanup() below — that would
-            # leak the RPC subprocess and the accounts-dir lock, which then
-            # blocks any replacement adapter from connecting.
-            try:
+        try:
+            if self._call_manager:
                 await self._call_manager.teardown()
-            except Exception as e:
-                logger.warning("DeltaChat: call manager teardown failed: %s", e)
-            self._call_manager = None
-        self._cleanup()
-        self._mark_disconnected()
+                self._call_manager = None
+        except Exception as e:
+            # A raising teardown used to skip _cleanup() entirely, leaking the
+            # RPC subprocess and the accounts-dir lock — which then blocks the
+            # replacement adapter the gateway builds on reconnect.
+            logger.warning("DeltaChat: call manager teardown failed: %s", e)
+        finally:
+            self._cleanup()  # marks the adapter disconnected itself
         logger.info("Delta Chat disconnected")
 
     def get_status(self) -> dict:
@@ -1947,52 +1962,104 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 remapped.append(file_path)
         return BasePlatformAdapter.filter_local_delivery_paths(remapped)
 
-    async def _event_listener(self) -> None:
-        """Listen for Delta Chat events and forward to Hermes."""
-        while self._running:
-            try:
-                if self.account_id:
-                    envelope = await self.rpc.get_next_event()
-                    if envelope.get("context_id") == self.account_id:
-                        await self._handle_dc_event(envelope.get("event", {}))
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Event listener error: {e}")
-                await asyncio.sleep(1)
+    def _rpc_server_exit_code(self) -> Optional[int]:
+        """Exit code of the deltachat-rpc-server subprocess, or None if alive.
 
-    async def _event_supervisor(self) -> None:
-        """Run the event listener and restart it on crash.
-
-        If the listener crashes 3 times within 60 seconds, the adapter gives up
-        and disconnects.
+        IOTransport only binds `.process` once start() has been called, so a
+        missing attribute means "not started yet", not "dead".
         """
-        while self._running:
-            try:
-                await self._event_listener()
-                break  # Clean exit
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                if not self._running:
+        process = getattr(self._transport, "process", None)
+        if process is None:
+            return None
+        return process.poll()
+
+    async def _event_listener(self) -> None:
+        """Listen for Delta Chat events and forward to Hermes.
+
+        Retries transient RPC errors in place. If the loop ever stops while we
+        still believe we are connected — the RPC subprocess died, or the task
+        was cancelled by something other than disconnect() — the adapter is
+        deaf: DC keeps queueing events and nothing drains them. That used to be
+        silent and permanent. Now it is escalated to the gateway, which owns
+        supervision and rebuilds a fresh adapter (see _escalate_listener_death).
+        """
+        try:
+            while self._running:
+                try:
+                    if self.account_id:
+                        envelope = await self.rpc.get_next_event()
+                        if envelope.get("context_id") == self.account_id:
+                            await self._handle_dc_event(envelope.get("event", {}))
+                except asyncio.CancelledError:
                     break
-                now = time.monotonic()
-                with self._lock:
-                    self._crash_times = [t for t in self._crash_times if now - t < 60]
-                    self._crash_times.append(now)
-                    recent_crashes = len(self._crash_times)
-                self._bump_stat("event_listener_crashes")
-                if recent_crashes >= 3:
-                    logger.error(
-                        "DeltaChat: 3 event listener crashes in 60s — disabling"
-                    )
-                    self._running = False
-                    asyncio.create_task(self.disconnect())
-                    break
-                logger.error(
-                    "DeltaChat: event listener crashed (%s), restarting in 5s", e
+                except Exception as e:
+                    if not await self._handle_listener_error(e):
+                        break
+        finally:
+            # is_connected is the base class's self._running, which _cleanup()
+            # and _set_fatal_error() both clear — so a deliberate teardown (and
+            # an error path that already escalated) falls through here without
+            # escalating again.
+            if self.is_connected:
+                self._escalate_listener_death(
+                    "event_listener_stopped",
+                    "Delta Chat event listener stopped while connected",
                 )
-                await asyncio.sleep(5)
+
+    async def _handle_listener_error(self, exc: Exception) -> bool:
+        """Handle an error from the listen loop. Return True to keep polling.
+
+        A transient RPC error is logged and retried after a short sleep. But
+        once the deltachat-rpc-server subprocess is gone, retrying is futile
+        and actively harmful: the vendored transport resolves the in-flight
+        call with an error and then every subsequent call would raise (or, on
+        an older transport, hang) — see vendor/deltachat2/transport.py. So the
+        moment poll() shows the subprocess has exited, stop the loop and let
+        the `finally` in _event_listener escalate to the gateway, which
+        respawns the RPC server by rebuilding the adapter.
+        """
+        exit_code = self._rpc_server_exit_code()
+        if exit_code is None:
+            logger.error("Event listener error: %s", exc)
+            now = time.monotonic()
+            with self._lock:
+                self._crash_times = [t for t in self._crash_times if now - t < 60]
+                self._crash_times.append(now)
+            self._bump_stat("event_listener_errors")
+            await asyncio.sleep(1)
+            return True
+
+        logger.error(
+            "deltachat-rpc-server exited (code %s); stopping the event listener. "
+            "Last error: %s",
+            exit_code,
+            exc,
+        )
+        self._escalate_listener_death(
+            "rpc_server_died",
+            f"deltachat-rpc-server exited with code {exit_code}",
+        )
+        return False
+
+    def _escalate_listener_death(self, code: str, message: str) -> None:
+        """Report a dead event listener to the gateway and let it recover us.
+
+        Hermes owns supervision: _handle_adapter_fatal_error drops this adapter
+        and _platform_reconnect_watcher rebuilds a *fresh* one with 30s->300s
+        backoff. So we must not restart the listener ourselves — an adapter-side
+        supervisor would race that watcher and keep the RPC subprocess and the
+        accounts-dir lock alive, which is exactly what blocks the replacement
+        from connecting.
+
+        The notify is fired as its own task rather than awaited: the gateway's
+        fatal handler calls back into disconnect(), which cancels *this* task.
+        Awaiting from inside the task would cancel it mid-teardown.
+        """
+        if not self.is_connected:
+            return
+        self._set_fatal_error(code, message, retryable=True)
+        # Held on the instance so the task isn't garbage-collected mid-flight.
+        self._fatal_notify_task = asyncio.create_task(self._notify_fatal_error())
 
     async def _handle_dc_event(self, event: Dict[str, Any]) -> None:
         """Handle a Delta Chat event and convert to Hermes MessageEvent.

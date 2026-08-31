@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.5] - 2026-08-31
+
+### Changed
+- A dead event listener is now reported to the Hermes gateway instead of being restarted in-process. Previously `_event_supervisor` restarted the listener up to 3 times in 60s and then called `disconnect()` — but the gateway was never told, so the platform was never queued for reconnect, and the inner `except Exception` in `_event_listener` swallowed every error so the give-up path was effectively unreachable anyway. A dead `deltachat-rpc-server` therefore produced a permanent 1-per-second error log with `is_connected` still `True` and no recovery. `_event_supervisor` is removed. `_event_listener` now runs the poll loop in a `try/finally`; if the loop ever exits while `self.is_connected` is still true — the RPC subprocess exited, or the task was cancelled by something other than `disconnect()` — it calls `_set_fatal_error(..., retryable=True)` + `_notify_fatal_error()`, the same `BasePlatformAdapter` contract IRC/Telegram and the other bundled adapters use. Hermes's `_handle_adapter_fatal_error` then drops this adapter and `_platform_reconnect_watcher` rebuilds a fresh one (respawning the RPC server) with 30s→300s backoff. The adapter deliberately does not restart the listener itself — an adapter-side supervisor races that watcher and keeps the RPC subprocess and accounts-dir lock alive, blocking the replacement.
+- `_handle_listener_error()` distinguishes a transient RPC error (logged, retried after 1s, counted in `_crash_times` / the new `event_listener_errors` stat) from a dead subprocess: `_rpc_server_exit_code()` probes `transport.process.poll()`, and any exit code — `0` included — stops the loop and escalates as fatal code `rpc_server_died`. Builds on the v1.7.3 transport fix, which is what makes `get_next_event()` reliably *raise* (rather than hang) once the server is gone.
+
+### Fixed
+- `disconnect()` now runs `_cleanup()` from a `finally`, so a raising `CallManager.teardown()` can no longer skip it and leak the RPC subprocess + accounts-dir lock. `_on_listener_done` (was `_on_event_task_done`) logs an escaped listener crash with `exc_info`.
+
+### Tests
+- `tests/conftest.py`: `MockBasePlatformAdapter` gains the fatal-error contract (`is_connected`, `has_fatal_error`, `fatal_error_code`/`message`/`retryable`, `set_fatal_error_handler`, `_set_fatal_error`, `_notify_fatal_error`) and now mirrors the real base's `_running`-is-`is_connected` and its refusal to downgrade a recorded fatal error.
+- `tests/test_adapter_integration.py`: `TestEventSupervisor` replaced with `TestListenerDeathEscalation` (transient-error retry vs dead-server escalation, cancellation-while-connected, gateway notify, deliberate-disconnect is not a crash, no self-restart) and `TestListenerDoneCallback`.
+- Added `tests/test_rpc_server_death.py`: the `_rpc_server_exit_code()` probe, transient-vs-dead handling in `_handle_listener_error()`, and `disconnect()`/`_cleanup()` resilience.
+
 ## [1.7.4] - 2026-08-31
 
 ### Changed
