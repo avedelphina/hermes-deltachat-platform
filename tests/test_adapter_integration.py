@@ -698,49 +698,121 @@ class TestSignalHandling:
         assert signal.SIGINT in removed
 
 
-class TestEventSupervisor:
-    """Test event-listener crash recovery."""
+class TestListenerDeathEscalation:
+    """A dead event listener is reported to the gateway, not restarted here.
+
+    Hermes owns supervision: a retryable fatal error makes it drop this adapter
+    and rebuild a fresh one. self._running *is* the base's is_connected, so the
+    realistic death paths are an exception/cancellation escaping the loop, or
+    the RPC subprocess exiting.
+    """
+
+    @pytest.fixture
+    def adapter(self, platform_config):
+        a = DeltaChatAdapter(platform_config)
+        a.account_id = 1
+        a.rpc = AsyncMock()
+        a._transport = MagicMock()
+        a._transport.process.poll.return_value = None  # alive by default
+        return a
 
     @pytest.mark.asyncio
-    async def test_supervisor_restarts_after_crash(self, platform_config):
-        """Test that the supervisor restarts the listener after a crash."""
-        adapter = DeltaChatAdapter(platform_config)
-        adapter._running = True
-        call_count = 0
+    async def test_transient_error_retries_and_does_not_escalate(self, adapter):
+        adapter._mark_connected()
+        calls = []
 
-        async def fake_listener():
-            nonlocal call_count
-            call_count += 1
-            if call_count < 2:
-                raise RuntimeError("boom")
-            adapter._running = False
+        async def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise OSError("transient")
+            adapter._running = False  # deliberate stop so the test terminates
+            raise asyncio.CancelledError()
 
-        adapter._event_listener = fake_listener
-        await adapter._event_supervisor()
+        adapter.rpc.get_next_event = AsyncMock(side_effect=flaky)
+        with patch("asyncio.sleep", AsyncMock()):
+            await adapter._event_listener()
 
-        assert call_count == 2
-        assert adapter._stats.get("event_listener_crashes") == 1
+        assert len(calls) == 3
+        assert adapter.has_fatal_error is False
+        assert adapter._stats.get("event_listener_errors") == 2
 
     @pytest.mark.asyncio
-    async def test_supervisor_gives_up_after_three_crashes(self, platform_config):
-        """Test that the supervisor stops after 3 crashes in 60 seconds."""
-        adapter = DeltaChatAdapter(platform_config)
-        adapter._running = True
-        adapter._mark_disconnected = Mock()
-        call_count = 0
+    async def test_dead_rpc_server_escalates_retryable(self, adapter):
+        adapter._mark_connected()
+        adapter._transport.process.poll.return_value = 1
+        adapter.rpc.get_next_event = AsyncMock(side_effect=OSError("disconnected"))
 
-        async def fake_listener():
-            nonlocal call_count
-            call_count += 1
-            raise RuntimeError("boom")
+        await asyncio.wait_for(adapter._event_listener(), timeout=1)
 
-        adapter._event_listener = fake_listener
-        adapter.disconnect = AsyncMock()
-        await adapter._event_supervisor()
+        # Exactly one poll: a second call is the one that would block forever.
+        assert adapter.rpc.get_next_event.await_count == 1
+        assert adapter.fatal_error_code == "rpc_server_died"
+        assert adapter.fatal_error_retryable is True
 
-        assert call_count == 3
-        assert adapter._running is False
-        assert adapter._stats.get("event_listener_crashes") == 3
+    @pytest.mark.asyncio
+    async def test_cancellation_while_connected_is_fatal(self, adapter):
+        """Cancelled without going through disconnect() -> we are deaf."""
+        adapter._mark_connected()
+        adapter.rpc.get_next_event = AsyncMock(side_effect=asyncio.CancelledError())
+
+        await adapter._event_listener()
+
+        assert adapter.fatal_error_code == "event_listener_stopped"
+        assert adapter.fatal_error_retryable is True
+
+    @pytest.mark.asyncio
+    async def test_gateway_handler_is_notified(self, adapter):
+        adapter._mark_connected()
+        handler = AsyncMock()
+        adapter.set_fatal_error_handler(handler)
+        adapter.rpc.get_next_event = AsyncMock(side_effect=asyncio.CancelledError())
+
+        await adapter._event_listener()
+        await asyncio.sleep(0)  # the notify is fired as its own task
+
+        handler.assert_awaited_once_with(adapter)
+
+    @pytest.mark.asyncio
+    async def test_deliberate_disconnect_does_not_escalate(self, adapter):
+        adapter._mark_connected()
+        adapter._cleanup()  # clears is_connected, as a real disconnect would
+
+        await adapter._event_listener()
+
+        assert adapter.has_fatal_error is False
+
+    @pytest.mark.asyncio
+    async def test_no_self_restart(self, adapter):
+        adapter._mark_connected()
+        adapter.rpc.get_next_event = AsyncMock(side_effect=asyncio.CancelledError())
+
+        await adapter._event_listener()
+        for _ in range(5):
+            await asyncio.sleep(0)  # give any unwanted restart task a chance
+
+        assert adapter.rpc.get_next_event.await_count == 1
+
+
+class TestListenerDoneCallback:
+    def test_exception_is_retrieved_and_logged(self, caplog):
+        task = MagicMock()
+        task.cancelled.return_value = False
+        task.exception.return_value = RuntimeError("listener blew up")
+
+        with caplog.at_level("ERROR"):
+            DeltaChatAdapter._on_listener_done(task)
+
+        task.exception.assert_called_once()
+        assert "listener blew up" in caplog.text
+
+    def test_cancellation_is_not_an_error(self, caplog):
+        task = MagicMock()
+        task.cancelled.return_value = True
+
+        with caplog.at_level("ERROR"):
+            DeltaChatAdapter._on_listener_done(task)
+
+        task.exception.assert_not_called()
 
 
 class TestOnboarding:
