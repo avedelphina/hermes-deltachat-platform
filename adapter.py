@@ -1372,7 +1372,6 @@ class DeltaChatAdapter(BasePlatformAdapter):
                     self.account_id,
                     {"addr": self._email, "password": self._password},
                 )
-                await rpc.configure(self.account_id)
             else:
                 await self._create_chatmail_account(rpc)
             return True
@@ -1387,10 +1386,10 @@ class DeltaChatAdapter(BasePlatformAdapter):
         for server in servers:
             logger.info("Trying chatmail server %s", server)
             try:
-                await rpc.set_config_from_qr(
+                # Delta Chat 2.59 deprecated the legacy configure-after-QR flow.
+                await rpc.add_transport_from_qr(
                     self.account_id, f"DCACCOUNT:https://{server}/new"
                 )
-                await rpc.configure(self.account_id)
                 addr = await rpc.get_config(self.account_id, "addr")
                 logger.info("Chatmail account ready: %s", addr)
                 return

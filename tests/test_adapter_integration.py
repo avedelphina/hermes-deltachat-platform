@@ -983,18 +983,16 @@ class TestOnboarding:
         mock_rpc.get_all_accounts = AsyncMock(return_value=[])
         mock_rpc.add_account = AsyncMock(return_value=3)
         mock_rpc.set_config = AsyncMock()
-        mock_rpc.set_config_from_qr = AsyncMock()
-        mock_rpc.configure = AsyncMock()
+        mock_rpc.add_transport_from_qr = AsyncMock()
         mock_rpc.get_config = AsyncMock(return_value="bot@nine.testrun.org")
 
         result = await adapter._configure_account(mock_rpc)
 
         assert result is True
         assert adapter.account_id == 3
-        mock_rpc.set_config_from_qr.assert_awaited_once_with(
+        mock_rpc.add_transport_from_qr.assert_awaited_once_with(
             3, "DCACCOUNT:https://nine.testrun.org/new"
         )
-        mock_rpc.configure.assert_awaited_once_with(3)
 
     @pytest.mark.asyncio
     async def test_configure_account_chatmail_fallback_servers(
@@ -1008,20 +1006,18 @@ class TestOnboarding:
         mock_rpc.get_all_accounts = AsyncMock(return_value=[])
         mock_rpc.add_account = AsyncMock(return_value=4)
         mock_rpc.set_config = AsyncMock()
-        mock_rpc.set_config_from_qr = AsyncMock(
+        mock_rpc.add_transport_from_qr = AsyncMock(
             side_effect=[RuntimeError("first down"), None]
         )
-        mock_rpc.configure = AsyncMock()
         mock_rpc.get_config = AsyncMock(return_value="bot@second.example.org")
 
         result = await adapter._configure_account(mock_rpc)
 
         assert result is True
         assert adapter.account_id == 4
-        assert mock_rpc.set_config_from_qr.await_count == 2
-        second_call = mock_rpc.set_config_from_qr.await_args_list[1]
+        assert mock_rpc.add_transport_from_qr.await_count == 2
+        second_call = mock_rpc.add_transport_from_qr.await_args_list[1]
         assert second_call.args == (4, "DCACCOUNT:https://second.example.org/new")
-        mock_rpc.configure.assert_awaited_once_with(4)
 
     @pytest.mark.asyncio
     async def test_configure_account_chatmail_all_servers_fail(
@@ -1035,8 +1031,7 @@ class TestOnboarding:
         mock_rpc.get_all_accounts = AsyncMock(return_value=[])
         mock_rpc.add_account = AsyncMock(return_value=5)
         mock_rpc.set_config = AsyncMock()
-        mock_rpc.set_config_from_qr = AsyncMock(side_effect=RuntimeError("down"))
-        mock_rpc.configure = AsyncMock()
+        mock_rpc.add_transport_from_qr = AsyncMock(side_effect=RuntimeError("down"))
 
         with pytest.raises(RuntimeError):
             await adapter._configure_account(mock_rpc)
