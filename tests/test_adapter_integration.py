@@ -910,14 +910,20 @@ class TestOnboarding:
         mock_rpc.set_config.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_configure_account_reuses_existing_account(
+    async def test_configure_account_reuses_configured_existing_account(
         self, platform_config, mock_rpc
     ):
-        """_configure_account reuses the first existing account."""
+        """_configure_account reuses an existing account with a self address."""
         adapter = DeltaChatAdapter(platform_config)
         mock_rpc.get_all_accounts = AsyncMock(return_value=[{"id": 7}])
         mock_rpc.set_config = AsyncMock()
-        mock_rpc.get_config = AsyncMock(return_value="")
+        mock_rpc.get_config = AsyncMock(
+            side_effect=lambda account_id, key: {
+                "addr": "bot@example.com",
+                "displayname": "TestBot",
+                "bot": "1",
+            }.get(key)
+        )
 
         result = await adapter._configure_account(mock_rpc)
 
@@ -925,9 +931,33 @@ class TestOnboarding:
         assert adapter.account_id == 7
         mock_rpc.get_all_accounts.assert_awaited_once()
         mock_rpc.add_account.assert_not_called()
+        mock_rpc.remove_account.assert_not_called()
         calls = [c.args for c in mock_rpc.set_config.await_args_list]
         assert (7, "displayname", adapter._display_name) in calls
         assert (7, "bot", "1") in calls
+
+    @pytest.mark.asyncio
+    async def test_configure_account_recreates_incomplete_existing_account(
+        self, platform_config, mock_rpc
+    ):
+        """An account without a self address is removed and reprovisioned."""
+        adapter = DeltaChatAdapter(platform_config)
+        mock_rpc.get_all_accounts = AsyncMock(return_value=[{"id": 7}])
+        mock_rpc.get_config = AsyncMock(return_value="")
+        mock_rpc.remove_account = AsyncMock()
+        mock_rpc.add_account = AsyncMock(return_value=8)
+        mock_rpc.set_config = AsyncMock()
+        mock_rpc.add_transport_from_qr = AsyncMock()
+
+        result = await adapter._configure_account(mock_rpc)
+
+        assert result is True
+        assert adapter.account_id == 8
+        mock_rpc.remove_account.assert_awaited_once_with(7)
+        mock_rpc.add_account.assert_awaited_once()
+        mock_rpc.add_transport_from_qr.assert_awaited_once_with(
+            8, "DCACCOUNT:https://nine.testrun.org/new"
+        )
 
     @pytest.mark.asyncio
     async def test_configure_account_manual_email_password(
@@ -983,18 +1013,16 @@ class TestOnboarding:
         mock_rpc.get_all_accounts = AsyncMock(return_value=[])
         mock_rpc.add_account = AsyncMock(return_value=3)
         mock_rpc.set_config = AsyncMock()
-        mock_rpc.set_config_from_qr = AsyncMock()
-        mock_rpc.configure = AsyncMock()
+        mock_rpc.add_transport_from_qr = AsyncMock()
         mock_rpc.get_config = AsyncMock(return_value="bot@nine.testrun.org")
 
         result = await adapter._configure_account(mock_rpc)
 
         assert result is True
         assert adapter.account_id == 3
-        mock_rpc.set_config_from_qr.assert_awaited_once_with(
+        mock_rpc.add_transport_from_qr.assert_awaited_once_with(
             3, "DCACCOUNT:https://nine.testrun.org/new"
         )
-        mock_rpc.configure.assert_awaited_once_with(3)
 
     @pytest.mark.asyncio
     async def test_configure_account_chatmail_fallback_servers(
@@ -1008,20 +1036,18 @@ class TestOnboarding:
         mock_rpc.get_all_accounts = AsyncMock(return_value=[])
         mock_rpc.add_account = AsyncMock(return_value=4)
         mock_rpc.set_config = AsyncMock()
-        mock_rpc.set_config_from_qr = AsyncMock(
+        mock_rpc.add_transport_from_qr = AsyncMock(
             side_effect=[RuntimeError("first down"), None]
         )
-        mock_rpc.configure = AsyncMock()
         mock_rpc.get_config = AsyncMock(return_value="bot@second.example.org")
 
         result = await adapter._configure_account(mock_rpc)
 
         assert result is True
         assert adapter.account_id == 4
-        assert mock_rpc.set_config_from_qr.await_count == 2
-        second_call = mock_rpc.set_config_from_qr.await_args_list[1]
+        assert mock_rpc.add_transport_from_qr.await_count == 2
+        second_call = mock_rpc.add_transport_from_qr.await_args_list[1]
         assert second_call.args == (4, "DCACCOUNT:https://second.example.org/new")
-        mock_rpc.configure.assert_awaited_once_with(4)
 
     @pytest.mark.asyncio
     async def test_configure_account_chatmail_all_servers_fail(
@@ -1035,8 +1061,7 @@ class TestOnboarding:
         mock_rpc.get_all_accounts = AsyncMock(return_value=[])
         mock_rpc.add_account = AsyncMock(return_value=5)
         mock_rpc.set_config = AsyncMock()
-        mock_rpc.set_config_from_qr = AsyncMock(side_effect=RuntimeError("down"))
-        mock_rpc.configure = AsyncMock()
+        mock_rpc.add_transport_from_qr = AsyncMock(side_effect=RuntimeError("down"))
 
         with pytest.raises(RuntimeError):
             await adapter._configure_account(mock_rpc)

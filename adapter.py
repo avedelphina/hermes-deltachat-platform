@@ -1348,13 +1348,24 @@ class DeltaChatAdapter(BasePlatformAdapter):
         accounts = await rpc.get_all_accounts()
         if accounts:
             self.account_id = accounts[0]["id"]
-            logger.info("Using existing Delta Chat account: %s", self.account_id)
-            await self._apply_profile(rpc, self.account_id)
-            # Existing accounts do not need the configured password.
-            self._password = None
-            return True
+            addr = await rpc.get_config(self.account_id, "addr")
+            if addr:
+                logger.info("Using existing Delta Chat account: %s", self.account_id)
+                await self._apply_profile(rpc, self.account_id)
+                # Existing accounts do not need the configured password.
+                self._password = None
+                return True
 
-        logger.info("No Delta Chat account found; creating one")
+            # A cancelled provisioning run leaves an account record without a
+            # transport or address. It cannot become valid merely by reconnecting.
+            logger.warning(
+                "Removing incomplete Delta Chat account %s before reprovisioning",
+                self.account_id,
+            )
+            await rpc.remove_account(self.account_id)
+            self.account_id = None
+
+        logger.info("No usable Delta Chat account found; creating one")
         account_id = await rpc.add_account()
         if isinstance(account_id, dict):
             account_id = account_id.get("id", account_id.get("account_id"))
@@ -1372,7 +1383,6 @@ class DeltaChatAdapter(BasePlatformAdapter):
                     self.account_id,
                     {"addr": self._email, "password": self._password},
                 )
-                await rpc.configure(self.account_id)
             else:
                 await self._create_chatmail_account(rpc)
             return True
@@ -1387,10 +1397,10 @@ class DeltaChatAdapter(BasePlatformAdapter):
         for server in servers:
             logger.info("Trying chatmail server %s", server)
             try:
-                await rpc.set_config_from_qr(
+                # Delta Chat 2.59 deprecated the legacy configure-after-QR flow.
+                await rpc.add_transport_from_qr(
                     self.account_id, f"DCACCOUNT:https://{server}/new"
                 )
-                await rpc.configure(self.account_id)
                 addr = await rpc.get_config(self.account_id, "addr")
                 logger.info("Chatmail account ready: %s", addr)
                 return
