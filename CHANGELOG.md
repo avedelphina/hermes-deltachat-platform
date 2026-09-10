@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.7] - 2026-09-10
+
+### Fixed
+- Chatmail account provisioning now uses Delta Chat 2.59's atomic
+  `add_transport_from_qr()` instead of the deprecated
+  `set_config_from_qr()` + `configure()` pair. On DC core 2.59 the legacy
+  `configure()` RPC stayed pending until the gateway's 30s platform
+  timeout, leaving a configured IMAP login but no self address. The
+  redundant explicit-email `configure()` call was dropped for the same
+  reason.
+- `_setup_account` now checks `get_config(addr)` on the reused account. A
+  cancelled provisioning run leaves an account record with no transport
+  and no address; it cannot recover by reconnecting, so it is removed with
+  `remove_account()` and reprovisioned instead of being adopted as-is.
+
+### Tests
+- `tests/test_adapter_integration.py`: updated for the new RPC sequence
+  (`add_transport_from_qr`, no trailing `configure`) and added the
+  incomplete-account reprovision path.
+
 ## [1.7.6] - 2026-08-31
 
 ### Changed
