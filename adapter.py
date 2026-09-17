@@ -2253,10 +2253,35 @@ class DeltaChatAdapter(BasePlatformAdapter):
             # definition, so "someone else chiming in" can never happen —
             # from_id never changes and the streak would only grow, tripping
             # permanently with no way to recover. Restrict to groups.
-            if chat_type == "group":
+            #
+            # A DC "Group" with only one other member (e.g. a solo-topic
+            # group like "Household" created for a single human) has the
+            # identical problem: that one member is structurally the only
+            # possible sender, so a same-sender streak can never be broken
+            # by "someone else chiming in" and, once tripped, never
+            # recovers — permanently and silently. Treat it like a DM.
+            roster = (
+                await self._get_group_roster(chat_id) if chat_type == "group" else None
+            )
+            guards_apply = chat_type == "group" and roster is not None and len(roster) > 1
+            if guards_apply:
                 should_process, should_warn = self._check_loop_guard(chat_id, from_id)
                 if not should_process:
                     self._bump_stat("loop_guard_tripped")
+                    if should_warn:
+                        # Unconditional (unlike the in-chat notice below): with
+                        # send_rejection_replies=false this WARNING is the only
+                        # trace a trip ever leaves — the guard can stay
+                        # permanently tripped in a multi-member group whose
+                        # other members simply go quiet for a while, and that
+                        # is otherwise indistinguishable from a silent outage.
+                        logger.warning(
+                            "loop_guard tripped in chat %s: sender %s hit "
+                            "max_consecutive_replies=%d with no other participant "
+                            "chiming in; further messages from them here are "
+                            "dropped until someone else speaks",
+                            chat_id, from_id, self._max_consecutive_replies,
+                        )
                     if should_warn and self._send_rejection_replies:
                         await self.send(
                             str(chat_id),
@@ -2271,6 +2296,15 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 )
                 if not should_process:
                     self._bump_stat("bot_exchange_guard_tripped")
+                    if should_warn:
+                        # See the loop_guard WARNING above — same silent-forever
+                        # risk when send_rejection_replies=false.
+                        logger.warning(
+                            "bot_exchange_guard tripped in chat %s: max_bot_exchanges=%d "
+                            "hit with no DELTACHAT_HUMAN_USERS check-in; further "
+                            "non-human messages here are dropped until one checks in",
+                            chat_id, self._max_bot_exchanges,
+                        )
                     if should_warn and self._send_rejection_replies:
                         await self.send(
                             str(chat_id),
@@ -2327,10 +2361,6 @@ class DeltaChatAdapter(BasePlatformAdapter):
                     self.rpc, self.account_id, int(chat_id)
                 )
                 text_with_token = f"{text}\n[dc:chat={token}]"
-
-            roster = (
-                await self._get_group_roster(chat_id) if chat_type == "group" else None
-            )
 
             # Build and handle message event
             message_event = MessageEvent(

@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.8] - 2026-09-16
+
+### Fixed
+- The bot-loop and bot-exchange guards no longer trip in a DC "Group" that
+  has only one other member (e.g. a solo-topic group like "Household"
+  created for a single human). That one member is structurally the only
+  possible sender, identical to a DM, so the guards' "stops once someone
+  else chimes in" recovery path could never fire — a tripped guard there
+  went permanently, silently dark (worse still with
+  `send_rejection_replies: false`, which drops even the one-time notice).
+  `_handle_incoming_message` now fetches the group roster before running
+  either guard and skips both when it has one or zero other members
+  (avedelphina/hermes-deltachat-platform#2).
+- Both guards now log a WARNING the first time a streak trips, regardless
+  of `send_rejection_replies`. A group with 2+ members can still trip
+  permanently if the *other* members simply go quiet for a while (they
+  don't have to be silent forever, just quiet long enough for one sender
+  to cross the threshold) — previously that left zero trace anywhere with
+  `send_rejection_replies: false`, indistinguishable from a silent outage.
+
+### Tests
+- `tests/test_adapter_integration.py`: `test_loop_guard_still_trips_in_group`
+  now mocks a real multi-member roster so the guard still applies where
+  intended; added `test_loop_guard_does_not_trip_in_solo_member_group`
+  covering the new skip path.
+
 ## [1.7.6] - 2026-08-31
 
 ### Changed

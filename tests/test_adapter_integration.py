@@ -1074,6 +1074,9 @@ class TestLoopGuardChatScope:
             return_value={"chat_type": "Group", "name": "Test Group"}
         )
         mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+        # Two other members besides self — a real multi-party group, so the
+        # guard's "someone else could chime in" assumption actually holds.
+        mock_rpc.get_chat_contacts = AsyncMock(return_value=[1, 11, 12])
 
         await self._send_n_messages(adapter, chat_id=1, n=10)
 
@@ -1081,6 +1084,80 @@ class TestLoopGuardChatScope:
         # through; the 3rd trips the guard and it stays tripped (same
         # from_id every time in this test), so the rest are dropped.
         assert adapter.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_loop_guard_trip_logs_warning_even_without_rejection_replies(
+        self, platform_config, mock_rpc, caplog
+    ):
+        """A tripped guard must leave a trace even with send_rejection_replies=false,
+
+        or a genuinely multi-member group whose other members just go quiet
+        for a while trips permanently with zero evidence anywhere (#2)."""
+        platform_config.extra = {
+            "max_consecutive_replies": 2,
+            "send_rejection_replies": False,
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "hello there",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+        mock_rpc.get_chat_contacts = AsyncMock(return_value=[1, 11, 12])
+
+        with caplog.at_level("WARNING"):
+            await self._send_n_messages(adapter, chat_id=1, n=5)
+
+        adapter.send.assert_not_called()
+        assert any("loop_guard tripped" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_loop_guard_does_not_trip_in_solo_member_group(
+        self, platform_config, mock_rpc
+    ):
+        """A DC 'Group' with only one other member (e.g. a solo-topic group
+
+        created for a single human) is structurally identical to a DM for
+        loop-guard purposes: that one member is the only possible sender, so
+        "someone else chiming in" can never happen and a trip would be
+        permanent. Regression for the "Household" group going silent forever
+        after ~20 messages from its one human member (#2).
+        """
+        platform_config.extra = {"max_consecutive_replies": 2}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "hello there",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Household"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+        # Only self (contact 1) and one human (contact 11) — roster (which
+        # excludes self) has a single member.
+        mock_rpc.get_chat_contacts = AsyncMock(return_value=[1, 11])
+
+        await self._send_n_messages(adapter, chat_id=13, n=10)
+
+        assert adapter.handle_message.await_count == 10
+        adapter.send.assert_not_called()
 
 
 class TestMetadata:
