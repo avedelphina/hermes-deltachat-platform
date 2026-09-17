@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.10] - 2026-09-17
+
+### Fixed
+- `docs/version-compatibility.md` and `_check_dc_version`'s docstring named
+  the RPC key as `deltachat_version`; the real key (confirmed against a
+  live `deltachat-rpc-server`) is `deltachat_core_version`, and the value
+  carries a leading `v`. Also documents the existing fail-closed behavior
+  on an undeterminable version. Pulled from upstream
+  (Simon-Laux/hermes-deltachat-platform@1245bfc), which had already
+  ported the fail-closed fix itself back from this fork's v1.4.1.
+
 ## [1.7.9] - 2026-09-17
 
 ### Fixed
