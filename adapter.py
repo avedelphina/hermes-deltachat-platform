@@ -2727,7 +2727,20 @@ class DeltaChatAdapter(BasePlatformAdapter):
         token = await _get_or_create_chat_token(self.rpc, self.account_id, int(chat_id))
 
         caption = msg.get("text", "") or ""
-        if not await self._check_mention(caption, chat_type, chat_id):
+        # Same implicit-mention exemption as the text path: a quote-reply to
+        # one of this bot's own messages continues the thread under
+        # require_mention even with no @mention in the caption — e.g.
+        # sending a screenshot in reply to what the bot just said. Without
+        # this, every such image/file quote-reply in a mention-gated group
+        # was silently dropped while the equivalent text quote-reply worked.
+        quote = msg.get("quote") or {}
+        is_with_message = quote.get("kind") == "WithMessage"
+        is_reply_to_self = is_with_message and await self._quote_is_self_authored(
+            quote
+        )
+        if not is_reply_to_self and not await self._check_mention(
+            caption, chat_type, chat_id
+        ):
             return
 
         roster = await self._get_group_roster(chat_id) if chat_type == "group" else None

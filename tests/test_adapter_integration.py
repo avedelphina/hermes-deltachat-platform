@@ -1220,6 +1220,56 @@ class TestMentions:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_reply_to_own_message_is_implicit_mention_for_image(
+        self, platform_config, mock_rpc, group_event
+    ):
+        """The text path exempts a quote-reply to the bot's own message from
+
+        mention-gating (see test_reply_to_own_message_is_implicit_mention);
+        the image/file path went through a separate code path
+        (_handle_non_text_message) that lacked this exemption entirely, so an
+        image sent as a quote-reply to the bot in a mention-gated group (e.g.
+        "here's a screenshot of what you just said") was silently dropped
+        even though the equivalent text reply worked. Regression for OCEAN
+        Support ignoring image replies."""
+        platform_config.extra = {
+            "require_mention": "false",
+            "display_name": "Alice",
+            "require_mention_channels": "1",
+        }
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            side_effect=[
+                {
+                    "text": "here's what you just said",
+                    "view_type": "Image",
+                    "from_id": 11,
+                    "file": "/tmp/photo.jpg",
+                    "file_mime": "image/jpeg",
+                    "quote": {
+                        "kind": "WithMessage",
+                        "text": "shall I proceed?",
+                        "message_id": 99,
+                        "author_display_name": "Me",
+                    },
+                },
+                {"from_id": 1, "text": "shall I proceed?"},
+            ]
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "OCEAN Support"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+        adapter._resolve_blob_path = lambda x: x
+        adapter._copy_to_hermes_cache = lambda src, kind: src
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_default_free_response_processes_unmentioned_group_message(
         self, platform_config, mock_rpc, group_event
     ):
