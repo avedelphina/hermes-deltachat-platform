@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.9] - 2026-09-17
+
+### Fixed
+- An image/file/voice message sent as a quote-reply to the bot's own
+  message in a mention-gated group (`require_mention`/
+  `require_mention_channels`) was silently dropped, even though the
+  equivalent *text* quote-reply worked. `_handle_incoming_message` (text
+  path) already treats a quote-reply to the bot's own message as an
+  implicit mention via `_quote_is_self_authored`, but
+  `_handle_non_text_message` — the separate path for images, files, and
+  voice/audio — checked the caption against `_check_mention` with no such
+  exemption. Real-world case: sending a screenshot in reply to what the
+  bot just said in a mention-gated group (e.g. "OCEAN Support") never got
+  a response. `_handle_non_text_message` now runs the same quote check
+  before the mention gate.
+
+### Tests
+- `tests/test_adapter_integration.py`: added
+  `test_reply_to_own_message_is_implicit_mention_for_image`.
+- `tests/conftest.py`: `MockMessageType` was missing `PHOTO` (the adapter
+  sends images as `MessageType.PHOTO`, not `IMAGE`) and `MockMessageEvent`
+  was missing `media_urls`/`media_types` — no prior test exercised a
+  non-text message actually reaching `handle_message()`, only the gating
+  logic that stops before it.
+
 ## [1.7.8] - 2026-09-16
 
 ### Fixed

@@ -22,6 +22,7 @@ class MockMessageType(Enum):
     TEXT = "text"
     FILE = "file"
     IMAGE = "image"
+    PHOTO = "photo"
     AUDIO = "audio"
     VOICE = "voice"
     STICKER = "sticker"
@@ -59,6 +60,8 @@ class MockMessageEvent:
     source: MockSource
     message_id: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+    media_urls: list = field(default_factory=list)
+    media_types: list = field(default_factory=list)
 
 
 class MockPlatform(Enum):
