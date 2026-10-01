@@ -934,7 +934,8 @@ class TestOnboarding:
         mock_rpc.remove_account.assert_not_called()
         calls = [c.args for c in mock_rpc.set_config.await_args_list]
         assert (7, "displayname", adapter._display_name) in calls
-        assert (7, "bot", "1") in calls
+        # why: bot is already "1", and _apply_profile skips unchanged values.
+        assert (7, "bot", "1") not in calls
 
     @pytest.mark.asyncio
     async def test_configure_account_recreates_incomplete_existing_account(
@@ -973,7 +974,6 @@ class TestOnboarding:
         mock_rpc.add_account = AsyncMock(return_value=2)
         mock_rpc.set_config = AsyncMock()
         mock_rpc.add_or_update_transport = AsyncMock()
-        mock_rpc.configure = AsyncMock()
 
         result = await adapter._configure_account(mock_rpc)
 
@@ -983,7 +983,6 @@ class TestOnboarding:
         mock_rpc.add_or_update_transport.assert_awaited_once_with(
             2, {"addr": "bot@example.com", "password": "secret"}
         )
-        mock_rpc.configure.assert_awaited_once_with(2)
         assert adapter._password is None
 
     @pytest.mark.asyncio
@@ -999,8 +998,10 @@ class TestOnboarding:
         mock_rpc.get_all_accounts = AsyncMock(return_value=[])
         mock_rpc.add_account = AsyncMock(return_value=2)
         mock_rpc.set_config = AsyncMock()
-        mock_rpc.add_or_update_transport = AsyncMock()
-        mock_rpc.configure = AsyncMock(side_effect=RuntimeError("configure failed"))
+        # why: DC 2.59+ configures as part of add_or_update_transport.
+        mock_rpc.add_or_update_transport = AsyncMock(
+            side_effect=RuntimeError("configure failed")
+        )
 
         with pytest.raises(RuntimeError, match="configure failed"):
             await adapter._configure_account(mock_rpc)

@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.9.0] - 2026-10-01
+
+### Added
+- `standalone_sender_fn`: `hermes send` and headless cron can deliver to Delta
+  Chat without a running gateway. It starts a short-lived `deltachat-rpc-server`,
+  waits for server-side delivery, then closes it. If the gateway holds the
+  database (`accounts.lock`), it returns a retryable error instead of opening a
+  second writer. Supports text, `media_files` and `force_document`;
+  `thread_id` is ignored (Delta Chat has no threads).
+
+### Fixed
+- webxdc-converter skill no longer hardcodes `/workspace/` in its copy-paste
+  snippets, which failed on non-Docker deployments where that path does not
+  exist (upstream #3). Snippets are cwd-relative; only the `MEDIA:` line uses
+  an absolute path.
+
 ## [1.8.0] - 2026-09-27
 
 ### Changed

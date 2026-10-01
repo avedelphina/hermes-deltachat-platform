@@ -103,6 +103,8 @@ From there you can schedule daily briefings, reminders, or any recurring task �
 
 Proactive sends aren't limited to text: the AI can write a file (e.g. a `.md` report) to its working directory and push it as an attachment via the `dc_send_message` tool's `file_path` parameter, with the message text becoming the caption. Works both in the Docker sandbox (`/workspace/`) and on non-Docker deployments (any absolute host path).
 
+Standalone delivery: `hermes send --platform deltachat-platform ...` and headless cron jobs can deliver without a running gateway. The plugin starts a short-lived `deltachat-rpc-server`, waits until the server has the message, then exits. While the gateway is running it holds the account database lock, so a standalone send then fails with a retryable error — use `deliver: origin` through the gateway in that case. Delta Chat has no threads, so `thread_id` is ignored.
+
 ### Webxdc Mini-Apps
 Ask the AI to build a small interactive app (a game, a form, a calculator, a data viewer) and it delivers a `.xdc` file straight into the chat. The app runs locally inside Delta Chat — no server, no install. Built-in `webxdc-converter` skill handles the packaging.
 

@@ -2964,6 +2964,150 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     return result
 
 
+# Message.state values from deltachat-core (the OpenRPC spec types it as a bare int).
+_MSG_STATE_FAILED = 24
+_MSG_STATE_DELIVERED = 26
+_STANDALONE_DELIVERY_TIMEOUT = 60.0
+
+
+async def _wait_delivered(adapter: "DeltaChatAdapter", msg_ids: list) -> Optional[str]:
+    """Poll until every message left the outbox; return an error string or None.
+
+    why: send_msg only queues. Closing the RPC server before SMTP finishes would
+    drop the message, so a short-lived sender must wait for OutDelivered.
+    """
+    deadline = time.monotonic() + _STANDALONE_DELIVERY_TIMEOUT
+    pending = set(msg_ids)
+    while pending:
+        for mid in list(pending):
+            msg = await adapter.rpc.get_message(adapter.account_id, mid)
+            state = int(msg.get("state") or 0)
+            if state == _MSG_STATE_FAILED:
+                return "Delta Chat could not deliver the message"
+            if state >= _MSG_STATE_DELIVERED:
+                pending.discard(mid)
+        if pending:
+            if time.monotonic() > deadline:
+                return "timed out waiting for Delta Chat delivery (retryable)"
+            await asyncio.sleep(0.5)
+    return None
+
+
+async def _standalone_send(
+    pconfig,
+    chat_id,
+    message,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    caption=None,
+    **_ignored,
+) -> Dict[str, Any]:
+    """Send without a running gateway (``hermes send``, headless cron).
+
+    Opens a short-lived deltachat-rpc-server on the profile's accounts dir.
+    The core holds an exclusive ``accounts.lock``, so if the gateway is up the
+    second server exits at once; that is reported as a retryable error rather
+    than risking a second writer on the same database.
+    ``thread_id`` is ignored: Delta Chat has no threads.
+    """
+    result: Dict[str, Any] = {
+        "success": False,
+        "platform": "deltachat-platform",
+        "chat_id": str(chat_id),
+    }
+    if not _check_dc2_available():
+        result["error"] = "deltachat2 is not installed"
+        return result
+    try:
+        int(chat_id)
+    except (TypeError, ValueError):
+        result["error"] = f"invalid Delta Chat chat id: {chat_id!r}"
+        return result
+
+    # why: core passes the caption separately for captionable media sends.
+    message = message or caption or ""
+    files = list(media_files or [])
+    # Validate up front so a bad path fails before anything is sent.
+    for item in files:
+        path = item[0] if isinstance(item, (tuple, list)) else item
+        if not os.path.isfile(path) or not os.access(path, os.R_OK):
+            result["error"] = (
+                f"media file missing or unreadable: {os.path.basename(str(path))}"
+            )
+            return result
+
+    adapter = DeltaChatAdapter(pconfig)
+    try:
+        import deltachat2
+        from deltachat2.transport import IOTransport
+        from deltachat2.types import MessageViewtype
+
+        dc_accounts_path = adapter._get_dc_config_dir()
+        os.environ["DC_ACCOUNTS_PATH"] = dc_accounts_path
+        adapter._transport = IOTransport(
+            accounts_dir=dc_accounts_path, rpc_server=adapter._get_rpc_server_path()
+        )
+        adapter._transport.start()
+        adapter.rpc = _AsyncRpc(deltachat2.Rpc(adapter._transport))
+
+        try:
+            accounts = await adapter.rpc.get_all_accounts()
+        except Exception:
+            if adapter._rpc_server_exit_code() is not None:
+                result["error"] = (
+                    "Delta Chat database is in use by another process "
+                    "(is the gateway running?); retry later"
+                )
+                result["retryable"] = True
+                return result
+            raise
+        if not accounts:
+            result["error"] = "no Delta Chat account configured; run setup.py"
+            return result
+        adapter.account_id = accounts[0]["id"]
+        await adapter.rpc.start_io(adapter.account_id)
+
+        sent = []
+        if message and message.strip():
+            res = await adapter.send(str(chat_id), message)
+            if not res.success:
+                result["error"] = "Delta Chat send failed (see gateway log)"
+                return result
+            sent.append(res)
+        for item in files:
+            path = item[0] if isinstance(item, (tuple, list)) else item
+            fields = {"file": str(path), "text": ""}
+            if force_document:
+                fields["viewtype"] = MessageViewtype.FILE
+            res = await adapter._send_msg_data(
+                str(chat_id), "files", f"file {os.path.basename(str(path))}", **fields
+            )
+            if not res.success:
+                result["error"] = "Delta Chat send failed (see gateway log)"
+                return result
+            sent.append(res)
+        if not sent:
+            result["error"] = "nothing to send"
+            return result
+
+        ids = [int(r.message_id) for r in sent if r.message_id]
+        err = await _wait_delivered(adapter, ids)
+        if err:
+            result["error"] = err
+            return result
+        result.update(success=True, message_id=sent[-1].message_id)
+        return result
+    except Exception as e:
+        logger.error("Standalone Delta Chat send failed: %s", e)
+        # why: str(e) can echo paths/config; keep only the exception type.
+        result["error"] = f"Delta Chat send failed ({type(e).__name__})"
+        return result
+    finally:
+        adapter._cleanup()
+
+
 def register_platform(ctx):
     """Register Delta Chat platform adapter with Hermes."""
     ctx.register_platform(
@@ -2976,6 +3120,7 @@ def register_platform(ctx):
         env_enablement_fn=_env_enablement,
         apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="DELTACHAT_HOME_CHANNEL",
+        standalone_sender_fn=_standalone_send,
         # why: without these, gateway._is_user_authorized has no way to know
         # DELTACHAT_ALLOW_ALL_USERS/DELTACHAT_ALLOWED_USERS exist, and never
         # trusts our own dm_policy/group_policy: open as authorization (by
