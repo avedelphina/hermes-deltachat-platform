@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `standalone_sender_fn`: `hermes send` and headless cron can deliver to Delta
+  Chat without a running gateway. It starts a short-lived `deltachat-rpc-server`,
+  waits for server-side delivery, then closes it. If the gateway holds the
+  database (`accounts.lock`), it returns a retryable error instead of opening a
+  second writer. Supports text, `media_files` and `force_document`;
+  `thread_id` is ignored (Delta Chat has no threads).
+
 ## [1.8.0] - 2026-09-27
 
 ### Changed
