@@ -190,3 +190,31 @@ class TestFilterLocalDeliveryPaths:
 
         assert local_result == ["/home/user/report.pdf"]
         assert media_result == [("/home/user/app.xdc", False)]
+
+
+class TestNoHardcodedWorkspace:
+    """#3: non-Docker deployments have no /workspace and cannot create it."""
+
+    def test_platform_hint_points_at_cwd_not_workspace(self):
+        from unittest.mock import MagicMock
+
+        import adapter
+
+        ctx = MagicMock()
+        adapter.register_platform(ctx)
+        hint = ctx.register_platform.call_args.kwargs["platform_hint"]
+        assert "current working directory" in hint
+        assert "write output files to /workspace/" not in hint
+
+    def test_webxdc_skill_snippets_are_cwd_relative(self):
+        from pathlib import Path
+
+        skill = (
+            Path(__file__).parent.parent / "skills/webxdc-converter/SKILL.md"
+        ).read_text()
+        in_code = False
+        for line in skill.splitlines():
+            if line.startswith("```"):
+                in_code = not in_code
+            elif in_code and "MEDIA:" not in line:
+                assert "/workspace/" not in line, line

@@ -12,6 +12,12 @@ All notable changes to this project will be documented in this file.
   second writer. Supports text, `media_files` and `force_document`;
   `thread_id` is ignored (Delta Chat has no threads).
 
+### Fixed
+- webxdc-converter skill no longer hardcodes `/workspace/` in its copy-paste
+  snippets, which failed on non-Docker deployments where that path does not
+  exist (upstream #3). Snippets are cwd-relative; only the `MEDIA:` line uses
+  an absolute path.
+
 ## [1.8.0] - 2026-09-27
 
 ### Changed
