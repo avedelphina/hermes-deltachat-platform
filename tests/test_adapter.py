@@ -830,12 +830,13 @@ class TestPairingWithoutIsVerified:
     """dm_policy=pairing on a core that dropped Contact.is_verified (issue #6)."""
 
     @staticmethod
-    async def _gate(platform_config, mock_rpc, contact, is_request):
+    async def _gate(platform_config, mock_rpc, contact, marker="1", is_request=False):
         platform_config.extra = {"dm_policy": "pairing"}
         adapter = DeltaChatAdapter(platform_config)
         adapter.rpc, adapter.account_id = mock_rpc, 1
         adapter.send = AsyncMock()
         mock_rpc.get_contact = AsyncMock(return_value=contact)
+        mock_rpc.get_config = AsyncMock(return_value=marker)
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Single", "is_contact_request": is_request}
         )
@@ -843,42 +844,87 @@ class TestPairingWithoutIsVerified:
         return await adapter._gate_inbound(5, 1, 7)
 
     @pytest.mark.asyncio
-    async def test_securejoin_key_contact_accepted(self, platform_config, mock_rpc):
+    async def test_securejoin_marker_accepted(self, platform_config, mock_rpc):
         contact = {"address": "u@example.com", "is_key_contact": True}
-        assert await self._gate(platform_config, mock_rpc, contact, False) is True
+        assert await self._gate(platform_config, mock_rpc, contact) is True
+        mock_rpc.get_config.assert_awaited_once_with(1, "ui.hermes.paired.7")
 
     @pytest.mark.asyncio
-    async def test_plain_address_contact_rejected(self, platform_config, mock_rpc):
-        contact = {"address": "u@example.com", "is_key_contact": False}
-        assert await self._gate(platform_config, mock_rpc, contact, False) is False
-
-    @pytest.mark.asyncio
-    async def test_stranger_key_contact_request_rejected(
+    async def test_key_contact_in_accepted_chat_without_marker_rejected(
         self, platform_config, mock_rpc
     ):
+        # Existing accepted 1:1 with a stranger: key contact, not a request,
+        # but never completed SecureJoin against our invite.
         contact = {"address": "u@example.com", "is_key_contact": True}
-        assert await self._gate(platform_config, mock_rpc, contact, True) is False
+        assert await self._gate(platform_config, mock_rpc, contact, marker="") is False
+
+    @pytest.mark.asyncio
+    async def test_stranger_request_rejected(self, platform_config, mock_rpc):
+        contact = {"address": "u@example.com", "is_key_contact": True}
+        assert (
+            await self._gate(platform_config, mock_rpc, contact, "", is_request=True)
+            is False
+        )
         mock_rpc.accept_chat.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_explicit_is_verified_false_stays_authoritative(
+    async def test_is_verified_true_accepted_without_marker_or_key_flag(
         self, platform_config, mock_rpc
     ):
-        contact = {
-            "address": "u@example.com",
-            "is_verified": False,
-            "is_key_contact": True,
-        }
-        assert await self._gate(platform_config, mock_rpc, contact, False) is False
+        contact = {"address": "u@example.com", "is_verified": True}
+        assert await self._gate(platform_config, mock_rpc, contact, marker="") is True
+        mock_rpc.get_config.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_get_contact_failure_rejected(self, platform_config, mock_rpc):
+    async def test_explicit_is_verified_false_beats_marker(
+        self, platform_config, mock_rpc
+    ):
+        contact = {"address": "u@example.com", "is_verified": False}
+        assert await self._gate(platform_config, mock_rpc, contact) is False
+
+    @pytest.mark.asyncio
+    async def test_marker_read_failure_rejected(self, platform_config, mock_rpc):
+        contact = {"address": "u@example.com"}
         platform_config.extra = {"dm_policy": "pairing"}
         adapter = DeltaChatAdapter(platform_config)
         adapter.rpc, adapter.account_id = mock_rpc, 1
         adapter.send = AsyncMock()
-        mock_rpc.get_contact = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_rpc.get_contact = AsyncMock(return_value=contact)
+        mock_rpc.get_config = AsyncMock(side_effect=RuntimeError("boom"))
         mock_rpc.get_basic_chat_info = AsyncMock(
             return_value={"chat_type": "Single", "is_contact_request": False}
         )
         assert await adapter._gate_inbound(5, 1, 7) is False
+
+    @pytest.mark.asyncio
+    async def test_inviter_progress_records_marker(self, platform_config, mock_rpc):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        mock_rpc.set_config = AsyncMock()
+        await adapter._handle_dc_event(
+            {
+                "kind": "SecurejoinInviterProgress",
+                "contact_id": 7,
+                "chat_type": "Single",
+                "progress": 1000,
+            }
+        )
+        mock_rpc.set_config.assert_awaited_once_with(1, "ui.hermes.paired.7", "1")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "event",
+        [
+            {"contact_id": 7, "chat_type": "Group", "progress": 1000},
+            {"contact_id": 7, "chat_type": "Single", "progress": 600},
+            {"chat_type": "Single", "progress": 1000},
+        ],
+    )
+    async def test_inviter_progress_ignored_unless_complete_dm(
+        self, platform_config, mock_rpc, event
+    ):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        mock_rpc.set_config = AsyncMock()
+        await adapter._handle_dc_event({"kind": "SecurejoinInviterProgress", **event})
+        mock_rpc.set_config.assert_not_called()

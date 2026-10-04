@@ -1218,13 +1218,11 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
         sender_email = ""
         verified_field = None
-        is_key_contact = False
         if from_id:
             try:
                 contact = await self.rpc.get_contact(self.account_id, int(from_id))
                 sender_email = (contact.get("address") or "").lower()
                 verified_field = contact.get("is_verified")
-                is_key_contact = bool(contact.get("is_key_contact"))
             except Exception as e:
                 logger.debug("Could not fetch contact %s: %s", from_id, e)
 
@@ -1249,15 +1247,13 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
         if chat_type == "Single":
             # why: core >= 2.6x dropped Contact.is_verified, so the key is absent
-            # (None), not False. Only then fall back to "key contact in a chat that
-            # is not a pending request": SecureJoin opens the chat accepted, while
-            # a stranger's encrypted message arrives as a contact request. A
-            # present is_verified (older core) stays authoritative. Fail-closed.
-            is_paired = (
-                bool(verified_field)
-                if verified_field is not None
-                else is_key_contact and not is_request
-            )
+            # (None), not False. Only then require the SecureJoin-completion
+            # marker recorded by _record_securejoin_pairing. A present
+            # is_verified (older core) stays authoritative. Fail-closed.
+            if verified_field is not None:
+                is_paired = bool(verified_field)
+            else:
+                is_paired = bool(from_id) and await self._is_securejoin_paired(from_id)
             reason = self._check_dm(sender_email, is_paired)
             if reason:
                 logger.warning("dm_policy rejected %s", sender_email)
@@ -2329,8 +2325,46 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 )
         elif event_kind == EventType.INCOMING_CALL_ACCEPTED:
             logger.info("Incoming call accepted msg_id=%s", event.get("msg_id"))
+        elif event_kind == EventType.SECUREJOIN_INVITER_PROGRESS:
+            await self._record_securejoin_pairing(event)
         else:
             logger.debug(f"Unhandled event type: {event_kind}")
+
+    @staticmethod
+    def _paired_key(contact_id) -> str:
+        return f"ui.hermes.paired.{int(contact_id)}"
+
+    async def _record_securejoin_pairing(self, event: Dict[str, Any]) -> None:
+        """Persist that a contact completed SecureJoin against this account's invite.
+
+        why: core >= 2.6x no longer tracks Contact.is_verified, and
+        is_key_contact / accepted-chat state say nothing about SecureJoin. The
+        inviter-side completion event is the only proof the contact scanned our
+        QR, so remember it in a UI config key (survives restarts).
+        """
+        try:
+            if event.get("progress") != 1000 or event.get("chat_type") != "Single":
+                return
+            contact_id = event.get("contact_id")
+            if not contact_id:
+                return
+            await self.rpc.set_config(
+                self.account_id, self._paired_key(contact_id), "1"
+            )
+            logger.info("SecureJoin completed, paired contact %s", contact_id)
+        except Exception as e:
+            logger.warning("Could not record SecureJoin pairing: %s", e)
+
+    async def _is_securejoin_paired(self, contact_id) -> bool:
+        """True if SecureJoin completion was recorded for this contact. Fail-closed."""
+        try:
+            return (
+                await self.rpc.get_config(self.account_id, self._paired_key(contact_id))
+                == "1"
+            )
+        except Exception as e:
+            logger.warning("Could not read pairing marker for %s: %s", contact_id, e)
+            return False
 
     async def _handle_incoming_message(self, event: Dict[str, Any]) -> None:
         """Handle an incoming text message.
