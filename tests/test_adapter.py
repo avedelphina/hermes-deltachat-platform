@@ -824,3 +824,61 @@ class TestSharedHelpers:
 
         assert result.success is False and "boom" in result.error
         assert adapter._stats == {"files_send_failed": 1}
+
+
+class TestPairingWithoutIsVerified:
+    """dm_policy=pairing on a core that dropped Contact.is_verified (issue #6)."""
+
+    @staticmethod
+    async def _gate(platform_config, mock_rpc, contact, is_request):
+        platform_config.extra = {"dm_policy": "pairing"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        adapter.send = AsyncMock()
+        mock_rpc.get_contact = AsyncMock(return_value=contact)
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Single", "is_contact_request": is_request}
+        )
+        mock_rpc.accept_chat = AsyncMock()
+        return await adapter._gate_inbound(5, 1, 7)
+
+    @pytest.mark.asyncio
+    async def test_securejoin_key_contact_accepted(self, platform_config, mock_rpc):
+        contact = {"address": "u@example.com", "is_key_contact": True}
+        assert await self._gate(platform_config, mock_rpc, contact, False) is True
+
+    @pytest.mark.asyncio
+    async def test_plain_address_contact_rejected(self, platform_config, mock_rpc):
+        contact = {"address": "u@example.com", "is_key_contact": False}
+        assert await self._gate(platform_config, mock_rpc, contact, False) is False
+
+    @pytest.mark.asyncio
+    async def test_stranger_key_contact_request_rejected(
+        self, platform_config, mock_rpc
+    ):
+        contact = {"address": "u@example.com", "is_key_contact": True}
+        assert await self._gate(platform_config, mock_rpc, contact, True) is False
+        mock_rpc.accept_chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_explicit_is_verified_false_stays_authoritative(
+        self, platform_config, mock_rpc
+    ):
+        contact = {
+            "address": "u@example.com",
+            "is_verified": False,
+            "is_key_contact": True,
+        }
+        assert await self._gate(platform_config, mock_rpc, contact, False) is False
+
+    @pytest.mark.asyncio
+    async def test_get_contact_failure_rejected(self, platform_config, mock_rpc):
+        platform_config.extra = {"dm_policy": "pairing"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        adapter.send = AsyncMock()
+        mock_rpc.get_contact = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Single", "is_contact_request": False}
+        )
+        assert await adapter._gate_inbound(5, 1, 7) is False

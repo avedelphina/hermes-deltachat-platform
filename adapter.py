@@ -1217,12 +1217,14 @@ class DeltaChatAdapter(BasePlatformAdapter):
             return False
 
         sender_email = ""
-        is_verified = False
+        verified_field = None
+        is_key_contact = False
         if from_id:
             try:
                 contact = await self.rpc.get_contact(self.account_id, int(from_id))
                 sender_email = (contact.get("address") or "").lower()
-                is_verified = bool(contact.get("is_verified"))
+                verified_field = contact.get("is_verified")
+                is_key_contact = bool(contact.get("is_key_contact"))
             except Exception as e:
                 logger.debug("Could not fetch contact %s: %s", from_id, e)
 
@@ -1246,7 +1248,17 @@ class DeltaChatAdapter(BasePlatformAdapter):
         is_request = bool(chat.get("is_contact_request"))
 
         if chat_type == "Single":
-            reason = self._check_dm(sender_email, is_verified)
+            # why: core >= 2.6x dropped Contact.is_verified, so the key is absent
+            # (None), not False. Only then fall back to "key contact in a chat that
+            # is not a pending request": SecureJoin opens the chat accepted, while
+            # a stranger's encrypted message arrives as a contact request. A
+            # present is_verified (older core) stays authoritative. Fail-closed.
+            is_paired = (
+                bool(verified_field)
+                if verified_field is not None
+                else is_key_contact and not is_request
+            )
+            reason = self._check_dm(sender_email, is_paired)
             if reason:
                 logger.warning("dm_policy rejected %s", sender_email)
                 return await self._reject(chat_id, reason)
