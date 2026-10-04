@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.10.0] - 2026-10-04
+
+### Fixed
+- `dm_policy: pairing` works on Delta Chat core >= 2.6x, which removed
+  `Contact.is_verified` from the JSON-RPC API (core commit b1da53a). On those
+  cores the field comes back absent, and the adapter used to treat that as
+  unverified, so every DM was rejected even after a completed SecureJoin.
+  A contact now counts as paired only when this account has recorded a
+  completed SecureJoin against its own invite (`SecurejoinInviterProgress` at
+  progress 1000 for a 1:1 chat, stored as `ui.hermes.paired.<contact_id>`).
+  On older cores a present `is_verified` stays authoritative, including an
+  explicit false. Reading the contact or the marker fails closed.
+
 ## [1.9.0] - 2026-10-01
 
 ### Added
