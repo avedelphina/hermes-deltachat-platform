@@ -22,14 +22,18 @@ All Delta Chat platform settings are read from environment variables (or from `c
 
 ## Access control
 
+On/off settings: `1`, `true`, `yes` and `on` (any case) mean on. Every other value means off.
+
+The bot only answers senders that have a Delta Chat key. Plain email is dropped before any of the settings below apply.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DELTACHAT_ALLOW_ALL_USERS` | `false` | Set to `true` to allow anyone to use the bot. Overrides all per-sender checks. |
 | `DELTACHAT_ALLOWED_USERS` | — | Comma-separated email addresses allowed to use the bot. |
 | `DELTACHAT_DM_POLICY` | `pairing` | Direct-message policy: `open`, `allowlist`, `pairing` (verified contacts only), or `disabled`. |
-| `DELTACHAT_DM_ALLOWED_USERS` | — | Comma-separated emails allowed for `allowlist` DM policy. |
+| `DELTACHAT_DM_ALLOWED_USERS` | — | Comma-separated emails allowed for `allowlist` DM policy. If empty, `DELTACHAT_ALLOWED_USERS` applies. If that is empty too, nobody is allowed and the plugin refuses to start. |
 | `DELTACHAT_GROUP_POLICY` | `open` | Group-chat policy: `open`, `allowlist`, or `disabled`. |
-| `DELTACHAT_GROUP_ALLOWED_USERS` | — | Comma-separated emails allowed for `allowlist` group policy. |
+| `DELTACHAT_GROUP_ALLOWED_USERS` | — | Comma-separated emails allowed for `allowlist` group policy. Same fallback as `DELTACHAT_DM_ALLOWED_USERS`. |
 | `DELTACHAT_REQUIRE_MENTION` | `false` | In group chats, only respond to messages that mention the bot (`@DisplayName` or whole-word name). Applies to text and media captions. |
 | `DELTACHAT_FREE_RESPONSE_CHANNELS` | — | Comma-separated group chat IDs exempt from `DELTACHAT_REQUIRE_MENTION=true` — those groups always respond, no mention needed. |
 | `DELTACHAT_REQUIRE_MENTION_CHANNELS` | — | Comma-separated group chat IDs that stay mention-gated when `DELTACHAT_REQUIRE_MENTION=false` (the default) — inverse of `DELTACHAT_FREE_RESPONSE_CHANNELS`. Use this to keep most groups conversational while a specific noisy support/ops group requires `@DisplayName`. |

@@ -5,7 +5,7 @@
 When the AI sends an image by URL, the adapter downloads it before forwarding it to Delta Chat. The following restrictions apply:
 
 - **Scheme**: only `http://` and `https://` URLs are accepted.
-- **Target**: URLs that resolve to loopback, private or link-local addresses are refused. Hermes' own URL policy decides when available, so its `allow_private_urls` setting is honoured.
+- **Target**: URLs that resolve to loopback, private or link-local addresses are refused. Hermes' own URL policy decides when available, so its `security.allow_private_urls` setting is honoured.
 - **Redirects**: `httpx` is configured with `follow_redirects=False` to avoid open-redirect issues.
 - **Size limit**: downloads are bounded to **25 MiB** by both the `Content-Length` header and the streamed response size.
 - **Content-Type**: the response must declare `image/*`; non-image responses are rejected.

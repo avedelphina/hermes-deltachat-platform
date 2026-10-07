@@ -100,6 +100,29 @@ ls -la ~/.hermes/deltachat/
 
 **Fix:** See [docs/UPGRADING.md](UPGRADING.md) — two `config.yaml` key renames plus a one-time migration script for existing chat sessions, for whichever transition applies to you.
 
+## Plugin Refuses to Start After an Upgrade
+
+**Symptom:** the gateway log shows `Platform 'Delta Chat' config validation error: DELTACHAT_DM_POLICY is 'allowlist' but neither DELTACHAT_DM_ALLOWED_USERS nor DELTACHAT_ALLOWED_USERS names anyone` (or the same for `GROUP`).
+
+**Cause:** since v1.11.0 an `allowlist` policy that names nobody admits nobody. Earlier versions admitted everybody.
+
+**Fix:** list the allowed addresses in `dm_allowed_users` / `group_allowed_users` or `allowed_users`, or choose another policy.
+
+**Symptom:** the gateway log shows `The Delta Chat database does not belong to this Hermes state` and the adapter reports `deltachat_db_mismatch`.
+
+**Cause:** the ID stored in the account differs from the one in `<HERMES_HOME>/.deltachat-db-id`. The accounts directory was deleted, recreated or replaced by another database. Hermes' pairing approvals, sessions, home channel and cron targets refer to contact and chat IDs of the old database, and in the new one those IDs belong to other people.
+
+**Fix:** if you replaced the database by mistake, restore the right one. If you want to start over on the new database, follow the steps in the log message: revoke the `deltachat-platform` pairing approvals, delete its sessions, clear `DELTACHAT_HOME_CHANNEL` and cron targets, then delete the marker file and restart.
+
+## Bot Does Not Answer a Sender
+
+Since v1.11.0 these cases are dropped on purpose:
+
+- **The sender has no Delta Chat key** (plain email). Log, at DEBUG: `Dropping message N from contact M: no key`. The sender must use Delta Chat and scan the invite link.
+- **A photo, file or voice message without a caption in a mention-gated group.** Add a caption that mentions the bot, or quote-reply to one of its messages.
+- **A group paused by the bot-exchange guard.** Log: `bot_exchange_guard tripped in chat N`. A message from a human resumes it. `DELTACHAT_MAX_BOT_EXCHANGES=0` turns the guard off.
+- **An agent tool answers `This chat_token belongs to a different conversation`.** `dc_safe_rpc_call` and `dc_start_call` only accept the token of the chat they are used in. Use `dc_send_message` to write to another chat.
+
 ## Version Warning
 
 **Symptom:** "Delta Chat version X.X.X is newer than expected" warning
@@ -172,14 +195,19 @@ file /path/to/your/file.xdc
 
 ## Voice Call Issues
 
-**Symptom:** Incoming call events not handled
+See [voice-calls.md](voice-calls.md) for setup. Voice calls need `aiortc`.
 
-**Note:** Voice call support is Phase 4 (stretch goal) and not yet implemented.
+**Symptom:** the bot declines an incoming call. Log: `Declining call N from unauthorized contact M`.
 
-**Current status:**
-- `IncomingCall` events are logged but not processed
-- WebRTC bridge not yet implemented
-- Requires aiortc and additional setup
+**Cause:** since v1.11.0 a call is only answered when the caller may also message the bot: `allowed_users`, `dm_policy` and Hermes' own authorization all apply.
+
+**Symptom:** the log shows `DELTACHAT_CALL_MODEL=... is set but the gateway runner is not reachable`.
+
+**Cause:** the per-call model could not be installed, so the call runs on the default model.
+
+**Symptom:** the bot says goodbye but does not hang up.
+
+**Cause:** a custom `DELTACHAT_CALL_PROMPT` without the hang-up instruction. Tell the model to end its goodbye with `[[hangup]]`.
 
 ## Performance Issues
 

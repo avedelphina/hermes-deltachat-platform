@@ -4,6 +4,120 @@ All notable changes to this project will be documented in this file.
 
 ## [1.11.0] - 2026-10-07
 
+### Upgrade notes: what can change on a working install
+
+This release tightens several defaults. Check the points below before you
+restart the gateway. [docs/UPGRADING.md](docs/UPGRADING.md) has the same list
+as a short checklist.
+
+**The plugin may refuse to start**
+
+- *An `allowlist` policy with no list.* If `dm_policy` or `group_policy` is
+  `allowlist`, and neither its own list (`dm_allowed_users` /
+  `group_allowed_users`) nor `allowed_users` names anyone, and
+  `allow_all_users` is off, the plugin does not load. The gateway log shows
+  `config validation error: DELTACHAT_DM_POLICY is 'allowlist' but neither
+  DELTACHAT_DM_ALLOWED_USERS nor DELTACHAT_ALLOWED_USERS names anyone`.
+  Earlier versions let every sender in with that configuration. Add the
+  addresses, or set the policy you meant.
+- *A Delta Chat database that is not the one Hermes knows.* On its first
+  start 1.11.0 writes `<HERMES_HOME>/.deltachat-db-id` and stores the same ID
+  in the account. After that, if the accounts directory is deleted, recreated
+  with `setup.py` or replaced by another database, the adapter stops with
+  `deltachat_db_mismatch` and logs the steps to start over. Back up the marker
+  file together with the accounts directory. `hermes send` and headless cron
+  run the same check.
+
+**People the bot stops answering**
+
+- *Anyone who writes by plain email.* A sender without a Delta Chat key is
+  dropped: no reply, no rejection notice, no read receipt, only a DEBUG line
+  (`Dropping message N from contact M: no key`). Such mail has a forgeable
+  From address, and the allowlists match on that address.
+- *Callers who may not message the bot.* Incoming calls used to be answered
+  for anyone. They are now declined unless the caller passes `allowed_users`,
+  `dm_policy` and Hermes' own authorization. The log shows
+  `Declining call N from unauthorized contact M`.
+- *Photos, files and voice messages without a caption, in a mention-gated
+  group.* They used to slip past the mention gate. Now they need a caption
+  that mentions the bot, or must quote-reply to one of its messages.
+- *Groups where only bots talk.* The bot-exchange guard is now active without
+  `DELTACHAT_HUMAN_USERS`. In a group with two or more other members it
+  pauses after 12 messages in a row from contacts flagged as bots, until a
+  human writes. Set `DELTACHAT_MAX_BOT_EXCHANGES=0` to turn it off.
+
+**Settings that are read differently**
+
+- *On/off values.* Only `1`, `true`, `yes` and `on` (any case) mean on.
+  Everything else means off. Check your environment for these two cases:
+  - `on` used to read as **off** for `DELTACHAT_REQUIRE_MENTION`,
+    `DELTACHAT_ALLOW_ALL_USERS` and `DELTACHAT_SEND_REJECTION_REPLIES`. It
+    now takes effect. `DELTACHAT_ALLOW_ALL_USERS=on` opens the bot to every
+    sender.
+  - Any non-empty value used to turn **on** `DELTACHAT_ENABLE_RAW_RPC` and
+    `DELTACHAT_DEBUG`, `0` and `false` included. Values such as `enabled` now
+    leave them off.
+- *`DELTACHAT_RAW_RPC_ALLOWLIST`* set to a value that names no method (for
+  example `,`) now allows nothing. It used to allow everything.
+- *Numbers.* A value that is not a number, or is out of range, in
+  `rate_limit_max`, `rate_limit_window`, `max_consecutive_replies` or
+  `max_bot_exchanges` falls back to the default with a warning. It used to
+  stop the adapter from starting.
+
+**Agent tools that now refuse**
+
+- *A chat token outside its own chat.* `dc_safe_rpc_call` and `dc_start_call`
+  answer `This chat_token belongs to a different conversation` when the token
+  was taken from another chat. Use `dc_send_message` to write to another
+  chat. `dc_end_call` only ends the call of the chat it is used in. Cron jobs
+  and CLI sessions are not affected.
+- *More RPC methods.* `forward_messages`, `add_contact_to_chat`,
+  `set_chat_ephemeral_timer`, `block_chat`, `set_chat_mute_duration`,
+  `set_chat_visibility`, `send_locations_to_chat`, `place_outgoing_call`,
+  `init_webxdc_integration` and the two SecureJoin QR methods are refused by
+  both RPC tools and no longer listed by the spec tools.
+- *File paths in `dc_safe_rpc_call`.* A path must pass Hermes' delivery policy
+  and must not lie in a Delta Chat data directory or in `logs/`.
+- *Image URLs on internal addresses.* `send_image_file` answers `Image URL
+  points at a private or internal address` for loopback, private and
+  link-local targets. If you serve images from your LAN, allow that in Hermes
+  (`security.allow_private_urls`).
+
+**Voice calls**
+
+- *A custom `DELTACHAT_CALL_PROMPT`* does not get the new hang-up instruction
+  by itself. Add it: the model must end its goodbye with `[[hangup]]`.
+  `dc_end_call` still works, but on Hermes 0.21.5 the model often misses it.
+- *Each call has its own session.* Inside a call the bot no longer sees
+  earlier calls. The text chat still gets a note when a call ends. With
+  `DELTACHAT_CALL_SHARED_HISTORY=true` nothing changes.
+- *Only the final reply of a turn is spoken* (Hermes 0.21.5 and newer).
+  Memory notices and tool progress are no longer read aloud.
+- *An outgoing call that nobody answers* no longer adds "call ended" notes to
+  the conversation.
+
+**Where the invite link is**
+
+- The `Bot address` log line and `get_status()["account_addr"]` now show the
+  email address. They used to show the SecureJoin invite link. The link is in
+  `invite.txt` (mode 0600) in the accounts directory, rewritten on every
+  connect, and in `get_status()["invite_link"]`.
+- **Gateway logs written by earlier versions still contain the invite link.**
+  Under `dm_policy: pairing`, anyone who can read them can pair with the bot.
+  Restrict or delete those logs.
+
+**Other things you may notice**
+
+- Rejected senders no longer get a read receipt.
+- Earlier versions left one `call_*.wav` recording per spoken sentence in
+  `<HERMES_HOME>/audio_cache/`. New ones are deleted after transcription. Old
+  ones stay until you delete them.
+- `setup.py` now creates the account in `DELTACHAT_DATA_DIR` when that is
+  set. It used to ignore it.
+- Tested with Hermes 0.21.5. On an older Hermes the chat-token binding and
+  the final-reply-only rule are inactive, because they rely on what newer
+  Hermes provides.
+
 Ports from upstream 2.0.0 (Simon-Laux/hermes-deltachat-platform).
 
 ### Security
