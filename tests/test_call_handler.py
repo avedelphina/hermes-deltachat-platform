@@ -560,3 +560,117 @@ class TestIncomingCallAuthorization:
         )
         mgr._answer_call.assert_awaited_once()
         adapter.rpc.end_call.assert_not_awaited()
+
+
+class TestCallLifecycleEdges:
+    """Calls that end at awkward moments must not leak a session or a reply."""
+
+    def _manager(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        adapter = MagicMock()
+        adapter.account_id = 1
+        adapter.rpc.accept_incoming_call = AsyncMock()
+        adapter.rpc.end_call = AsyncMock()
+        mgr = ch.CallManager(adapter=adapter)
+        pc = MagicMock()
+        for name in (
+            "setRemoteDescription",
+            "createAnswer",
+            "setLocalDescription",
+            "close",
+        ):
+            setattr(pc, name, AsyncMock())
+        pc.localDescription.sdp = "answer-sdp"
+        mgr._new_peer_connection = AsyncMock(return_value=(pc, MagicMock()))
+        mgr._make_audio_buffer = MagicMock()
+        mgr._gather_ice = AsyncMock()
+        mgr._log_sdp = MagicMock()
+        mgr._play_greeting = AsyncMock()
+        mgr._log_media_stats = AsyncMock()
+        mgr._note_call_ended = AsyncMock()
+        return mgr, adapter, pc
+
+    @pytest.mark.asyncio
+    async def test_hangup_while_answering_leaves_nothing_behind(self):
+        """Caller cancels during ICE gathering: CallEnded arrives mid-setup."""
+        mgr, adapter, pc = self._manager()
+
+        async def caller_hangs_up(_pc):
+            await mgr._handle_call_ended({"msg_id": 5})
+
+        mgr._gather_ice.side_effect = caller_hangs_up
+        await mgr._answer_call(5, "12", "offer-sdp", "10", "Eve")
+
+        adapter.rpc.accept_incoming_call.assert_not_awaited()
+        pc.close.assert_awaited()  # not leaked
+        assert mgr.has_active_call("12") is False  # no dead call left "active"
+        mgr._play_greeting.assert_not_called()
+        mgr._note_call_ended.assert_not_called()  # it never went live
+
+    @pytest.mark.asyncio
+    async def test_normal_answer_registers_a_live_session(self):
+        mgr, adapter, _ = self._manager()
+        await mgr._answer_call(5, "12", "offer-sdp", "10", "Eve")
+        await asyncio.sleep(0)
+        adapter.rpc.accept_incoming_call.assert_awaited_once_with(1, 5, "answer-sdp")
+        assert mgr._sessions[5].answered is True
+        assert mgr.has_active_call("12") is True
+
+    @pytest.mark.asyncio
+    async def test_failed_answer_tears_the_session_down(self):
+        from unittest.mock import AsyncMock
+
+        mgr, adapter, pc = self._manager()
+        adapter.rpc.get_message = AsyncMock(return_value={"from_id": 10})
+        adapter.rpc.get_contact = AsyncMock(return_value={"name": "Eve"})
+        adapter._caller_allowed = AsyncMock(return_value=True)
+        adapter.rpc.accept_incoming_call.side_effect = RuntimeError("call is gone")
+        mgr._warmup_stt = AsyncMock()
+        await mgr._handle_incoming_call(
+            {"msg_id": 5, "chat_id": 12, "place_call_info": "offer-sdp"}
+        )
+        assert mgr.has_active_call("12") is False
+        pc.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("answered", [True, False])
+    async def test_only_a_live_call_gets_call_ended_notes(self, answered):
+        mgr, _, _ = self._manager()
+        await mgr._answer_call(5, "12", "offer-sdp", "10", "Eve")
+        mgr._sessions[5].answered = answered
+        await mgr._teardown_session(5)
+        await asyncio.sleep(0)
+        assert mgr._note_call_ended.called is answered
+
+    @pytest.mark.asyncio
+    async def test_utterance_after_hangup_is_dropped(self):
+        """Teardown flushes the last words through STT; answering them would
+        reach the user as a text message, "[[hangup]]" marker included."""
+        from unittest.mock import AsyncMock
+
+        mgr, _, _ = self._manager()
+        mgr._to_hermes = AsyncMock()
+        await mgr._on_utterance(5, "12", "bye", "10", "Eve")
+        mgr._to_hermes.assert_not_awaited()
+
+
+class TestUtteranceRecordingIsDeleted:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stt_ok", [True, False])
+    async def test_wav_is_removed_after_stt(self, tmp_path, monkeypatch, stt_ok):
+        heard = []
+        buf = ch.IncomingAudioBuffer(
+            hermes_home=str(tmp_path), on_utterance=lambda t, w: heard.append(t)
+        )
+
+        def fake_transcribe(wav_path):
+            assert os.path.exists(wav_path)  # still there while STT reads it
+            if not stt_ok:
+                raise OSError("stt backend down")
+            return {"success": True, "transcript": "hello"}
+
+        monkeypatch.setattr(buf, "_transcribe", fake_transcribe)
+        await buf._process_utterance(b"\x00" * 3200)
+        assert heard == (["hello"] if stt_ok else [])
+        assert list((tmp_path / "audio_cache").glob("*.wav")) == []

@@ -6,12 +6,14 @@ Integrates Delta Chat as a messaging platform using deltachat2 (direct JSON-RPC)
 import email.utils
 import functools
 import inspect
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shutil
 import signal
+import socket
 import sys
 import asyncio
 import logging
@@ -55,12 +57,15 @@ logger = logging.getLogger("hermes_plugins.deltachat")
 
 
 def _is_on(value) -> bool:
-    """On/off rule for kill-switch env vars: "0"/"false"/"no"/"off" are off.
+    """The one on/off rule for settings: "1"/"true"/"yes"/"on" are on.
 
-    why: plain truthiness on os.getenv treats "0" as enabled (non-empty
-    string), which is a fail-open kill switch.
+    Everything else is off — "0", "off", a blank, and anything unrecognised.
+    why one rule: there were three (plain truthiness, where "0" was on; a
+    list without "on"; a list of off-words, where a typo was on), so the same
+    value meant different things for different settings.
+    call_handler._env_flag is the same rule (that module cannot import this one).
     """
-    return str(value).strip().lower() not in ("", "0", "false", "no", "off")
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 # Enable debug logging for RPC if requested. It logs every RPC request and
@@ -117,8 +122,12 @@ def _cfg(config, env: str, key: str, default: str = "") -> str:
 
 
 def _cfg_bool(config, env: str, key: str, default: str = "false") -> bool:
-    """Read a boolean platform config value ("1"/"true"/"yes" are truthy)."""
-    return str(_cfg(config, env, key, default)).lower() in ("1", "true", "yes")
+    """Read a boolean platform config value; see _is_on for the rule.
+
+    why "on" counts: DELTACHAT_REQUIRE_MENTION=on used to read as off,
+    silently leaving a gate open.
+    """
+    return _is_on(_cfg(config, env, key, default))
 
 
 # (env var, config.extra key, default, min, max) — shared by the adapter
@@ -618,6 +627,63 @@ def _commands_bio(own: str, extra: Dict) -> Optional[str]:
 _COMMAND_ADDR_RE = re.compile(r"/[\w-]+@")
 
 
+def _url_is_public(url: str) -> bool:
+    """Whether *url* resolves only to public addresses. Blocking (DNS).
+
+    why: send_image_file fetches whatever URL the agent hands it, from the
+    host — loopback, the LAN and cloud metadata endpoints included. Hermes'
+    own check when present (it honours the operator's allow_private_urls);
+    otherwise every resolved address must be global. Fail-closed on errors.
+    """
+    try:
+        from tools.url_safety import is_safe_url
+    except ImportError:
+        is_safe_url = None
+    if is_safe_url is not None:
+        return bool(is_safe_url(url))
+    # ponytail: resolve-then-fetch leaves a DNS-rebinding window on cores
+    # without tools.url_safety; pin the resolved address if that matters.
+    try:
+        host = urllib.parse.urlparse(url).hostname
+        infos = socket.getaddrinfo(host, None)
+        return bool(infos) and all(
+            ipaddress.ip_address(info[4][0]).is_global for info in infos
+        )
+    except Exception:
+        return False
+
+
+def _calling_chat_mismatch(adapter, real_chat_id) -> bool:
+    """True when the current tool call comes from a chat other than *real_chat_id*.
+
+    why: a chat token is only shown in its own chat, but the agent can carry
+    one elsewhere (memory, a cron listing), and then anyone in chat A could
+    have it read chat B. Hermes binds the calling session's platform and chat
+    id per task; when it names a chat, the token must be that chat's. No chat
+    bound (CLI, cron, an older core) leaves the token as the only check.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except ImportError:
+        return False
+    chat = (get_session_env("HERMES_SESSION_CHAT_ID") or "").strip()
+    if not chat:
+        return False
+    platform = (get_session_env("HERMES_SESSION_PLATFORM") or "").strip()
+    own = getattr(adapter.platform, "value", str(adapter.platform))
+    return platform != own or chat != str(real_chat_id)
+
+
+_WRONG_CHAT_ERROR = json.dumps(
+    {
+        "error": (
+            "This chat_token belongs to a different conversation — use the "
+            "[dc:chat=...] value from the current message"
+        )
+    }
+)
+
+
 def _contact_name(contact: dict, fallback: str) -> str:
     """Best display name from a ``get_contact`` snapshot."""
     return (
@@ -637,9 +703,21 @@ class _RateLimiter:
         self._buckets: Dict[str, deque] = {}
         self._lock = threading.Lock()
 
+    # Sweep idle senders only once this many are tracked (an O(n) pass then).
+    _SWEEP_ABOVE = 1024
+
     def is_allowed(self, key: str) -> bool:
         now = time.monotonic()
         with self._lock:
+            # why: one bucket per sender address, kept forever, grew without
+            # bound under an open policy. A bucket idle for a whole window
+            # carries no state worth keeping.
+            if len(self._buckets) > self._SWEEP_ABOVE:
+                self._buckets = {
+                    k: b
+                    for k, b in self._buckets.items()
+                    if b and now - b[-1] <= self.window
+                }
             bucket = self._buckets.get(key)
             if bucket is None:
                 self._buckets[key] = deque([now], maxlen=self.max_calls)
@@ -890,8 +968,12 @@ def _refuse_path(method: str, path) -> str:
 
 # Cached OpenRPC spec (fetched lazily on first use).
 _spec_cache: Optional[dict] = None
-_token_lock = asyncio.Lock()
-_spec_lock = asyncio.Lock()
+# why threading, not asyncio: Hermes runs async tool handlers on their own
+# event loop in a worker thread (model_tools._run_async), while message
+# handling runs on the gateway loop. An asyncio.Lock shared between loops
+# raises or strands its waiter the first time it is contended. The sections
+# it guards are plain dict access with no await inside.
+_token_lock = threading.Lock()
 
 
 async def _get_or_create_chat_token(rpc, account_id: int, chat_id: int) -> str:
@@ -900,7 +982,7 @@ async def _get_or_create_chat_token(rpc, account_id: int, chat_id: int) -> str:
     Checks memory cache first, then DC UI config (persists across restarts),
     creating and storing a new token if none exists yet.
     """
-    async with _token_lock:
+    with _token_lock:
         if chat_id in _chat_id_to_token:
             return _chat_id_to_token[chat_id]
 
@@ -922,7 +1004,7 @@ async def _get_or_create_chat_token(rpc, account_id: int, chat_id: int) -> str:
         except Exception as e:
             logger.warning("Could not persist chat token to DC config: %s", e)
 
-    async with _token_lock:
+    with _token_lock:
         _chat_id_to_token[chat_id] = token
         _chat_token_to_id[token] = chat_id
     return token
@@ -945,7 +1027,7 @@ async def _resolve_chat_token(rpc, account_id: int, token: str) -> Optional[int]
     Checks memory cache first, then DC UI config as a fallback for
     tokens issued in a previous session.
     """
-    async with _token_lock:
+    with _token_lock:
         if token in _chat_token_to_id:
             return _chat_token_to_id[token]
 
@@ -957,7 +1039,7 @@ async def _resolve_chat_token(rpc, account_id: int, token: str) -> Optional[int]
 
     if chat_id_str:
         chat_id = int(chat_id_str)
-        async with _token_lock:
+        with _token_lock:
             _chat_token_to_id[token] = chat_id
             _chat_id_to_token[chat_id] = token
         return chat_id
@@ -970,27 +1052,26 @@ async def _fetch_spec() -> dict:
     global _spec_cache
     if _spec_cache is not None:
         return _spec_cache
-    async with _spec_lock:
-        if _spec_cache is not None:
-            return _spec_cache
-        rpc_server = (
-            _active_adapter._get_rpc_server_path()
-            if _active_adapter is not None
-            else os.getenv("DELTACHAT_RPC_SERVER", "deltachat-rpc-server")
+    # No lock: callers may be on different event loops (see _token_lock), and
+    # two racing first calls only run `--openrpc` twice and cache the same spec.
+    rpc_server = (
+        _active_adapter._get_rpc_server_path()
+        if _active_adapter is not None
+        else os.getenv("DELTACHAT_RPC_SERVER", "deltachat-rpc-server")
+    )
+    proc = await asyncio.create_subprocess_exec(
+        rpc_server,
+        "--openrpc",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"deltachat-rpc-server --openrpc failed: {stderr.decode().strip()}"
         )
-        proc = await asyncio.create_subprocess_exec(
-            rpc_server,
-            "--openrpc",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"deltachat-rpc-server --openrpc failed: {stderr.decode().strip()}"
-            )
-        _spec_cache = json.loads(stdout.decode())
-        return _spec_cache
+    _spec_cache = json.loads(stdout.decode())
+    return _spec_cache
 
 
 class DeltaChatAdapter(BasePlatformAdapter):
@@ -1044,10 +1125,10 @@ class DeltaChatAdapter(BasePlatformAdapter):
         cfg = functools.partial(_cfg, config)
         cfg_bool = functools.partial(_cfg_bool, config)
 
-        allow_all = cfg_bool("DELTACHAT_ALLOW_ALL_USERS", "allow_all_users")
+        self._allow_all = cfg_bool("DELTACHAT_ALLOW_ALL_USERS", "allow_all_users")
         self._allowed_users = (
             set()
-            if allow_all
+            if self._allow_all
             else _parse_email_list(cfg("DELTACHAT_ALLOWED_USERS", "allowed_users"))
         )
 
@@ -1066,10 +1147,14 @@ class DeltaChatAdapter(BasePlatformAdapter):
         )
 
         self._seen_ids = _MessageCache(max_size=1000)
+        # why bounded: int()/float() on a typo raised out of __init__, and a
+        # max of 0 or less made deque(maxlen=...) admit one message then none.
         self._rate_limiter = _RateLimiter(
-            max_calls=int(cfg("DELTACHAT_RATE_LIMIT_MAX", "rate_limit_max", "30")),
-            window_seconds=float(
-                cfg("DELTACHAT_RATE_LIMIT_WINDOW", "rate_limit_window", "60")
+            max_calls=_cfg_bounded_int(
+                config, "DELTACHAT_RATE_LIMIT_MAX", "rate_limit_max", 30, 1, 100000
+            ),
+            window_seconds=_cfg_bounded_int(
+                config, "DELTACHAT_RATE_LIMIT_WINDOW", "rate_limit_window", 60, 1, 86400
             ),
         )
 
@@ -1089,16 +1174,19 @@ class DeltaChatAdapter(BasePlatformAdapter):
         raw_require_mention_channels = cfg(
             "DELTACHAT_REQUIRE_MENTION_CHANNELS", "require_mention_channels"
         )
-        self._require_mention_channels = (
-            _parse_email_list(raw_require_mention_channels)
-            if raw_require_mention_channels
-            else set()
+        self._require_mention_channels = set(
+            _parse_csv_unique(raw_require_mention_channels)
         )
 
         # Guards against bot-to-bot auto-reply loops (e.g. multiple agents in
         # one group replying to each other forever). <=0 disables the guard.
-        self._max_consecutive_replies = int(
-            cfg("DELTACHAT_MAX_CONSECUTIVE_REPLIES", "max_consecutive_replies", "20")
+        self._max_consecutive_replies = _cfg_bounded_int(
+            config,
+            "DELTACHAT_MAX_CONSECUTIVE_REPLIES",
+            "max_consecutive_replies",
+            20,
+            -1,
+            100000,
         )
         self._reply_streak: dict[str, tuple[str, int, bool]] = {}
 
@@ -1110,8 +1198,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._human_users = _parse_email_list(
             cfg("DELTACHAT_HUMAN_USERS", "human_users")
         )
-        self._max_bot_exchanges = int(
-            cfg("DELTACHAT_MAX_BOT_EXCHANGES", "max_bot_exchanges", "12")
+        self._max_bot_exchanges = _cfg_bounded_int(
+            config, "DELTACHAT_MAX_BOT_EXCHANGES", "max_bot_exchanges", 12, -1, 100000
         )
         self._bot_exchange_streak: dict[str, tuple[int, bool]] = {}
 
@@ -1152,7 +1240,20 @@ class DeltaChatAdapter(BasePlatformAdapter):
         # Exec-approval prompt msg id -> (Hermes session key, request_id),
         # oldest first. Only prompts whose request_id is known are here.
         self._approval_prompts: Dict[int, tuple] = {}
+        self._background_tasks: set = set()
         self._roster_cache: dict[str, tuple[float, list]] = {}
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """create_task with a strong reference held until the task is done.
+
+        why: the event loop keeps only a weak reference to a task, so a
+        fire-and-forget one (answering a call, speaking a reply) can be
+        garbage-collected mid-flight and simply never finish.
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _bump_stat(self, key: str, count: int = 1) -> None:
         """Increment an internal counter under the adapter lock."""
@@ -1273,15 +1374,27 @@ class DeltaChatAdapter(BasePlatformAdapter):
         except TypeError:
             return SendResult(success=True, message_id=str(msg_id) if msg_id else None)
 
+    def _on_allowlist(self, sender_email: str, scoped: set) -> bool:
+        """Whether *sender_email* passes an ``allowlist`` policy.
+
+        *scoped* is dm_allowed_users / group_allowed_users. Left empty, the
+        policy falls back to the global allowed_users, which _gate_inbound has
+        already enforced. why the last line: with neither list set (and no
+        allow_all_users) an "allowlist" that names nobody used to admit
+        everybody — and Hermes core trusts an adapter under an allowlist
+        policy without checking again. Naming nobody now admits nobody.
+        """
+        if scoped:
+            return sender_email in scoped
+        return self._allow_all or bool(self._allowed_users)
+
     def _check_dm(self, sender_email: str, is_verified: bool) -> Optional[str]:
         if self._dm_policy == "disabled":
             return "Sorry, this bot does not accept direct messages."
         if self._dm_policy == "pairing" and not is_verified:
             return "I only chat with verified contacts. Scan my QR code to connect securely."
-        if (
-            self._dm_policy == "allowlist"
-            and self._dm_allow_from
-            and sender_email not in self._dm_allow_from
+        if self._dm_policy == "allowlist" and not self._on_allowlist(
+            sender_email, self._dm_allow_from
         ):
             return "Sorry, you are not on the allowed list for direct messages."
         return None
@@ -1289,10 +1402,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
     def _check_group(self, sender_email: str) -> Optional[str]:
         if self._group_policy == "disabled":
             return "Sorry, this bot does not respond in group chats."
-        if (
-            self._group_policy == "allowlist"
-            and self._group_allow_from
-            and sender_email not in self._group_allow_from
+        if self._group_policy == "allowlist" and not self._on_allowlist(
+            sender_email, self._group_allow_from
         ):
             return "Sorry, you are not authorized for group interactions."
         return None
@@ -1379,7 +1490,9 @@ class DeltaChatAdapter(BasePlatformAdapter):
         else:
             if str(chat_id) not in self._require_mention_channels:
                 return True
-        if not text or text.startswith("/"):
+        # why: an empty body (captionless image/file/voice) has no mention, so it
+        # must NOT be exempt — only slash commands bypass the gate.
+        if text and text.startswith("/"):
             return True
         if self._is_mentioned(text):
             return True
@@ -1417,26 +1530,31 @@ class DeltaChatAdapter(BasePlatformAdapter):
         return not tripped, should_warn
 
     def _check_bot_exchange_guard(
-        self, chat_id, sender_email: str
+        self, chat_id, sender_email: str, is_bot: Optional[bool] = None
     ) -> tuple[bool, bool]:
         """Cap total bot-to-bot messages in a chat, regardless of who's sending.
 
         Unlike _check_loop_guard (which only catches one sender flooding),
         this catches 3+ bots round-robining a group — from each bot's own
         view the sender keeps changing, so the same-sender streak never
-        trips. Every message not from a DELTACHAT_HUMAN_USERS address counts
-        toward DELTACHAT_MAX_BOT_EXCHANGES; a message from one of those
-        addresses resets the count. Inactive unless human_users is set.
+        trips. Every bot message counts toward DELTACHAT_MAX_BOT_EXCHANGES; a
+        human message resets the count. Human = a DELTACHAT_HUMAN_USERS address,
+        or any contact core reports as not ``is_bot`` — so groups need no
+        per-user list. With ``is_bot`` unknown (None) only the list decides,
+        and the guard stays off when the list is empty.
 
         Returns (should_process, should_warn) — should_warn is True only the
         first time a given streak trips.
         """
-        if not self._human_users or self._max_bot_exchanges <= 0:
+        if self._max_bot_exchanges <= 0 or (is_bot is None and not self._human_users):
             return True, False
+        # why: a contact not flagged is_bot is a human even if not listed —
+        # requiring every group member in HUMAN_USERS defeats using groups.
+        is_human = sender_email in self._human_users or is_bot is False
         key = str(chat_id)
         with self._lock:
             count, warned = self._bot_exchange_streak.get(key, (0, False))
-            if sender_email in self._human_users:
+            if is_human:
                 count, warned = 0, False
             else:
                 count += 1
@@ -1461,10 +1579,28 @@ class DeltaChatAdapter(BasePlatformAdapter):
         if from_id:
             try:
                 contact = await self.rpc.get_contact(self.account_id, int(from_id))
-                sender_email = (contact.get("address") or "").lower()
-                verified_field = contact.get("is_verified")
             except Exception as e:
-                logger.debug("Could not fetch contact %s: %s", from_id, e)
+                # Fail-closed: under an open policy an unidentifiable sender
+                # used to be let through with an empty address.
+                logger.warning(
+                    "Dropping message %s: could not load sender %s: %s",
+                    msg_id,
+                    from_id,
+                    e,
+                )
+                return False
+            # why: identity in Delta Chat is the key. A sender without one is
+            # plain unencrypted mail, whose From address anyone can forge — and
+            # allowed_users / the allowlists match on that address. Dropped
+            # silently and unread, like upstream 2.0.0.
+            if contact.get("is_key_contact") is False:
+                logger.debug(
+                    "Dropping message %s from contact %s: no key", msg_id, from_id
+                )
+                self._bump_stat("keyless_messages_dropped")
+                return False
+            sender_email = (contact.get("address") or "").lower()
+            verified_field = contact.get("is_verified")
 
         if sender_email and not self._rate_limiter.is_allowed(sender_email):
             logger.warning("Rate limit exceeded for %s", sender_email)
@@ -1547,6 +1683,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("Could not load contact %s: %s", from_id, e)
             return False
+        if contact.get("is_key_contact") is False:
+            return False  # an address is forgeable, a key is not (see _gate_inbound)
         email = (contact.get("address") or "").lower()
         if self._allowed_users and email not in self._allowed_users:
             return False
@@ -1809,13 +1947,23 @@ class DeltaChatAdapter(BasePlatformAdapter):
         if accounts:
             self.account_id = accounts[0]["id"]
             addr = await rpc.get_config(self.account_id, "addr")
-            if addr:
+            kind = accounts[0].get("kind")
+            if addr or kind == "Configured":
                 logger.info("Using existing Delta Chat account: %s", self.account_id)
                 await self._apply_profile(rpc, self.account_id)
                 # Existing accounts do not need the configured password.
                 self._password = None
                 return True
 
+            # why: removing an account destroys its keys and every pairing, so
+            # only do it when core itself says the account is unconfigured — a
+            # missing "addr" config key alone (a renamed key on a newer core)
+            # must never delete a working account.
+            if kind != "Unconfigured":
+                raise RuntimeError(
+                    f"Delta Chat account {self.account_id} has no address but "
+                    f"core reports it as {kind!r}; refusing to remove it"
+                )
             # A cancelled provisioning run leaves an account record without a
             # transport or address. It cannot become valid merely by reconnecting.
             logger.warning(
@@ -2078,50 +2226,24 @@ class DeltaChatAdapter(BasePlatformAdapter):
         }
 
     async def get_my_address(self) -> Optional[str]:
-        """Get the Delta Chat account address or SecureJoin link.
+        """The account's email address, or None.
 
-        Returns:
-            SecureJoin link (e.g., https://delta.chat/s?pk=...) or address (e.g., bot@server.org)
+        why not the SecureJoin link (which this used to prefer): the result is
+        logged at INFO on connect and reported as ``account_addr``, and under
+        dm_policy=pairing whoever holds that link can reach the agent. The
+        link lives in invite.txt and get_status()["invite_link"] only.
         """
         if not self.rpc or not self.account_id:
             return None
-
         try:
-            # Try to get SecureJoin QR code content (which is the link)
-            try:
-                qr_content = await self.rpc.get_chat_securejoin_qr_code(
-                    self.account_id, None  # chat_id - None for account-level QR
-                )
-                if qr_content:
-                    return qr_content
-            except Exception:
-                pass
-
-            # Fallback: get account info which should include address
-            info = await self.rpc.get_account_info(self.account_id)
-            if info:
-                # Try different field names for address
-                address = info.get("address") or info.get("addr")
-                if address:
-                    return address
-                # Construct from name and server
-                name = info.get("name") or info.get("display_name", "")
-                server = info.get("server", "")
-                if name and server:
-                    return f"{name}@{server}"
-
-            # Final fallback: list accounts and find ours
-            accounts = await self.rpc.get_all_accounts()
-            for acc in accounts:
-                if acc.get("id") == self.account_id:
-                    name = acc.get("name", acc.get("display_name", ""))
-                    server = acc.get("server", "")
-                    if name and server:
-                        return f"{name}@{server}"
+            addr = await self.rpc.get_config(self.account_id, "addr")
+            if not addr:
+                info = await self.rpc.get_account_info(self.account_id)
+                addr = (info or {}).get("addr")
+            return addr or None
         except Exception as e:
-            logger.debug(f"Failed to get account address: {e}")
-
-        return None
+            logger.debug("Failed to get account address: %s", e)
+            return None
 
     async def _resolve_chat_id(self, chat_id) -> int:
         """Real DC chat id for an outbound target: a numeric id or a chat token.
@@ -2177,7 +2299,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 # also lands here (same session), so drop that one line.
                 if self._call_manager.consume_call_ack(chat_id):
                     return self._send_result(chat_id, None)
-                asyncio.create_task(self._call_manager.play_response(chat_id, content))
+                self._spawn(self._call_manager.play_response(chat_id, content))
                 return self._send_result(chat_id, None)
             # Reply from the text/chat thread while a call is active (e.g. the
             # agent's "calling you now" line in separate-thread mode, or a
@@ -2324,6 +2446,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError(f"Invalid image URL: {url}")
+        if not await asyncio.to_thread(_url_is_public, url):
+            raise ValueError("Image URL points at a private or internal address")
 
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             headers = {"Accept": "image/*"}
@@ -2893,7 +3017,13 @@ class DeltaChatAdapter(BasePlatformAdapter):
         respawns the RPC server by rebuilding the adapter.
         """
         exit_code = self._rpc_server_exit_code()
-        if exit_code is None:
+        # why also ask the transport: with its reader or writer thread gone the
+        # subprocess is still running (no exit code) but can never answer.
+        # Treating that as transient retried once a second, forever.
+        transport_dead = (
+            getattr(self._transport, "_server_dead", lambda: False)() is True
+        )
+        if exit_code is None and not transport_dead:
             logger.error("Event listener error: %s", exc)
             now = time.monotonic()
             with self._lock:
@@ -2903,16 +3033,17 @@ class DeltaChatAdapter(BasePlatformAdapter):
             await asyncio.sleep(1)
             return True
 
+        what = (
+            "transport stopped"
+            if exit_code is None
+            else f"exited with code {exit_code}"
+        )
         logger.error(
-            "deltachat-rpc-server exited (code %s); stopping the event listener. "
-            "Last error: %s",
-            exit_code,
+            "deltachat-rpc-server %s; stopping the event listener. Last error: %s",
+            what,
             exc,
         )
-        self._escalate_listener_death(
-            "rpc_server_died",
-            f"deltachat-rpc-server exited with code {exit_code}",
-        )
+        self._escalate_listener_death("rpc_server_died", f"deltachat-rpc-server {what}")
         return False
 
     def _escalate_listener_death(self, code: str, message: str) -> None:
@@ -2970,15 +3101,13 @@ class DeltaChatAdapter(BasePlatformAdapter):
             )
         elif event_kind == EventType.INCOMING_CALL:
             if self._call_manager:
-                asyncio.create_task(self._call_manager.handle_incoming_call(event))
+                self._spawn(self._call_manager.handle_incoming_call(event))
         elif event_kind == EventType.CALL_ENDED:
             if self._call_manager:
-                asyncio.create_task(self._call_manager.handle_call_ended(event))
+                self._spawn(self._call_manager.handle_call_ended(event))
         elif event_kind == EventType.OUTGOING_CALL_ACCEPTED:
             if self._call_manager:
-                asyncio.create_task(
-                    self._call_manager.handle_outgoing_call_accepted(event)
-                )
+                self._spawn(self._call_manager.handle_outgoing_call_accepted(event))
         elif event_kind == EventType.INCOMING_CALL_ACCEPTED:
             logger.info("Incoming call accepted msg_id=%s", event.get("msg_id"))
         elif event_kind == EventType.SECUREJOIN_INVITER_PROGRESS:
@@ -3047,14 +3176,16 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 logger.warning(f"Could not retrieve message {msg_id}")
                 return
 
-            # Send read receipt immediately
+            if not await self._gate_inbound(chat_id, msg_id, msg.get("from_id")):
+                return
+
+            # why after the gate: a read receipt tells a rejected sender the
+            # bot is there and read them — the one thing
+            # send_rejection_replies=false is meant to keep quiet.
             try:
                 await self.rpc.markseen_msgs(self.account_id, [int(msg_id)])
             except Exception as e:
                 logger.debug(f"Could not mark message {msg_id} as seen: {e}")
-
-            if not await self._gate_inbound(chat_id, msg_id, msg.get("from_id")):
-                return
 
             text = msg.get("text", "")
             view_type = msg.get("view_type", "")
@@ -3078,11 +3209,13 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
             from_id = msg.get("from_id")
             sender_email = ""
+            is_bot = None
             if from_id:
                 contact = await self.rpc.get_contact(self.account_id, int(from_id))
                 user_name = _contact_name(contact, f"Contact {from_id}")
                 user_id = str(from_id)
                 sender_email = (contact.get("address") or "").lower()
+                is_bot = contact.get("is_bot")
             else:
                 user_name, user_id = "Unknown", "unknown"
 
@@ -3105,7 +3238,9 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 await self._get_group_roster(chat_id) if chat_type == "group" else None
             )
             if roster is not None and len(roster) > 1:
-                if not await self._apply_bot_guards(chat_id, from_id, sender_email):
+                if not await self._apply_bot_guards(
+                    chat_id, from_id, sender_email, is_bot
+                ):
                     return
 
             # "/cmd@<name>": addressed to us → Hermes sees a plain "/cmd". In
@@ -3180,7 +3315,9 @@ class DeltaChatAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error(f"Error handling message event: {e}")
 
-    async def _apply_bot_guards(self, chat_id, from_id, sender_email: str) -> bool:
+    async def _apply_bot_guards(
+        self, chat_id, from_id, sender_email: str, is_bot: Optional[bool] = None
+    ) -> bool:
         """Run the loop and bot-exchange guards. Return True to keep processing."""
         should_process, should_warn = self._check_loop_guard(chat_id, from_id)
         if not should_process:
@@ -3198,7 +3335,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
             )
 
         should_process, should_warn = self._check_bot_exchange_guard(
-            chat_id, sender_email
+            chat_id, sender_email, is_bot
         )
         if not should_process:
             return await self._guard_tripped(
@@ -3207,8 +3344,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 should_warn,
                 f"bot_exchange_guard tripped in chat {chat_id}: "
                 f"max_bot_exchanges={self._max_bot_exchanges} hit with no "
-                "DELTACHAT_HUMAN_USERS check-in; further non-human messages here "
-                "are dropped until one checks in",
+                f"human check-in (last sender {sender_email!r}, is_bot={is_bot}); "
+                "further bot messages here are dropped until one checks in",
                 f"Pausing replies in this chat — {self._max_bot_exchanges} "
                 "bot-to-bot messages with no human check-in. Send a message "
                 "to resume.",
@@ -3349,10 +3486,14 @@ class DeltaChatAdapter(BasePlatformAdapter):
         from_id = msg.get("from_id")
         user_name = f"Contact {from_id}" if from_id else "Unknown"
         user_id = str(from_id) if from_id else "unknown"
+        sender_email = ""
+        is_bot = None
         try:
             if from_id:
                 contact = await self.rpc.get_contact(self.account_id, int(from_id))
                 user_name = _contact_name(contact, user_name)
+                sender_email = (contact.get("address") or "").lower()
+                is_bot = contact.get("is_bot")
         except Exception:
             pass
 
@@ -3375,12 +3516,18 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
         token = await _get_or_create_chat_token(self.rpc, self.account_id, int(chat_id))
 
+        roster = await self._get_group_roster(chat_id) if chat_type == "group" else None
+        # why: same guards as the text path (see _handle_incoming_message) — a
+        # human's image/voice message must reset the bot-exchange count too.
+        if roster is not None and len(roster) > 1:
+            if not await self._apply_bot_guards(chat_id, from_id, sender_email, is_bot):
+                return
+
         caption = msg.get("text", "") or ""
         should_process, _ = await self._gate_mention(msg, caption, chat_type, chat_id)
         if not should_process:
             return
 
-        roster = await self._get_group_roster(chat_id) if chat_type == "group" else None
         meta = self._message_metadata(
             chat_id, msg_id, from_id, chat_type == "group", token, roster
         )
@@ -3564,6 +3711,26 @@ def validate_config(config) -> bool:
     group_policy = cfg("DELTACHAT_GROUP_POLICY", "group_policy", "open")
     if group_policy not in ("open", "allowlist", "disabled"):
         raise ValueError(f"Invalid DELTACHAT_GROUP_POLICY: {group_policy!r}")
+
+    # why: an allowlist that names nobody admits nobody (see _on_allowlist);
+    # say so at startup instead of silently rejecting every sender.
+    if not _cfg_bool(
+        config, "DELTACHAT_ALLOW_ALL_USERS", "allow_all_users"
+    ) and not cfg("DELTACHAT_ALLOWED_USERS", "allowed_users"):
+        for kind, policy, env, key in (
+            ("DM", dm_policy, "DELTACHAT_DM_ALLOWED_USERS", "dm_allowed_users"),
+            (
+                "GROUP",
+                group_policy,
+                "DELTACHAT_GROUP_ALLOWED_USERS",
+                "group_allowed_users",
+            ),
+        ):
+            if policy == "allowlist" and not cfg(env, key):
+                raise ValueError(
+                    f"DELTACHAT_{kind}_POLICY is 'allowlist' but neither {env} nor "
+                    "DELTACHAT_ALLOWED_USERS names anyone"
+                )
 
     # Lightweight path checks (do not create directories or require the binary).
     _safe_data_dir(
@@ -4020,6 +4187,10 @@ def register_rpc_tools(ctx) -> None:
                 }
             )
 
+        if _calling_chat_mismatch(adapter, real_chat_id):
+            logger.warning("Safe RPC call %r REFUSED (token of another chat)", method)
+            return _WRONG_CHAT_ERROR
+
         if _is_blocked(method):
             return json.dumps({"error": f"'{method}' is not allowed in safe mode"})
 
@@ -4129,11 +4300,16 @@ def register_rpc_tools(ctx) -> None:
         if adapter is None or adapter._call_manager is None:
             return json.dumps({"error": "No active call"})
 
-        # The AI is in a call — find the active session.
-        # There is typically only one active call at a time.
-        chat_id = adapter._call_manager.first_active_chat_id()
-        if chat_id is None:
+        # Hang up the call of the chat this tool call came from. Only when no
+        # chat is bound (see _calling_chat_mismatch) fall back to "the" call —
+        # there is typically only one at a time.
+        mgr = adapter._call_manager
+        candidates = [
+            c for c in mgr.active_chat_ids() if not _calling_chat_mismatch(adapter, c)
+        ]
+        if not candidates:
             return json.dumps({"error": "No active call"})
+        chat_id = candidates[0]
 
         success = await adapter._call_manager.request_hangup(chat_id)
         if success:
@@ -4163,6 +4339,9 @@ def register_rpc_tools(ctx) -> None:
             return json.dumps(
                 {"error": "Unknown chat_token — use the [dc:chat=...] value"}
             )
+        if _calling_chat_mismatch(adapter, real_chat_id):
+            logger.warning("dc_start_call REFUSED (token of another chat)")
+            return _WRONG_CHAT_ERROR
 
         try:
             msg_id = await adapter._call_manager.start_call(
@@ -4257,7 +4436,7 @@ def register_rpc_tools(ctx) -> None:
                     }
                 )
             try:
-                real_chat_id = int(home_channel)
+                real_chat_id = await adapter._resolve_chat_id(home_channel)
             except ValueError:
                 return json.dumps(
                     {"error": "DELTACHAT_HOME_CHANNEL is not a valid chat id"}

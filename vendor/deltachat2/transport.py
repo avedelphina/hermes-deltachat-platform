@@ -122,17 +122,33 @@ class IOTransport:
         """Resolve every waiting caller with the disconnect error.
 
         Called from both the reader and writer loop when the RPC server dies, so
-        no caller blocks forever on a request that will never be answered. The
-        two callers may race on the dict, but both set the same error, so the
-        outcome is identical either way.
+        no caller blocks forever on a request that will never be answered. A
+        call() that registers between the snapshot and clear() is dropped
+        without being resolved; its own poll on _server_dead() catches that
+        within one slice.
         """
         for pending in list(self.pending_results.values()):
             pending.set(_DISCONNECTED_ERROR)
         self.pending_results.clear()
 
     def _server_dead(self) -> bool:
-        """True once the RPC server subprocess has exited (any exit code)."""
-        return hasattr(self, "process") and self.process.poll() is not None
+        """True once no further request can be answered.
+
+        That is: the RPC server subprocess has exited (any exit code), or the
+        reader or writer thread has died, so nothing will ever send the
+        request or deliver its reply. Before start() none of them exists,
+        which does not count as dead.
+        """
+        if not hasattr(self, "process"):
+            return False
+        if self.process.poll() is not None:
+            return True
+        for name in ("reader_thread", "writer_thread"):
+            thread = getattr(self, name, None)
+            # ident is None until the thread has started.
+            if thread is not None and thread.ident is not None and not thread.is_alive():
+                return True
+        return False
 
     def _reader_loop(self) -> None:
         try:
@@ -141,9 +157,20 @@ class IOTransport:
                 line = self.process.stdout.readline()
                 if not line:  # EOF
                     break
-                response = json.loads(line)
+                try:
+                    response = json.loads(line)
+                except ValueError:
+                    # A stray non-JSON line (a panic message, a log line on
+                    # stdout) must not kill the reader: the server may be fine,
+                    # and with no reader every later call would hang.
+                    self.logger.warning("Ignoring non-JSON line from RPC server: %r", line[:200])
+                    continue
                 if "id" in response:
-                    self.pending_results.pop(response["id"]).set(response)
+                    # The caller may already have given up on a dead server
+                    # (see call()); dropping its reply must not kill the reader.
+                    pending = self.pending_results.pop(response["id"], None)
+                    if pending is not None:
+                        pending.set(response)
                 else:
                     self.logger.warning("Got a response without ID: %s", response)
         except Exception:
@@ -183,8 +210,9 @@ class IOTransport:
             "params": args,
             "id": request_id,
         }
-        # Log the request for debugging
-        self.logger.debug(f"RPC request: method={method}, params={args}")
+        # why lazy %s: an f-string here rendered every request and response
+        # (whole messages, passwords, invite links) on every call, debug or not.
+        self.logger.debug("RPC request: method=%s, params=%s", method, args)
 
         result = self.pending_results[request_id] = _Result()
         self.request_queue.put(request)
@@ -194,12 +222,17 @@ class IOTransport:
         # slice instead of hanging this thread forever.
         while not result.wait(timeout=1.0):
             if self._server_dead():
+                # A reply the server wrote just before exiting can still be in
+                # the pipe; give the reader one more slice to deliver it (or to
+                # hit EOF and fail us) rather than reporting a call that
+                # succeeded, e.g. a sent message, as failed.
+                if result.wait(timeout=1.0):
+                    break
                 self.pending_results.pop(request_id, None)
                 raise JsonRpcError(_DISCONNECTED_ERROR["error"])
         response = result._value
 
-        # Log the response for debugging
-        self.logger.debug(f"RPC response for {method}: {response}")
+        self.logger.debug("RPC response for %s: %s", method, response)
 
         if "error" in response:
             raise JsonRpcError(response["error"])

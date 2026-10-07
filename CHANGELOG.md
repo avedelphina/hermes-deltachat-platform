@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.11.0] - 2026-10-07
 
 Ports from upstream 2.0.0 (Simon-Laux/hermes-deltachat-platform).
 
@@ -78,6 +78,94 @@ Ports from upstream 2.0.0 (Simon-Laux/hermes-deltachat-platform).
 - Cron delivery to a chat token failed with `invalid literal for int()`. A
   chat token is now accepted wherever an outbound chat id is, including
   `hermes send`.
+
+Found by re-reading the fork:
+
+### Security
+- Senders without a key are dropped, silently and unread. A sender without
+  one is plain unencrypted mail, whose From address anyone can forge, and
+  `allowed_users` and the allowlists match on that address. Calls and
+  approval reactions refuse them too. A sender whose contact cannot be loaded
+  is dropped as well; under `dm_policy: open` it used to be let through.
+  **People who wrote to the bot by plain email, without Delta Chat, are no
+  longer answered.**
+- A chat token only works from the chat it belongs to. `dc_safe_rpc_call` and
+  `dc_start_call` refuse a token carried in from another conversation (the
+  agent could pick one up from memory or a cron listing), and `dc_end_call`
+  hangs up the calling chat's own call instead of the first active one. Cron
+  jobs and CLI sessions, which have no calling chat, are unaffected, and
+  `dc_send_message` stays cross-chat by design.
+- `send_image_file` no longer fetches URLs that resolve to loopback, private
+  or link-local addresses (cloud metadata endpoints included). Hermes' own
+  `is_safe_url` decides when available, so `allow_private_urls` is honoured.
+- The SecureJoin invite link was written to the gateway log at INFO on every
+  connect, as "Bot address". `get_my_address()` preferred the invite link over
+  the address, and under `dm_policy: pairing` whoever holds that link can
+  reach the agent. It now returns the email address; the link is only in
+  `invite.txt` and `get_status()["invite_link"]`.
+- An `allowlist` policy that named nobody admitted everybody. With
+  `dm_policy: allowlist` (or `group_policy: allowlist`) and neither the
+  scoped list nor `DELTACHAT_ALLOWED_USERS` set, every sender passed — and
+  Hermes core trusts an adapter under an `allowlist` policy without checking
+  again. It now admits nobody, and `validate_config` refuses to start.
+- `DELTACHAT_REQUIRE_MENTION=on` (and every other boolean setting given as
+  `on`) read as off.
+- A read receipt was sent before the access check, so a rejected sender still
+  learned the bot had read them, also with `send_rejection_replies: false`.
+  It is now sent only for accepted senders.
+- An existing account is only removed and reprovisioned when core itself
+  reports it as `Unconfigured`. A missing `addr` config key alone used to be
+  enough to delete the account, its keys and every pairing.
+- `setup.py` created the accounts directory world-readable (0755) until the
+  adapter's first connect tightened it. It also ignored `DELTACHAT_DATA_DIR`,
+  creating the account where the adapter would never look.
+- `DELTACHAT_DEBUG=0` enabled debug logging, which logs every RPC request and
+  response, passwords and invite links included.
+- One on/off rule for every setting: `1`, `true`, `yes` and `on` are on,
+  anything else is off. A typo no longer enables `dc_rpc_call` or debug
+  logging.
+
+### Fixed
+- v1.8.1 never reached `main` (it only exists on `upstream-pr-clean`). Its
+  three fixes are back: captionless images/files/voice no longer bypass the
+  mention gate; image/file/voice messages go through the bot-loop and
+  bot-exchange guards; the bot-exchange guard counts `is_bot` contacts, so
+  `DELTACHAT_HUMAN_USERS` is optional and an unlisted human resets the count.
+- Voice calls: a caller who hung up while the call was being answered left a
+  leaked peer connection, or a dead call that stayed "active" for the chat
+  until restart. The session is now registered before the SDP/ICE work and
+  torn down on any failure.
+- Voice calls: what was being said at hang-up ("bye") was transcribed after
+  the call ended and answered, and the answer arrived as a text message,
+  `[[hangup]]` marker included. Utterances for an ended call are dropped.
+- Voice calls: every utterance left a WAV recording of the caller in
+  `<HERMES_HOME>/audio_cache/` that nothing deleted. It is removed after STT.
+- Voice calls: an outgoing call that was never answered injected "call ended"
+  notes into the AI's history, contrary to docs/voice-calls.md. Only a call
+  that went live gets them now.
+- Voice calls: the dedicated call event loop was never closed on disconnect
+  (file descriptors leaked per reconnect); a peer connection leaked when an
+  outgoing call could not be placed.
+- RPC transport: a non-JSON line on the server's stdout killed the reader
+  thread, after which every call hung forever with the server still running.
+  Such lines are skipped; a dead reader or writer thread now counts as a dead
+  server, and the event listener escalates instead of retrying each second.
+  A reply written just before the server exits is no longer reported as a
+  failure. Request and response logging no longer formats every payload when
+  debug logging is off.
+- A typo in `rate_limit_max`, `rate_limit_window`, `max_consecutive_replies`
+  or `max_bot_exchanges` crashed adapter construction; `rate_limit_max: 0`
+  let one message through and then none. They fall back to the default with
+  a warning.
+- Fire-and-forget tasks (answering a call, speaking a reply) are now
+  referenced until done, so they cannot be garbage-collected mid-flight.
+- `dc_send_message` accepts a chat token in `DELTACHAT_HOME_CHANNEL`.
+- Two module-level `asyncio.Lock`s were shared between the gateway loop and
+  the separate event loops Hermes runs tool handlers on; under contention
+  that raises or leaves the waiter hanging. The token lock is a thread lock
+  now and the spec fetch needs none.
+- The rate limiter kept one bucket per sender address forever. Idle ones are
+  swept once more than 1024 are tracked.
 
 ## [1.10.0] - 2026-10-04
 

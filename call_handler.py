@@ -141,6 +141,8 @@ def _take_one(counter: Counter, key: str) -> bool:
 
 
 def _env_flag(name: str) -> bool:
+    # Same rule as adapter._is_on. Not imported: this module is loaded by its
+    # top-level name, and importing adapter from here would load a second copy.
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -505,6 +507,11 @@ class IncomingAudioBuffer:
             except (OSError, ValueError) as e:
                 logger.error("STT failed: %s", e)
                 return
+            finally:
+                # why: a recording of the caller's voice per utterance, in a
+                # directory nothing prunes. Nothing reads it after STT.
+                with contextlib.suppress(OSError):
+                    os.unlink(wav_path)
         stt_s = time.monotonic() - t0
         if transcript:
             logger.info(
@@ -593,6 +600,7 @@ class CallSession:
     tts_checkpoints: list = field(
         default_factory=list
     )  # [(cum_chars, cum_frames)] per spoken sentence
+    answered: bool = False  # the call went live (accepted / answer SDP applied)
     hangup_pending: bool = False  # dc_end_call was requested — hang up after TTS drain
     hanging_up: bool = False  # _hangup_session in progress (idempotency guard)
     hangup_cancelled: bool = False  # barge-in during a pending hangup cancels it
@@ -666,7 +674,12 @@ class CallManager:
 
     def _run_call_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+        try:
+            self._loop.run_forever()
+        finally:
+            # Each reconnect builds a new CallManager; an unclosed loop keeps
+            # its selector and self-pipe open for the life of the process.
+            self._loop.close()
 
     async def _on_call_loop(self, coro):
         """Run *coro* on the dedicated call loop, awaiting the result from the
@@ -778,6 +791,7 @@ class CallManager:
             # Try to decline gracefully
             with contextlib.suppress(Exception):
                 await self._adapter.rpc.end_call(self._adapter.account_id, msg_id)
+            await self._teardown_session(msg_id)
 
     async def _handle_call_ended(self, event: Dict[str, Any]) -> None:
         msg_id = int(event["msg_id"])
@@ -1081,24 +1095,11 @@ class CallManager:
             if track.kind == "audio":
                 audio_buf.start(track)
 
-        # SDP exchange: remote offer in, our answer out
-        await pc.setRemoteDescription(
-            RTCSessionDescription(type="offer", sdp=sdp_offer)
-        )
-        self._log_sdp("Incoming offer", sdp_offer)
-        pc.addTrack(out_track)
-        await pc.setLocalDescription(await pc.createAnswer())
-        await self._gather_ice(pc)
-        self._log_sdp("Our answer", pc.localDescription.sdp)
-
-        await self._adapter.rpc.accept_incoming_call(
-            self._adapter.account_id,
-            msg_id,
-            pc.localDescription.sdp,
-        )
-        logger.info("Accepted call msg_id=%s chat_id=%s", msg_id, chat_id)
-
-        self._register_session(
+        # why registered before the SDP/ICE work (up to _ICE_GATHER_TIMEOUT_S):
+        # a caller who hangs up meanwhile sends CallEnded, which must find this
+        # session to close its pc. Registered only after accepting, the pc
+        # leaked — or the dead call stayed "active" for the chat until restart.
+        session = self._register_session(
             pc,
             ice_channel,
             out_track,
@@ -1108,6 +1109,27 @@ class CallManager:
             caller_id,
             caller_name,
         )
+
+        # SDP exchange: remote offer in, our answer out
+        await pc.setRemoteDescription(
+            RTCSessionDescription(type="offer", sdp=sdp_offer)
+        )
+        self._log_sdp("Incoming offer", sdp_offer)
+        pc.addTrack(out_track)
+        await pc.setLocalDescription(await pc.createAnswer())
+        await self._gather_ice(pc)
+        if self._sessions.get(msg_id) is not session:
+            logger.info("Call %s ended while it was being answered", msg_id)
+            return
+        self._log_sdp("Our answer", pc.localDescription.sdp)
+
+        await self._adapter.rpc.accept_incoming_call(
+            self._adapter.account_id,
+            msg_id,
+            pc.localDescription.sdp,
+        )
+        session.answered = True
+        logger.info("Accepted call msg_id=%s chat_id=%s", msg_id, chat_id)
 
         # Diagnostic baseline: a working (incoming) call's RTP counters, to diff
         # against the silent outgoing call.
@@ -1180,14 +1202,20 @@ class CallManager:
         await pc.setLocalDescription(await pc.createOffer())
         await self._gather_ice(pc)
         self._log_sdp("Our offer", pc.localDescription.sdp)
-        msg_id = int(
-            await self._adapter.rpc.place_outgoing_call(
-                self._adapter.account_id,
-                int(chat_id),
-                pc.localDescription.sdp,
-                False,
+        try:
+            msg_id = int(
+                await self._adapter.rpc.place_outgoing_call(
+                    self._adapter.account_id,
+                    int(chat_id),
+                    pc.localDescription.sdp,
+                    False,
+                )
             )
-        )
+        except Exception:
+            # No session exists yet to own the pc, so close it here.
+            with contextlib.suppress(Exception):
+                await pc.close()
+            raise
         logger.info(
             "Placed outgoing call: msg_id=%s chat_id=%s caller=%s",
             msg_id,
@@ -1251,6 +1279,10 @@ class CallManager:
         await pc.setRemoteDescription(
             RTCSessionDescription(type="answer", sdp=sdp_answer)
         )
+        with self._state_lock:
+            live = self._sessions.get(msg_id)
+        if live is not None:
+            live.answered = True
 
         # Briefly confirm the media path comes up before returning, so the tool
         # reports a genuinely live call and surfaces an immediate failure as an
@@ -1596,6 +1628,14 @@ class CallManager:
         except ImportError:
             pass
 
+        # why: teardown flushes whatever was being said at hang-up ("bye")
+        # through STT. Injecting it then gets an answer nobody can hear, which
+        # send() delivers as a text message — "[[hangup]]" marker included.
+        with self._state_lock:
+            if msg_id not in self._sessions:
+                logger.debug("Dropping utterance for ended call %s", msg_id)
+                return
+
         # First real user turn — the post-dc_start_call ack window is over, so a
         # never-consumed suppression can't eat a genuine spoken reply.
         with self._state_lock:
@@ -1842,7 +1882,9 @@ class CallManager:
             await asyncio.wait_for(session.pc.close(), timeout=3.0)
         logger.info("Call session %s torn down", msg_id)
         # Tell the AI the call is over so it doesn't think it's still connected.
-        if notify_ai:
+        # why `answered`: a call that never went live (declined, unanswered,
+        # hung up while ringing) had no "call started" turn to close.
+        if notify_ai and session.answered:
             asyncio.ensure_future(
                 self._note_call_ended(chat_id, caller_id, caller_name, msg_id)
             )
@@ -1905,12 +1947,10 @@ class CallManager:
         with self._state_lock:
             return chat_id in self._chat_to_msg
 
-    def first_active_chat_id(self) -> Optional[str]:
-        """Return an arbitrary active chat_id, or None.  Used by dc_end_call."""
+    def active_chat_ids(self) -> list:
+        """Chat ids with a call in progress. Used by dc_end_call."""
         with self._state_lock:
-            for chat_id in self._chat_to_msg:
-                return chat_id
-            return None
+            return list(self._chat_to_msg)
 
     @staticmethod
     def is_call_thread(thread_id) -> bool:

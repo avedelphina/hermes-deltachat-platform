@@ -5,6 +5,7 @@
 When the AI sends an image by URL, the adapter downloads it before forwarding it to Delta Chat. The following restrictions apply:
 
 - **Scheme**: only `http://` and `https://` URLs are accepted.
+- **Target**: URLs that resolve to loopback, private or link-local addresses are refused. Hermes' own URL policy decides when available, so its `allow_private_urls` setting is honoured.
 - **Redirects**: `httpx` is configured with `follow_redirects=False` to avoid open-redirect issues.
 - **Size limit**: downloads are bounded to **25 MiB** by both the `Content-Length` header and the streamed response size.
 - **Content-Type**: the response must declare `image/*`; non-image responses are rejected.
@@ -29,6 +30,14 @@ Hermes keys pairing approvals, sessions, `DELTACHAT_HOME_CHANNEL` and cron targe
 ## Voice calls
 
 Incoming calls are declined unless the caller passes the same sender rules as a direct message (`allowed_users`, `dm_policy`) and Hermes' own authorization.
+
+## Senders without a key
+
+Identity in Delta Chat is the key. A message from a contact without one is plain unencrypted mail, whose From address can be forged, so it is dropped silently and unread. This also means the bot does not answer people who write to its address from an ordinary email client.
+
+## Chat tokens
+
+Each message carries an opaque `[dc:chat=<token>]` tag that scopes the RPC tools to that chat. `dc_safe_rpc_call` and `dc_start_call` only accept a token from the conversation it belongs to; `dc_send_message` accepts any, since sending to another chat is its purpose.
 
 ## Contact verification
 
