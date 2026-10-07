@@ -6,8 +6,16 @@ speech-to-text → Hermes AI → text-to-speech → spoken reply, all over the l
 WebRTC call.
 
 Requires `aiortc` (see [nixos-installation.md](nixos-installation.md) for the
-NixOS setup). Incoming calls are auto-answered; hang up from your Delta Chat
-client (or the bot can hang up via `dc_end_call`).
+NixOS setup). Incoming calls are auto-answered when the caller passes the same
+sender rules as a direct message (`allowed_users`, `dm_policy`, Hermes'
+authorization); other calls are declined. Hang up from your Delta Chat client, or
+say goodbye: the bot ends its goodbye with a `[[hangup]]` marker (stripped before
+speech) and the call ends once the goodbye has played. If you set a custom
+`DELTACHAT_CALL_PROMPT`, keep that instruction in it. `dc_end_call` still works.
+
+Each call runs in its own session (`call-<msg_id>`), so earlier calls do not
+pile up in the context. Only the final reply of a turn is spoken; status
+messages are not.
 
 ## Outgoing calls (the bot calls you)
 

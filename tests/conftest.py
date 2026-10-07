@@ -260,6 +260,18 @@ gateway_module.config = gateway_config_module
 import pytest  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolated_hermes_home(tmp_path, monkeypatch):
+    """Give every test its own Hermes home.
+
+    why: connect() and the standalone sender write <HERMES_HOME>/.deltachat-db-id.
+    Without this a test run with a mocked RPC would leave a bogus marker in a
+    shared (or the developer's real) Hermes home, and the next start would refuse.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    (tmp_path / "hermes-home").mkdir()
+
+
 @pytest.fixture
 def platform_config():
     """Create a mock PlatformConfig."""

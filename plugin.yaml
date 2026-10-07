@@ -112,12 +112,16 @@ optional_env:
     description: "Stop auto-replying in a chat after this many messages from senders not in DELTACHAT_HUMAN_USERS — catches 3+ bots round-robining a group, which the single-sender loop guard above can't (default: 12; only active when DELTACHAT_HUMAN_USERS is set)"
     prompt: "Max bot-to-bot exchanges before requiring a human"
     password: false
+  - name: DELTACHAT_COMMANDS_BIO
+    description: "Set to '1' to list the bot's slash commands in its profile bio, below a 'Hermes commands:' line; your own text above it is kept. The bio is sent with every message (~5 KB). Unset or '0' removes the list again"
+    prompt: "Commands in bio? (1/0)"
+    password: false
   - name: DELTACHAT_ENABLE_RAW_RPC
-    description: "Set to '1' to register the unrestricted dc_rpc_call tool (use with caution)"
+    description: "Set to '1' to register the account-wide dc_rpc_call tool (use with caution). '0', 'false', 'no' and 'off' leave it off"
     prompt: "Enable raw RPC access? (1/0)"
     password: false
   - name: DELTACHAT_RAW_RPC_ALLOWLIST
-    description: "Comma-separated list of methods allowed for dc_rpc_call (empty = all non-destructive methods)"
+    description: "Comma-separated list of methods allowed for dc_rpc_call (blank = every method that is not blocked; set but naming nothing = none)"
     prompt: "Raw RPC allowlist (optional)"
     password: false
   - name: DELTACHAT_RAW_RPC_BLOCKLIST

@@ -2,6 +2,83 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+Ports from upstream 2.0.0 (Simon-Laux/hermes-deltachat-platform).
+
+### Security
+- `dc_safe_rpc_call` validates file paths. `send_msg` (`data.file`),
+  `misc_send_msg`, `misc_set_draft`, `set_chat_profile_image` and
+  `send_sticker` used to hand any host path to core, so a steered agent could
+  send `~/.hermes/.env` or the account database into the chat — also from the
+  Docker sandbox, because the RPC server runs on the host. Paths now go
+  through Hermes' delivery policy; on top of that every Hermes profile's Delta
+  Chat data dir and `logs/` are refused, compared by inode. A path-shaped
+  parameter this code does not know refuses the call.
+- `dc_safe_rpc_call` binds parameters by name. `[accountId, chatId] + params`
+  assumed `chatId` is parameter 1; `search_messages` has it last.
+- The RPC tools refuse 11 more methods: `forward_messages` (copies out of any
+  other chat), the two SecureJoin QR methods (the QR text is the invite),
+  `add_contact_to_chat`, `set_chat_ephemeral_timer`, `block_chat`,
+  `set_chat_mute_duration`, `set_chat_visibility`, `send_locations_to_chat`,
+  `place_outgoing_call` (use `dc_start_call`), `init_webxdc_integration`.
+  `dc_rpc_spec` / `dc_chat_rpc_spec` no longer list refused methods.
+- `DELTACHAT_ENABLE_RAW_RPC=0`, `false`, `no` or `off` now disables
+  `dc_rpc_call`; any non-empty value used to enable it.
+  `DELTACHAT_RAW_RPC_ALLOWLIST` / `_BLOCKLIST` are read per call, and an
+  allowlist that is set but names nothing allows nothing. Every raw call is
+  logged at WARNING as ACCEPTED or REFUSED.
+- Incoming calls are declined unless the caller passes the sender rules a DM
+  gets (`allowed_users`, `dm_policy`) and Hermes' own authorization. Calls
+  used to be answered for anyone, loading STT first.
+- The adapter refuses to start on a Delta Chat database that isn't the one
+  this Hermes state was paired with. Hermes keys pairing approvals, sessions,
+  `DELTACHAT_HOME_CHANNEL` and cron targets on contact and chat IDs, which a
+  recreated database hands out again. A random ID is stored in the account
+  (`ui.hermes.db_id`) and in `<HERMES_HOME>/.deltachat-db-id`; on mismatch the
+  adapter stops with recovery steps. Existing installs adopt their current
+  database on first start. `hermes send` / headless cron run the same check.
+
+### Added
+- Exec-approval prompts can be answered by reacting 👍 (approve once) or 👎
+  (deny) to the prompt; `/approve` and `/deny` still work. A reaction only
+  answers the prompt it was given to, only from a key contact that passes the
+  adapter's sender rules and Hermes' authorization for that chat, and not
+  past `allow_admin_from`. Prompts arriving during a voice call are not
+  delivered.
+- `/cmd@<name>` command addressing. One addressed to this bot (display name
+  or a `mention_aliases` entry) reaches Hermes as a plain `/cmd`; in a group,
+  one addressed to another name is ignored. A bare `/cmd` still reaches every
+  bot.
+- `DELTACHAT_COMMANDS_BIO=1` (or `commands_bio: true`) lists the gateway's
+  slash commands in the bot's profile bio, below a `Hermes commands:` line;
+  text above that line is kept. Off by default: core sends the bio with every
+  message (~5 KB). Turning it off again removes the list.
+- Videos are sent as videos (`send_video`) instead of a "couldn't send video"
+  notice.
+- The SecureJoin invite link is written to `invite.txt` (mode 0600) in the
+  accounts dir on every connect; the log names the file.
+- Voice calls hang up on goodbye: the bot ends its goodbye with `[[hangup]]`,
+  which is stripped before TTS. A custom `DELTACHAT_CALL_PROMPT` must keep
+  that instruction. `dc_end_call` stays available.
+
+### Fixed
+- `DELTACHAT_CALL_MODEL` was ignored on Hermes 0.21.5 (the message handler is
+  a closure there, so the gateway runner lookup returned nothing). It is also
+  installed before the greeting turn now, and an unreachable runner logs a
+  WARNING.
+- Voice calls no longer read status sends aloud (memory notices, tool
+  progress, busy notices). Only the turn's final reply is spoken, on Hermes
+  cores that mark it.
+- Each voice call gets its own session (`call-<msg_id>`) instead of one
+  ever-growing `call` thread.
+- Replies to the internal "call ended" note are recognised by what they reply
+  to instead of a per-chat counter, which could leak the reply or swallow the
+  next real one. A non-numeric `reply_to` sends unquoted instead of failing.
+- Cron delivery to a chat token failed with `invalid literal for int()`. A
+  chat token is now accepted wherever an outbound chat id is, including
+  `hermes send`.
+
 ## [1.10.0] - 2026-10-04
 
 ### Fixed

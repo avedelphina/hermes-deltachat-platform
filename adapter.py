@@ -21,6 +21,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -41,12 +42,30 @@ from gateway.platforms.base import (  # noqa: E402
 )
 from gateway.config import Platform, PlatformConfig  # noqa: E402
 
+# why: Hermes >= 0.21.5 marks only a turn's final reply with metadata["notify"]
+# (base.py _mark_notify_metadata). Voice calls speak only that; on an older
+# core nothing carries the flag, so filtering on it would silence every call.
+_BASE_MARKS_FINAL_REPLY = hasattr(
+    sys.modules.get("gateway.platforms.base"), "_mark_notify_metadata"
+)
+
 # Must use "hermes_plugins.*" prefix so records appear in gateway.log.
 # __name__ resolves to "adapter" (standalone module), which only goes to agent.log.
 logger = logging.getLogger("hermes_plugins.deltachat")
 
-# Enable debug logging for RPC if requested
-if os.getenv("DELTACHAT_DEBUG"):
+
+def _is_on(value) -> bool:
+    """On/off rule for kill-switch env vars: "0"/"false"/"no"/"off" are off.
+
+    why: plain truthiness on os.getenv treats "0" as enabled (non-empty
+    string), which is a fail-open kill switch.
+    """
+    return str(value).strip().lower() not in ("", "0", "false", "no", "off")
+
+
+# Enable debug logging for RPC if requested. It logs every RPC request and
+# response, passwords and invite links included.
+if _is_on(os.getenv("DELTACHAT_DEBUG", "")):
     logging.getLogger("deltachat2").setLevel(logging.DEBUG)
     logging.getLogger("deltachat2.IOTransport").setLevel(logging.DEBUG)
 
@@ -69,6 +88,9 @@ _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 # Delta Chat's reserved contact id for the account itself.
 DC_CONTACT_ID_SELF = 1
+
+# DC config key pairing the database with Hermes' state; see _check_db_id.
+_DB_ID_KEY = "ui.hermes.db_id"
 
 _WORKSPACE_PREFIX = "/workspace/"
 _XDC_MEDIA_RE = re.compile(
@@ -536,6 +558,66 @@ def _build_mention_pattern(name: str) -> Optional[re.Pattern]:
     return re.compile(rf"(?:^|\W)@{core}(?:\W|$)", re.IGNORECASE)
 
 
+# why: /start only acknowledges Telegram's start ping and /topic refuses
+# everything but Telegram DMs; every other gateway command works here.
+_BIO_SKIP_COMMANDS = frozenset({"start", "topic"})
+
+# Everything above this line in the bio is the operator's own text and is
+# kept; everything below it is regenerated on connect.
+_BIO_MARKER = "Hermes commands:"
+_BIO_DEFAULT_INTRO = "Hermes AI assistant – just write to me."
+
+
+def _own_bio(current: str) -> Optional[str]:
+    """The operator's text above the command list, or None when there is no list."""
+    # splitlines: a bio edited on another client may come back with \r\n.
+    lines = current.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == _BIO_MARKER:
+            return "\n".join(lines[:i]).strip()
+    return None
+
+
+def _commands_bio(own: str, extra: Dict) -> Optional[str]:
+    """*own* bio text with the gateway's slash commands appended, one per line.
+
+    Built from Hermes' own registry so it follows the installed version; None
+    when that API isn't there (older cores).
+    """
+    try:
+        # Private helpers, but the ones Hermes builds Telegram's command menu from.
+        from hermes_cli.commands_platforms import _gateway_available_commands
+        from hermes_cli.commands import _iter_plugin_command_entries
+        from gateway.slash_access import policy_from_extra
+
+        entries = [
+            (c.name, c.args_hint, c.description) for c in _gateway_available_commands()
+        ]
+        entries += [
+            (name, hint, desc) for name, desc, hint in _iter_plugin_command_entries()
+        ]
+        # Everyone who gets a message sees the bio, so list only what a
+        # non-admin may run in a DM — the filter Hermes' /help applies.
+        policy = policy_from_extra(extra, "dm")
+    except Exception as e:
+        logger.warning(
+            "Not setting the commands bio, Hermes command registry unavailable: %s", e
+        )
+        return None
+    lines = [own or _BIO_DEFAULT_INTRO, "", _BIO_MARKER]
+    for name, hint, desc in entries:
+        if name in _BIO_SKIP_COMMANDS or not policy.can_run(None, name):
+            continue
+        usage = f"/{name} {hint}".strip()
+        # One line per command, without the parenthesised details.
+        lines.append(f"{usage} – {' '.join(desc.split()).split(' (')[0]}")
+    return "\n".join(lines)
+
+
+# Telegram-style addressed command: "/cmd@<name>". See _command_for_us.
+_COMMAND_ADDR_RE = re.compile(r"/[\w-]+@")
+
+
 def _contact_name(contact: dict, fallback: str) -> str:
     """Best display name from a ``get_contact`` snapshot."""
     return (
@@ -652,22 +734,43 @@ _active_adapter = None
 _chat_id_to_token: Dict[int, str] = {}
 _chat_token_to_id: Dict[str, int] = {}
 
-# Methods that mutate or destroy chat data — blocked from dc_safe_rpc_call.
-_DESTRUCTIVE_METHODS = frozenset(
+# Methods the RPC tools refuse, beyond the delete_*/remove_* prefix rule.
+# Each is here for what it does, not for what it is called.
+_BLOCKED_METHODS = frozenset(
     {
-        "delete_chat",
-        "delete_messages",
-        "delete_messages_for_all",
-        "remove_contact_from_chat",
-        "remove_draft",
+        # destroys or detaches
         "leave_group",
+        "set_chat_ephemeral_timer",  # timed deletion: delete_messages by another name
+        # reaches outside the chat the token scopes
+        "forward_messages",  # messageIds are global: copies out of any other chat
+        "add_contact_to_chat",
+        # hands out credentials: the QR text *is* the group invite
+        "get_chat_securejoin_qr_code",
+        "get_chat_securejoin_qr_code_svg",
+        # leaks the device, not the chat
+        "send_locations_to_chat",
+        # hides the conversation from the bot's own operator
+        "set_chat_mute_duration",
+        "set_chat_visibility",
+        "block_chat",
+        # reachable by a better route, or not ours to touch
+        "place_outgoing_call",  # dc_start_call handles the opening line
+        "init_webxdc_integration",
     }
 )
 
 
-def _is_destructive(method: str) -> bool:
-    """Whether an RPC method may mutate or destroy chat data (always blocked)."""
-    return method in _DESTRUCTIVE_METHODS or method.startswith(("delete_", "remove_"))
+def _is_blocked(method: str) -> bool:
+    """Whether the RPC tools refuse *method*.
+
+    The prefix half is open-ended on purpose: a delete_* method added by a
+    future core is blocked the day it appears. This is a *name* rule, so it
+    bounds names, not capabilities (set_config can still wipe messages via
+    delete_device_after) — DELTACHAT_RAW_RPC_ALLOWLIST is the real control
+    for dc_rpc_call. File paths are a parameter problem and are checked in
+    the safe call handler.
+    """
+    return method in _BLOCKED_METHODS or method.startswith(("delete_", "remove_"))
 
 
 def _parse_method_list(value: Optional[str]) -> frozenset:
@@ -677,10 +780,113 @@ def _parse_method_list(value: Optional[str]) -> frozenset:
     return frozenset(m.strip() for m in value.split(",") if m.strip())
 
 
-# Optional explicit allowlist/blocklist for the unrestricted dc_rpc_call tool.
-# DESTRUCTIVE_METHODS and delete_/remove_ prefixes are always blocked.
-_RAW_RPC_ALLOWLIST = _parse_method_list(os.getenv("DELTACHAT_RAW_RPC_ALLOWLIST"))
-_RAW_RPC_BLOCKLIST = _parse_method_list(os.getenv("DELTACHAT_RAW_RPC_BLOCKLIST"))
+# Spec parameter names that carry a local filesystem path for core to read.
+# send_msg's path is nested as data.file and handled separately.
+_PATH_PARAMS = frozenset({"file", "imagePath", "stickerPath"})
+# Names that look like paths but are not: filename is the display name only.
+_NOT_PATH_PARAMS = frozenset({"filename"})
+
+
+def _unchecked_path_name(names) -> Optional[str]:
+    """First name that looks like a path but has no handling here, else None.
+
+    why: _PATH_PARAMS matches today's spec by name, and the spec is fetched
+    from whatever core is installed. A future core that renames `file` or
+    adds a `filePath` would otherwise slip past unchecked; refusing unknown
+    path-shaped names fails closed instead.
+    """
+    for name in names:
+        lowered = name.lower()
+        if (
+            ("file" in lowered or "path" in lowered)
+            and name not in _PATH_PARAMS
+            and name not in _NOT_PATH_PARAMS
+        ):
+            return name
+    return None
+
+
+def _protected_dirs(adapter) -> list:
+    """Directories whose contents must never be sent: Delta Chat state and logs.
+
+    Covers every profile of this Hermes root, not just ours: a bot steered in
+    profile A could otherwise send profile B's dc.db. Hermes' own helper
+    enumerates those homes; older cores lack it, so fall back to ours.
+    """
+    from gateway.config import get_hermes_home
+
+    try:
+        from gateway.platforms.base import _credential_home_roots
+
+        homes = [str(h) for h in _credential_home_roots()]
+    except Exception:
+        homes = []
+    homes.append(str(get_hermes_home()))
+    dirs = [adapter._get_dc_config_dir()]
+    for home in homes:
+        # "deltachat" is the v1.6.x data dir (see _default_dc_data_dir).
+        dirs += [
+            os.path.join(home, d) for d in ("deltachat-platform", "deltachat", "logs")
+        ]
+    return dirs
+
+
+def _is_inside(path: str, dirs) -> bool:
+    """True if *path* or any parent is one of *dirs*, compared by inode.
+
+    why: inode, not string prefix. On a case-insensitive filesystem (macOS)
+    realpath keeps the caller's spelling, so ~/.HERMES/deltachat-platform/
+    opens the same files while missing a prefix match.
+    """
+    ids = set()
+    for d in dirs:
+        try:
+            st = os.stat(d)
+        except OSError:
+            continue
+        ids.add((st.st_dev, st.st_ino))
+    current = os.path.realpath(path)
+    while True:
+        try:
+            st = os.stat(current)
+            if (st.st_dev, st.st_ino) in ids:
+                return True
+        except OSError:
+            pass
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
+def _safe_delivery_path(adapter, path) -> Optional[str]:
+    """The validated host path for *path*, or None if delivery policy refuses it.
+
+    Hermes' policy denylists its own secrets (.env, state.db, ~/.ssh) but
+    knows nothing about ours: the Delta Chat account dir holds dc.db (PGP
+    secret key, mail password, every chat) and the logs carry message
+    content. Refuse both on top of Hermes' check.
+    """
+    if not isinstance(path, str):
+        return None
+    safe = adapter.filter_local_delivery_paths([path])
+    if not safe or _is_inside(safe[0], _protected_dirs(adapter)):
+        return None
+    return safe[0]
+
+
+def _refuse_path(method: str, path) -> str:
+    # why: %r — the path is model-supplied; a newline must not forge a log line.
+    logger.warning("Safe RPC call %r REFUSED (unsafe file path): %r", method, path)
+    return json.dumps(
+        {
+            "error": (
+                f"'{method}': file path refused — it does not exist on this host "
+                "or lies under a location the delivery policy protects"
+            )
+        }
+    )
+
 
 # Cached OpenRPC spec (fetched lazily on first use).
 _spec_cache: Optional[dict] = None
@@ -720,6 +926,17 @@ async def _get_or_create_chat_token(rpc, account_id: int, chat_id: int) -> str:
         _chat_id_to_token[chat_id] = token
         _chat_token_to_id[token] = chat_id
     return token
+
+
+def _quote_id(reply_to) -> Optional[int]:
+    """DC message id to quote, or None when reply_to is not a real DC message.
+
+    why: Hermes anchors replies on the triggering event's message_id, and our
+    synthetic events (call notes) carry non-numeric ids; int() on those failed
+    the whole send instead of just sending it unquoted.
+    """
+    s = str(reply_to or "").strip()
+    return int(s) if s.isdigit() else None
 
 
 async def _resolve_chat_token(rpc, account_id: int, token: str) -> Optional[int]:
@@ -912,6 +1129,9 @@ class DeltaChatAdapter(BasePlatformAdapter):
             )
             if p is not None
         ]
+        # why opt-in: core sends the bio as the signature of every outgoing
+        # message, so the command list costs ~5 KB per reply.
+        self._commands_bio_enabled = cfg_bool("DELTACHAT_COMMANDS_BIO", "commands_bio")
         self._avatar_path = _validate_avatar_path(
             cfg("DELTACHAT_AVATAR_PATH", "avatar_path") or None, strict=False
         )
@@ -929,6 +1149,9 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._lock = threading.RLock()
         self._self_addr: Optional[str] = None
         self._invite_link: Optional[str] = None
+        # Exec-approval prompt msg id -> (Hermes session key, request_id),
+        # oldest first. Only prompts whose request_id is known are here.
+        self._approval_prompts: Dict[int, tuple] = {}
         self._roster_cache: dict[str, tuple[float, list]] = {}
 
     def _bump_stat(self, key: str, count: int = 1) -> None:
@@ -1089,6 +1312,23 @@ class DeltaChatAdapter(BasePlatformAdapter):
             return False
         return any(p.search(text) for p in self._mention_patterns)
 
+    def _command_for_us(self, text: str, addr_start: int) -> Optional[str]:
+        """For "/cmd@<name> args": "/cmd args" if <name> is this bot, else None.
+
+        *addr_start* is the index right after the "@". Exact (case-insensitive)
+        name or alias only — an address is typed deliberately, so the
+        declension tolerance of prose @mentions does not apply.
+        """
+        rest = text[addr_start:]
+        names = [n for n in (self._display_name, *self._mention_aliases) if n]
+        # why: longest first, so with names "Hermes" and "Hermes Bot",
+        # "/reset@Hermes Bot" strips the whole name instead of leaving " Bot".
+        for name in sorted(names, key=len, reverse=True):
+            m = re.match(re.escape(name) + r"(?![\w-])", rest, re.IGNORECASE)
+            if m:
+                return text[: addr_start - 1] + rest[m.end() :]
+        return None
+
     async def _quote_is_self_authored(self, quote: dict) -> bool:
         """Whether a ``WithMessage`` quote points at one of this bot's own messages.
 
@@ -1246,15 +1486,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
         is_request = bool(chat.get("is_contact_request"))
 
         if chat_type == "Single":
-            # why: core >= 2.6x dropped Contact.is_verified, so the key is absent
-            # (None), not False. Only then require the SecureJoin-completion
-            # marker recorded by _record_securejoin_pairing. A present
-            # is_verified (older core) stays authoritative. Fail-closed.
-            if verified_field is not None:
-                is_paired = bool(verified_field)
-            else:
-                is_paired = bool(from_id) and await self._is_securejoin_paired(from_id)
-            reason = self._check_dm(sender_email, is_paired)
+            reason = await self._dm_rejection(from_id, sender_email, verified_field)
             if reason:
                 logger.warning("dm_policy rejected %s", sender_email)
                 return await self._reject(chat_id, reason)
@@ -1279,6 +1511,68 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
         self._bump_stat("messages_received")
         return True
+
+    async def _dm_rejection(
+        self, from_id, sender_email, verified_field
+    ) -> Optional[str]:
+        """Why dm_policy refuses this contact (message or call), or None."""
+        # why: core >= 2.6x dropped Contact.is_verified, so the key is absent
+        # (None), not False. Only then require the SecureJoin-completion
+        # marker recorded by _record_securejoin_pairing. A present
+        # is_verified (older core) stays authoritative. Fail-closed.
+        if verified_field is not None:
+            is_paired = bool(verified_field)
+        else:
+            is_paired = bool(from_id) and await self._is_securejoin_paired(from_id)
+        return self._check_dm(sender_email, is_paired)
+
+    async def _sender_allowed(
+        self, from_id, chat_type: str, chat_id, *, strict: bool = False
+    ) -> bool:
+        """Sender policy for events that are not messages (calls, reactions).
+
+        The rules _gate_inbound applies, minus its side effects (no dedup,
+        rate limit or rejection reply), then Hermes' own verdict. Fail-closed
+        on a contact we cannot load.
+
+        strict (reactions that approve a command): the contact must be a key
+        contact — an address is spoofable, a key is not — and Hermes must say
+        yes. Otherwise only Hermes' explicit no refuses; None ("no check
+        wired", older cores) is not a verdict.
+        """
+        if not from_id:
+            return False
+        try:
+            contact = await self.rpc.get_contact(self.account_id, int(from_id))
+        except Exception as e:
+            logger.warning("Could not load contact %s: %s", from_id, e)
+            return False
+        email = (contact.get("address") or "").lower()
+        if self._allowed_users and email not in self._allowed_users:
+            return False
+        if chat_type == "group":
+            reason = self._check_group(email)
+        else:
+            reason = await self._dm_rejection(
+                from_id, email, contact.get("is_verified")
+            )
+        if reason:
+            return False
+        core_check = getattr(self, "_is_sender_authorized", None)
+        verdict = (
+            core_check(str(from_id), chat_type, str(chat_id)) if core_check else None
+        )
+        if strict:
+            return bool(contact.get("is_key_contact")) and verdict is True
+        return verdict is not False
+
+    async def _caller_allowed(self, from_id, chat_id) -> bool:
+        """Whether an incoming call may be answered: a call is a DM.
+
+        Checked before answering — that sets up WebRTC and loads STT before
+        Hermes ever sees (and drops) what an unauthorized caller says.
+        """
+        return await self._sender_allowed(from_id, "dm", chat_id)
 
     async def _reject(self, chat_id, reply: Optional[str]) -> bool:
         """Count a rejected inbound message and send *reply* if configured.
@@ -1365,6 +1659,150 @@ class DeltaChatAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("Could not set avatar: %s", e)
 
+    async def _update_commands_bio(self) -> None:
+        """Write the command list into the profile bio, or take it out when disabled."""
+        try:
+            current = await self.rpc.get_config(self.account_id, "selfstatus") or ""
+            own = _own_bio(current)
+            if self._commands_bio_enabled:
+                bio = _commands_bio(
+                    current.strip() if own is None else own, self.config.extra or {}
+                )
+            elif own is not None:
+                # Turned off again: take the list back out.
+                bio = "" if own == _BIO_DEFAULT_INTRO else own
+            else:
+                bio = None
+            # Only on change: a write is synced to the account's other devices.
+            if bio is not None and bio != current:
+                await self.rpc.set_config(self.account_id, "selfstatus", bio)
+                logger.info("Updated the command list in the profile bio")
+        except Exception as e:
+            logger.warning("Could not update the commands bio: %s", e)
+
+    def _write_invite_file(self, link: str) -> None:
+        """Persist the SecureJoin invite link to a 0600 file in the accounts dir.
+
+        why a file: with headless onboarding nobody watches setup.py's
+        terminal, and under dm_policy=pairing whoever holds the link can reach
+        the agent — so it must not go to the world-readable gateway log at
+        INFO. The log only names the file.
+        """
+        if not link:
+            return
+        path = os.path.join(self._get_dc_config_dir(), "invite.txt")
+        try:
+            # os.open with an explicit mode: no window where the link sits in
+            # a umask-default (usually 0644) file.
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(link + "\n")
+            os.chmod(path, 0o600)  # O_CREAT's mode is ignored for an existing file
+        except OSError as e:
+            # Nothing to point at, so the link itself is the only way to pair.
+            logger.warning(
+                "Could not write invite link to %s (%s). Invite link: %s", path, e, link
+            )
+            return
+        logger.info("Delta Chat invite link written to %s", path)
+
+    async def _check_db_id(self) -> bool:
+        """Refuse to run on a Delta Chat database Hermes' state doesn't belong to.
+
+        Hermes keys pairing approvals, sessions, the home channel and cron
+        targets on DC contact and chat IDs, which are local to one DC database.
+        If that database is lost and recreated, the IDs are handed out again —
+        an approved contact 10 can now be a stranger, inheriting the access and
+        the conversation history. So the same random ID is kept in the DC
+        config and in a dotfile in HERMES_HOME (next to Hermes' state, not
+        inside the accounts dir, so resetting the database can't take it
+        along); on mismatch we stop instead of guessing.
+
+        Neither side having an ID is a fresh install *or* an upgrade from
+        before this check: both just adopt a new one. With self.account_id
+        None (no DC account yet) only a mismatch is detected, so onboarding
+        doesn't create an account first.
+        """
+        from gateway.config import get_hermes_home
+
+        marker = os.path.join(str(get_hermes_home()), ".deltachat-db-id")
+        dc_id = None
+        if self.account_id is not None:
+            dc_id = await self.rpc.get_config(self.account_id, _DB_ID_KEY) or None
+        try:
+            try:
+                with open(marker) as f:
+                    hermes_id = f.read().strip() or None
+            except FileNotFoundError:
+                hermes_id = None
+            if hermes_id is None:
+                if self.account_id is None:
+                    return True
+                if dc_id is None:
+                    # DC first: dying before the file is written leaves the
+                    # adoptable state below, never a refusing one.
+                    dc_id = str(uuid.uuid4())
+                    await self.rpc.set_config(self.account_id, _DB_ID_KEY, dc_id)
+                    self._warn_if_already_paired()
+                # else: only the marker is gone (deleted by hand, as the
+                # recovery below says) — adopt the database's ID.
+                tmp = marker + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(dc_id + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, marker)
+                return True
+        except (OSError, UnicodeDecodeError) as e:
+            message = (
+                f"Cannot read or write the Delta Chat database marker {marker}: {e}"
+            )
+            logger.error(message)
+            # Not retryable: needs the operator to fix permissions or the disk.
+            self._set_fatal_error("deltachat_db_marker_io", message, retryable=False)
+            return False
+
+        if dc_id == hermes_id:
+            return True
+
+        message = (
+            f"The Delta Chat database does not belong to this Hermes state "
+            f"(ID {dc_id or 'missing'} in the database, {hermes_id} in {marker}). "
+            "It was probably recreated, so its contact and chat IDs now mean "
+            "different people. Refusing to start: Hermes' pairing approvals, "
+            "sessions, DELTACHAT_HOME_CHANNEL and cron delivery targets would "
+            "apply to the wrong contacts. To start over on this database "
+            "(add `-p <profile>` if this isn't the default profile): revoke the "
+            "deltachat-platform approvals (`hermes pairing list`, `hermes "
+            "pairing revoke deltachat-platform <id>`) and remove Delta Chat IDs "
+            "from GATEWAY_ALLOWED_USERS; delete its sessions (`hermes sessions "
+            "prune --source deltachat-platform --include-pinned "
+            "--include-archived`, then `hermes sessions delete <id>` for each "
+            "one still listed); unset DELTACHAT_HOME_CHANNEL and fix cron jobs "
+            f"that deliver to Delta Chat; then delete {marker} and restart."
+        )
+        logger.error(message)
+        # Not retryable: a reconnect would find the same mismatch.
+        self._set_fatal_error("deltachat_db_mismatch", message, retryable=False)
+        return False
+
+    @staticmethod
+    def _warn_if_already_paired() -> None:
+        """On upgrade, note that existing approvals were trusted unverified."""
+        try:
+            from gateway.pairing import PairingStore
+
+            approved = PairingStore().list_approved("deltachat-platform")
+        except Exception:
+            return
+        if approved:
+            logger.warning(
+                "Delta Chat database ID created with %d pairing approval(s) "
+                "already present. They are assumed to belong to this database; "
+                "if it was recreated earlier, check `hermes pairing list`.",
+                len(approved),
+            )
+
     async def _configure_account(self, rpc) -> bool:
         """Select an existing account or create and configure a new one."""
         accounts = await rpc.get_all_accounts()
@@ -1386,6 +1824,12 @@ class DeltaChatAdapter(BasePlatformAdapter):
             )
             await rpc.remove_account(self.account_id)
             self.account_id = None
+
+        # Before creating anything: an existing marker with no usable account
+        # means the database was lost, and registering a new account would
+        # bind it to the old Hermes state.
+        if not await self._check_db_id():
+            return False
 
         logger.info("No usable Delta Chat account found; creating one")
         account_id = await rpc.add_account()
@@ -1480,6 +1924,12 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 self._cleanup()
                 return False
 
+            if not await self._check_db_id():
+                self._cleanup()
+                return False
+
+            await self._update_commands_bio()
+
             # Start IO for the account to receive events
             await self.rpc.start_io(self.account_id)
             logger.debug("Started IO for account %s", self.account_id)
@@ -1491,6 +1941,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 )
                 self._invite_link = link
                 logger.debug("SecureJoin invite link: %s", link)
+                self._write_invite_file(link)
             except Exception as e:
                 logger.warning("Could not generate SecureJoin invite link: %s", e)
                 self._invite_link = None
@@ -1672,6 +2123,23 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
         return None
 
+    async def _resolve_chat_id(self, chat_id) -> int:
+        """Real DC chat id for an outbound target: a numeric id or a chat token.
+
+        why: the agent sees only the [dc:chat=<token>] tag, so when it writes a
+        delivery target itself (a cron job's `deliver: deltachat-platform:<x>`)
+        it uses the token. Hermes passes that through verbatim as chat_id.
+        """
+        s = str(chat_id).strip()
+        # token_hex(8) is 16 hex chars and can, rarely, be all digits.
+        if not s.isdigit() or len(s) == 16:
+            real = await _resolve_chat_token(self.rpc, self.account_id, s)
+            if real is not None:
+                return real
+        if not s.isdigit():
+            raise ValueError(f"unknown Delta Chat chat id or token: {s!r}")
+        return int(s)
+
     async def send(
         self,
         chat_id: str,
@@ -1684,9 +2152,26 @@ class DeltaChatAdapter(BasePlatformAdapter):
         When a voice call is active for this chat the response is routed to
         TTS and played into the call instead of being sent as a DC message.
         """
+        # Suppress the AI's reply to an internal "call ended" note so we don't
+        # text the user a stray message after a call. Checked before call
+        # routing so a late reply can't be spoken into a follow-up call.
+        if self._call_manager and self._call_manager.is_call_end_reply(reply_to):
+            return self._send_result(chat_id, None)
+
         if self._call_manager and self._call_manager.has_active_call(chat_id):
             thread_id = (metadata or {}).get("thread_id")
             if self._call_manager.is_call_thread(thread_id):
+                # Only the turn's final reply is spoken. Hermes also routes
+                # status traffic through send() — memory notices, tool
+                # progress, busy acks, the "Working" heartbeat. Checked before
+                # the call-ack drop so a status line can't use up that drop.
+                if _BASE_MARKS_FINAL_REPLY and not (metadata or {}).get("notify"):
+                    logger.debug(
+                        "Call %s: not speaking non-final send: %r",
+                        chat_id,
+                        (content or "")[:80],
+                    )
+                    return self._send_result(chat_id, None)
                 # Reply belongs to the call conversation — speak it into the call.
                 # In shared-history mode the placing agent's "call connected" ack
                 # also lands here (same session), so drop that one line.
@@ -1698,10 +2183,6 @@ class DeltaChatAdapter(BasePlatformAdapter):
             # agent's "calling you now" line in separate-thread mode, or a
             # concurrent DM) — deliver it as a normal Delta Chat message instead
             # of speaking it into the call. Falls through to the normal send path.
-        # Suppress the AI's reply to the internal "call ended" note so we don't
-        # text the user a stray message after a call.
-        if self._call_manager and self._call_manager.consume_drop_response(chat_id):
-            return self._send_result(chat_id, None)
 
         try:
             if not self.rpc or not self.account_id:
@@ -1712,7 +2193,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
             # Delta Chat renders plain text only; strip common markdown syntax.
             stripped = _strip_markdown(content)
 
-            quoted_id = int(reply_to) if reply_to else None
+            quoted_id = _quote_id(reply_to)
+            real_chat_id = await self._resolve_chat_id(chat_id)
 
             async def _do_send() -> Optional[int]:
                 from deltachat2.types import MsgData
@@ -1729,7 +2211,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
                     chunk_quoted = quoted_id if idx == 0 else None
                     last_msg_id = await self.rpc.send_msg(
                         self.account_id,
-                        int(chat_id),
+                        real_chat_id,
                         MsgData(text=chunk, quoted_message_id=chunk_quoted),
                     )
                 return last_msg_id
@@ -1766,11 +2248,10 @@ class DeltaChatAdapter(BasePlatformAdapter):
 
             from deltachat2.types import MsgData
 
-            msg_data = MsgData(
-                quoted_message_id=int(reply_to) if reply_to else None, **fields
-            )
+            msg_data = MsgData(quoted_message_id=_quote_id(reply_to), **fields)
+            real_chat_id = await self._resolve_chat_id(chat_id)
             msg_id = await _async_retry(
-                lambda: self.rpc.send_msg(self.account_id, int(chat_id), msg_data),
+                lambda: self.rpc.send_msg(self.account_id, real_chat_id, msg_data),
                 max_attempts=2,
                 base_delay=0.5,
             )
@@ -1934,6 +2415,181 @@ class DeltaChatAdapter(BasePlatformAdapter):
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+    # Delta Chat has no buttons: an exec-approval prompt is answered by reacting
+    # to it. Compared with skin tones/variation selectors removed.
+    _APPROVAL_REACTIONS = {"👍": "once", "👎": "deny"}
+    _MAX_APPROVAL_PROMPTS = 64
+
+    async def _send_exec_approval_prompt(self, prompt) -> SendResult:
+        """Send Hermes' approval prompt and remember it for _handle_reaction.
+
+        A reaction must only ever answer the approval its prompt shows, so the
+        prompt offers reactions only when that approval's request_id is known;
+        otherwise it's the plain /approve, /deny prompt.
+        """
+        try:
+            request_id = self._pending_request_id(prompt)
+        except Exception as e:
+            logger.warning(
+                "Can't tell which pending approval prompt %r is for, sending it "
+                "without reactions: %s",
+                prompt.command[:80],
+                e,
+            )
+            request_id = None
+        commands = ["/approve"] + [
+            f"/approve {c}" for c in ("session", "always") if c in prompt.choices
+        ]
+        reply = f"{', '.join(commands)} or /deny."
+        if request_id:
+            text = (
+                f"{prompt.text}\n\n"
+                "React to this exact message:\n👍 = approve once\n👎 = deny\n\n"
+                f"Or reply {reply}"
+            )
+        else:
+            text = f"{prompt.text}\n\nReply {reply}"
+        result = await self.send(prompt.chat_id, text, metadata=prompt.metadata)
+        if result.success and result.message_id and request_id:
+            self._approval_prompts[int(result.message_id)] = (
+                prompt.session_key,
+                request_id,
+            )
+            while len(self._approval_prompts) > self._MAX_APPROVAL_PROMPTS:
+                del self._approval_prompts[next(iter(self._approval_prompts))]
+        return result
+
+    def _pending_request_id(self, prompt) -> Optional[str]:
+        """The request_id of the pending approval *prompt* was rendered from.
+
+        Hermes doesn't hand it to us, and without it the resolver can only
+        take the session's oldest approval, which with parallel tool calls may
+        be another prompt's. The entry is queued before Hermes notifies us;
+        match it the way Hermes built the prompt from it (redacted command,
+        description), skipping entries our other prompts answer. None when
+        nothing pending matches. Hermes' queue is internal: anything
+        unexpected raises, and the caller falls back to a plain prompt.
+        """
+        from tools import approval
+        from gateway.run import _redact_approval_command
+
+        claimed = {rid for _, rid in self._approval_prompts.values()}
+        with approval._lock:
+            entries = [
+                e.data for e in approval._gateway_queues.get(prompt.session_key, [])
+            ]
+        for data in entries:
+            if (
+                data["request_id"] not in claimed
+                and _redact_approval_command(data.get("command", "")) == prompt.command
+                and data.get("description", "dangerous command") == prompt.description
+            ):
+                return data["request_id"]
+        return None
+
+    async def _handle_reaction(self, event: Dict[str, Any]) -> None:
+        """Resolve the exec approval a 👍/👎 reaction answers.
+
+        Hermes never sees reactions, so this is the authorization gate: the
+        reactor must pass _sender_allowed(strict) for this chat, the prompt's
+        session must belong to this chat and, for per-user group sessions, to
+        the reactor — whoever could have typed /approve for it.
+        """
+        msg_id, chat_id, contact_id = (
+            event.get("msg_id"),
+            event.get("chat_id"),
+            event.get("contact_id"),
+        )
+        if msg_id not in self._approval_prompts:
+            return
+        session_key, request_id = self._approval_prompts[msg_id]
+        emojis = re.sub(
+            "[\U0001f3fb-\U0001f3ff\ufe0f]", "", event.get("reaction") or ""
+        ).split()
+        choices = {self._APPROVAL_REACTIONS.get(e) for e in emojis}
+        if len(choices) != 1 or None in choices:
+            return
+        (choice,) = choices
+        try:
+            chat = await self.rpc.get_basic_chat_info(self.account_id, int(chat_id))
+        except Exception as e:
+            logger.warning("Ignoring approval reaction on prompt %s: %s", msg_id, e)
+            return
+        chat_type = "group" if chat.get("chat_type") == "Group" else "dm"
+        # why: exact keys, not a ":<chat_id>" suffix — chat and contact ids share
+        # a range, so group 12's per-user key for contact 12 ends in ":12" too.
+        own = f":{chat_type}:{chat_id}"
+        if not session_key.endswith((own, f"{own}:{contact_id}")):
+            logger.info(
+                "Ignoring approval reaction from contact %s on prompt %s: not "
+                "their session",
+                contact_id,
+                msg_id,
+            )
+            return
+        if not await self._sender_allowed(contact_id, chat_type, chat_id, strict=True):
+            logger.info(
+                "Ignoring approval reaction from unauthorized contact %s", contact_id
+            )
+            return
+        from gateway.slash_access import policy_from_extra
+
+        # why: Hermes refuses /approve and /deny from non-admins when
+        # allow_admin_from is set; a reaction must not get around that.
+        command = "deny" if choice == "deny" else "approve"
+        policy = policy_from_extra(self.config.extra or {}, chat_type)
+        if not policy.can_run(str(contact_id), command):
+            logger.info(
+                "Ignoring approval reaction from contact %s: /%s is admin-only",
+                contact_id,
+                command,
+            )
+            return
+
+        from tools.approval import resolve_gateway_approval
+
+        del self._approval_prompts[msg_id]
+        count = resolve_gateway_approval(session_key, choice, request_id=request_id)
+        logger.info(
+            "Contact %s reacted to approval prompt %s: %s (%d resolved)",
+            contact_id,
+            msg_id,
+            choice,
+            count,
+        )
+        if not count:
+            reply = "⌛ Nothing pending anymore: it timed out or was already answered."
+        else:
+            reply = "✅ Approved." if choice == "once" else "❌ Denied."
+        await self.send(str(chat_id), reply, reply_to=str(msg_id))
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a video file as an inline-playable video.
+
+        why: without this override Hermes falls back to the base class, which
+        posts a "couldn't send video" notice instead of the file — on both the
+        reply-flow MEDIA path and cron delivery.
+        """
+        from deltachat2.types import MessageViewtype
+
+        return await self._send_msg_data(
+            chat_id,
+            "videos",
+            f"video {video_path}",
+            reply_to,
+            file=video_path,
+            text=caption or "",
+            viewtype=MessageViewtype.VIDEO,
+        )
 
     async def send_voice(
         self,
@@ -2327,6 +2983,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
             logger.info("Incoming call accepted msg_id=%s", event.get("msg_id"))
         elif event_kind == EventType.SECUREJOIN_INVITER_PROGRESS:
             await self._record_securejoin_pairing(event)
+        elif event_kind == EventType.INCOMING_REACTION:
+            await self._handle_reaction(event)
         else:
             logger.debug(f"Unhandled event type: {event_kind}")
 
@@ -2448,6 +3106,20 @@ class DeltaChatAdapter(BasePlatformAdapter):
             )
             if roster is not None and len(roster) > 1:
                 if not await self._apply_bot_guards(chat_id, from_id, sender_email):
+                    return
+
+            # "/cmd@<name>": addressed to us → Hermes sees a plain "/cmd". In
+            # a group, one addressed to another bot is not ours to run. A bare
+            # "/cmd" still reaches every bot, as before.
+            addressed = _COMMAND_ADDR_RE.match(text)
+            if addressed:
+                for_us = self._command_for_us(text, addressed.end())
+                if for_us is not None:
+                    text = for_us
+                elif chat_type == "group":
+                    logger.debug(
+                        "Ignoring command %s addressed to another bot", text.split()[0]
+                    )
                     return
 
             # why: mention gate must run on the reply body only — matching inside
@@ -2827,7 +3499,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
             if self.rpc and self.account_id:
                 chat = await self.rpc.get_basic_chat_info(
                     self.account_id,
-                    int(chat_id),
+                    await self._resolve_chat_id(chat_id),
                 )
                 return {
                     "name": chat.get("name", chat_id),
@@ -2958,6 +3630,7 @@ def _apply_yaml_config(
         "mention_aliases",
         "free_response_channels",
         "require_mention_channels",
+        "commands_bio",
         "auto_delete_interval",
         "max_message_length",
         "max_message_lines",
@@ -3066,9 +3739,8 @@ async def _standalone_send(
     if not _check_dc2_available():
         result["error"] = "deltachat2 is not installed"
         return result
-    try:
-        int(chat_id)
-    except (TypeError, ValueError):
+    # A numeric id or a 16-hex chat token (resolved in send() once RPC is up).
+    if not re.fullmatch(r"\d+|[0-9a-f]{16}", str(chat_id).strip()):
         result["error"] = f"invalid Delta Chat chat id: {chat_id!r}"
         return result
 
@@ -3113,6 +3785,12 @@ async def _standalone_send(
             result["error"] = "no Delta Chat account configured; run setup.py"
             return result
         adapter.account_id = accounts[0]["id"]
+        # Chat ids from cron/`hermes send` belong to one database, too.
+        if not await adapter._check_db_id():
+            result["error"] = (
+                "Delta Chat database does not match this Hermes state (see log)"
+            )
+            return result
         await adapter.rpc.start_io(adapter.account_id)
 
         sent = []
@@ -3229,19 +3907,35 @@ def register_rpc_tools(ctx) -> None:
     """Register Delta Chat RPC tools.
 
     Always registers:
-      - dc_rpc_spec: full OpenRPC spec
-      - dc_chat_rpc_spec: spec filtered to chatId-scoped, non-destructive methods
+      - dc_rpc_spec: OpenRPC spec, minus the methods we refuse
+      - dc_chat_rpc_spec: spec filtered to chatId-scoped methods we do not refuse
       - dc_safe_rpc_call: chat-scoped calls with token-validated chatId injection
 
-    Only registers when DELTACHAT_ENABLE_RAW_RPC is set:
-      - dc_rpc_call: unrestricted access to any RPC method
+    Only registers when DELTACHAT_ENABLE_RAW_RPC is on:
+      - dc_rpc_call: any RPC method _is_blocked does not refuse
     """
+
+    def _visible_methods(spec: dict, chat_scoped: bool) -> list:
+        # why: never advertise a method the call gate then refuses — the model
+        # cannot tell "not permitted" from "wrong name" and burns the turn retrying.
+        return [
+            m
+            for m in spec.get("methods", [])
+            if not _is_blocked(m["name"])
+            and (
+                not chat_scoped
+                or any(p["name"] == "chatId" for p in m.get("params", []))
+            )
+        ]
 
     async def _spec_handler(args: dict = None, **kwargs) -> str:
         try:
-            return json.dumps(await _fetch_spec(), indent=2)
+            spec = await _fetch_spec()
         except Exception as e:
             return f"Error: {e}"
+        return json.dumps(
+            {**spec, "methods": _visible_methods(spec, chat_scoped=False)}, indent=2
+        )
 
     async def _call_handler(args: dict, **kwargs) -> str:
         method = (args or {}).get("method")
@@ -3251,12 +3945,33 @@ def register_rpc_tools(ctx) -> None:
         if _active_adapter is None or _active_adapter.rpc is None:
             return json.dumps({"error": "Delta Chat is not connected"})
 
-        logger.warning("Raw RPC call: %s", method)
+        # why: %r, not %s — `method` is model-supplied; an embedded newline
+        # would otherwise forge a second audit line.
+        def _refuse(reason: str, detail: str) -> str:
+            logger.warning("Raw RPC call REFUSED (%s): %r", reason, method)
+            return json.dumps({"error": detail})
 
-        if _RAW_RPC_ALLOWLIST and method not in _RAW_RPC_ALLOWLIST:
-            return json.dumps({"error": f"'{method}' is not in the raw RPC allowlist"})
-        if method in _RAW_RPC_BLOCKLIST or _is_destructive(method):
-            return json.dumps({"error": f"'{method}' is blocked"})
+        # Read at call time, not import time — Hermes loads ~/.hermes/.env
+        # after this module is imported.
+        raw_allowlist = (os.getenv("DELTACHAT_RAW_RPC_ALLOWLIST") or "").strip()
+        allowlist = _parse_method_list(raw_allowlist)
+        # why: a non-blank value that names nothing means "allow nothing", not
+        # "unrestricted" — a typo like " , ," must not remove the gate.
+        if raw_allowlist and not allowlist:
+            return _refuse(
+                "unusable allowlist",
+                "DELTACHAT_RAW_RPC_ALLOWLIST is set but lists no method names",
+            )
+        if allowlist and method not in allowlist:
+            return _refuse(
+                "not allowlisted", f"'{method}' is not in the raw RPC allowlist"
+            )
+        blocklist = _parse_method_list(os.getenv("DELTACHAT_RAW_RPC_BLOCKLIST"))
+        if method in blocklist or _is_blocked(method):
+            return _refuse("blocked", f"'{method}' is blocked")
+
+        # Logged after every gate so the audit trail tells ran from refused.
+        logger.warning("Raw RPC call ACCEPTED: %r", method)
 
         try:
             result = await getattr(_active_adapter.rpc, method)(*params)
@@ -3268,18 +3983,14 @@ def register_rpc_tools(ctx) -> None:
             return json.dumps({"error": "RPC call failed"})
 
     async def _chat_spec_handler(args: dict = None, **kwargs) -> str:
-        """Return only the chatId-scoped, non-destructive methods."""
+        """Return only the chatId-scoped methods _is_blocked does not refuse."""
         try:
             spec = await _fetch_spec()
         except Exception as e:
             return f"Error: {e}"
-        safe_methods = [
-            m
-            for m in spec.get("methods", [])
-            if any(p["name"] == "chatId" for p in m.get("params", []))
-            and not _is_destructive(m["name"])
-        ]
-        return json.dumps({**spec, "methods": safe_methods}, indent=2)
+        return json.dumps(
+            {**spec, "methods": _visible_methods(spec, chat_scoped=True)}, indent=2
+        )
 
     async def _safe_call_handler(args: dict, **kwargs) -> Any:
         method = (args or {}).get("method")
@@ -3309,7 +4020,7 @@ def register_rpc_tools(ctx) -> None:
                 }
             )
 
-        if _is_destructive(method):
+        if _is_blocked(method):
             return json.dumps({"error": f"'{method}' is not allowed in safe mode"})
 
         # Verify method exists and has a chatId param
@@ -3342,8 +4053,66 @@ def register_rpc_tools(ctx) -> None:
                 }
             )
 
-        # Build positional params: accountId at [0], chatId at [1]
-        full_params = [adapter.account_id, real_chat_id] + list(params or [])
+        # why: bind by name, not position. [account_id, chat_id] + params
+        # assumes chatId is parameter 1; search_messages(accountId, query,
+        # chatId) breaks that, and there the caller's own value would land in
+        # the chatId slot — defeating the token. The spec declares the order.
+        supplied = list(params or [])
+        full_params = []
+        for name in param_names:
+            if name == "accountId":
+                full_params.append(adapter.account_id)
+            elif name == "chatId":
+                full_params.append(real_chat_id)
+            elif supplied:
+                full_params.append(supplied.pop(0))
+            else:
+                break  # trailing optional parameters the caller left off
+        if supplied:
+            return json.dumps(
+                {
+                    "error": (
+                        f"'{method}' takes {len(param_names)} parameters "
+                        f"({', '.join(param_names)}); accountId and chatId are "
+                        f"injected, so pass only the rest — {len(supplied)} too "
+                        "many were given"
+                    )
+                }
+            )
+
+        # why: core sends whatever local path it is handed, so without this
+        # one call mails ~/.hermes/.env to the chat. The token scopes the
+        # chat, not the file. Same filter the adapter's own sends use.
+        unchecked = _unchecked_path_name(param_names)
+        for name, value in zip(param_names, full_params):
+            if unchecked is None and name == "data" and isinstance(value, dict):
+                unchecked = _unchecked_path_name(value)
+        if unchecked is not None:
+            logger.warning(
+                "Safe RPC call %r REFUSED (unchecked path parameter %r)",
+                method,
+                unchecked,
+            )
+            return json.dumps(
+                {
+                    "error": (
+                        f"'{method}' takes a file path ('{unchecked}') this tool "
+                        "cannot validate"
+                    )
+                }
+            )
+        for i, name in enumerate(param_names[: len(full_params)]):
+            value = full_params[i]
+            if name == "data" and isinstance(value, dict) and value.get("file"):
+                safe = _safe_delivery_path(adapter, value["file"])
+                if safe is None:
+                    return _refuse_path(method, value["file"])
+                full_params[i] = {**value, "file": safe}
+            elif name in _PATH_PARAMS and value:
+                safe = _safe_delivery_path(adapter, value)
+                if safe is None:
+                    return _refuse_path(method, value)
+                full_params[i] = safe
 
         logger.info("Safe RPC call: %s (chat_id=%s)", method, real_chat_id)
         try:
@@ -3563,7 +4332,7 @@ def register_rpc_tools(ctx) -> None:
         emoji="📋",
     )
 
-    if os.getenv("DELTACHAT_ENABLE_RAW_RPC"):
+    if _is_on(os.getenv("DELTACHAT_ENABLE_RAW_RPC", "")):
         ctx.register_tool(
             name="dc_rpc_call",
             toolset="deltachat",
@@ -3571,7 +4340,7 @@ def register_rpc_tools(ctx) -> None:
                 "description": (
                     "Call any Delta Chat RPC method directly by name and params. "
                     "Use dc_rpc_spec first to see available methods. "
-                    "CAUTION: unrestricted access — can modify or delete account data. "
+                    "CAUTION: account-wide access — can modify account data. "
                     "Prefer dc_safe_rpc_call for chat-scoped operations."
                 ),
                 "parameters": {

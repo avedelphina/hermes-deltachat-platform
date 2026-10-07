@@ -117,7 +117,7 @@ Three tools are always available once the plugin is loaded:
 | `dc_chat_rpc_spec` | Spec filtered to chat-scoped methods, destructive ops removed |
 | `dc_safe_rpc_call` | Call a chat-scoped method safely — `accountId` and `chatId` are injected from an opaque per-chat token; the AI cannot address a different chat |
 
-Set `DELTACHAT_ENABLE_RAW_RPC=1` to also unlock `dc_rpc_call` (unrestricted access — only for trusted deployments).
+Set `DELTACHAT_ENABLE_RAW_RPC=1` to also unlock `dc_rpc_call` (account-wide access, no file-path validation — only for trusted deployments).
 
 ---
 
@@ -209,7 +209,8 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full environment-vari
 | `DELTACHAT_REQUIRE_MENTION` | No | `false` | Require `@DisplayName` mention in groups |
 | `DELTACHAT_REQUIRE_MENTION_CHANNELS` | No | — | Group chat IDs that stay mention-gated when `DELTACHAT_REQUIRE_MENTION=false` (inverse of `DELTACHAT_FREE_RESPONSE_CHANNELS`) |
 | `DELTACHAT_HOME_CHANNEL` | No | — | Chat ID for cron/proactive delivery (or use `/sethome` in chat) |
-| `DELTACHAT_ENABLE_RAW_RPC` | No | — | Enable unrestricted `dc_rpc_call` tool |
+| `DELTACHAT_ENABLE_RAW_RPC` | No | — | Enable the account-wide `dc_rpc_call` tool |
+| `DELTACHAT_COMMANDS_BIO` | No | `false` | List slash commands in the bot's profile bio (sent with every message, ~5 KB) |
 
 ### Multiple Agents
 

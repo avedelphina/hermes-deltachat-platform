@@ -50,7 +50,9 @@ All Delta Chat platform settings are read from environment variables (or from `c
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DELTACHAT_ENABLE_RAW_RPC` | — | Set to `1`/`true` to unlock unrestricted `dc_rpc_call`. |
+| `DELTACHAT_ENABLE_RAW_RPC` | — | Set to `1`/`true` to unlock the account-wide `dc_rpc_call`. `0`/`false`/`no`/`off` leave it off. |
+| `DELTACHAT_RAW_RPC_ALLOWLIST` | — | Comma-separated methods `dc_rpc_call` may call. Set but naming nothing allows nothing. |
+| `DELTACHAT_COMMANDS_BIO` | `false` | Set to `1` to list the gateway's slash commands in the bot's profile bio, below a `Hermes commands:` line. The bio is sent with every message (~5 KB). |
 | `DELTACHAT_DEBUG` | — | Set to `1`/`true` to enable debug logs from `deltachat2`. |
 
 ## Environment examples

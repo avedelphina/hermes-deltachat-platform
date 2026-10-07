@@ -722,13 +722,15 @@ class TestEnforcesOwnAccessPolicy:
 class TestSharedHelpers:
     """Helpers extracted from duplicated call sites."""
 
-    def test_is_destructive(self):
-        from adapter import _is_destructive
+    def test_is_blocked(self):
+        from adapter import _is_blocked
 
-        assert _is_destructive("delete_chat")
-        assert _is_destructive("remove_contact_from_chat")
-        assert _is_destructive("leave_group")
-        assert not _is_destructive("get_chat_contacts")
+        assert _is_blocked("delete_chat")
+        assert _is_blocked("remove_contact_from_chat")
+        assert _is_blocked("leave_group")
+        assert _is_blocked("forward_messages")
+        assert _is_blocked("get_chat_securejoin_qr_code")
+        assert not _is_blocked("get_chat_contacts")
 
     def test_bounded_int(self):
         from adapter import _bounded_int
@@ -928,3 +930,69 @@ class TestPairingWithoutIsVerified:
         mock_rpc.set_config = AsyncMock()
         await adapter._handle_dc_event({"kind": "SecurejoinInviterProgress", **event})
         mock_rpc.set_config.assert_not_called()
+
+
+class TestCallerAllowed:
+    """Incoming calls get the DM sender rules, without _gate_inbound's side effects."""
+
+    def _adapter(self, platform_config, mock_rpc, contact, paired=None, **extra):
+        platform_config.extra.update(extra)
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        mock_rpc.get_contact = AsyncMock(return_value=contact)
+        mock_rpc.get_config = AsyncMock(return_value=paired)
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_paired_contact_is_answered(self, platform_config, mock_rpc):
+        adapter = self._adapter(
+            platform_config, mock_rpc, {"address": "a@example.com"}, paired="1"
+        )
+        assert await adapter._caller_allowed(7, "12") is True
+
+    @pytest.mark.asyncio
+    async def test_unpaired_contact_is_declined_under_pairing(
+        self, platform_config, mock_rpc
+    ):
+        adapter = self._adapter(platform_config, mock_rpc, {"address": "a@example.com"})
+        assert await adapter._caller_allowed(7, "12") is False
+
+    @pytest.mark.asyncio
+    async def test_allowed_users_applies_to_calls(self, platform_config, mock_rpc):
+        adapter = self._adapter(
+            platform_config,
+            mock_rpc,
+            {"address": "eve@example.com", "is_verified": True},
+            allowed_users="alice@example.com",
+        )
+        assert await adapter._caller_allowed(7, "12") is False
+
+    @pytest.mark.asyncio
+    async def test_dm_policy_disabled_declines(self, platform_config, mock_rpc):
+        adapter = self._adapter(
+            platform_config,
+            mock_rpc,
+            {"address": "a@example.com", "is_verified": True},
+            dm_policy="disabled",
+        )
+        assert await adapter._caller_allowed(7, "12") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "verdict,expected", [(False, False), (True, True), (None, True)]
+    )
+    async def test_hermes_verdict_only_declines_on_false(
+        self, platform_config, mock_rpc, verdict, expected
+    ):
+        adapter = self._adapter(
+            platform_config, mock_rpc, {"address": "a@example.com", "is_verified": True}
+        )
+        adapter._is_sender_authorized = lambda *a: verdict
+        assert await adapter._caller_allowed(7, "12") is expected
+
+    @pytest.mark.asyncio
+    async def test_unknown_caller_fails_closed(self, platform_config, mock_rpc):
+        adapter = self._adapter(platform_config, mock_rpc, {})
+        mock_rpc.get_contact = AsyncMock(side_effect=RuntimeError("gone"))
+        assert await adapter._caller_allowed(None, "12") is False
+        assert await adapter._caller_allowed(7, "12") is False
