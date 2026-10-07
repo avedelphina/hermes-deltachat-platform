@@ -2,6 +2,285 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.11.0] - 2026-10-07
+
+### Upgrade notes: what can change on a working install
+
+This release tightens several defaults. Check the points below before you
+restart the gateway. [docs/UPGRADING.md](docs/UPGRADING.md) has the same list
+as a short checklist.
+
+**The plugin may refuse to start**
+
+- *An `allowlist` policy with no list.* If `dm_policy` or `group_policy` is
+  `allowlist`, and neither its own list (`dm_allowed_users` /
+  `group_allowed_users`) nor `allowed_users` names anyone, and
+  `allow_all_users` is off, the plugin does not load. The gateway log shows
+  `config validation error: DELTACHAT_DM_POLICY is 'allowlist' but neither
+  DELTACHAT_DM_ALLOWED_USERS nor DELTACHAT_ALLOWED_USERS names anyone`.
+  Earlier versions let every sender in with that configuration. Add the
+  addresses, or set the policy you meant.
+- *A Delta Chat database that is not the one Hermes knows.* On its first
+  start 1.11.0 writes `<HERMES_HOME>/.deltachat-db-id` and stores the same ID
+  in the account. After that, if the accounts directory is deleted, recreated
+  with `setup.py` or replaced by another database, the adapter stops with
+  `deltachat_db_mismatch` and logs the steps to start over. Back up the marker
+  file together with the accounts directory. `hermes send` and headless cron
+  run the same check.
+
+**People the bot stops answering**
+
+- *Anyone who writes by plain email.* A sender without a Delta Chat key is
+  dropped: no reply, no rejection notice, no read receipt, only a DEBUG line
+  (`Dropping message N from contact M: no key`). Such mail has a forgeable
+  From address, and the allowlists match on that address.
+- *Callers who may not message the bot.* Incoming calls used to be answered
+  for anyone. They are now declined unless the caller passes `allowed_users`,
+  `dm_policy` and Hermes' own authorization. The log shows
+  `Declining call N from unauthorized contact M`.
+- *Photos, files and voice messages without a caption, in a mention-gated
+  group.* They used to slip past the mention gate. Now they need a caption
+  that mentions the bot, or must quote-reply to one of its messages.
+- *Groups where only bots talk.* The bot-exchange guard is now active without
+  `DELTACHAT_HUMAN_USERS`. In a group with two or more other members it
+  pauses after 12 messages in a row from contacts flagged as bots, until a
+  human writes. Set `DELTACHAT_MAX_BOT_EXCHANGES=0` to turn it off.
+
+**Settings that are read differently**
+
+- *On/off values.* Only `1`, `true`, `yes` and `on` (any case) mean on.
+  Everything else means off. Check your environment for these two cases:
+  - `on` used to read as **off** for `DELTACHAT_REQUIRE_MENTION`,
+    `DELTACHAT_ALLOW_ALL_USERS` and `DELTACHAT_SEND_REJECTION_REPLIES`. It
+    now takes effect. `DELTACHAT_ALLOW_ALL_USERS=on` opens the bot to every
+    sender.
+  - Any non-empty value used to turn **on** `DELTACHAT_ENABLE_RAW_RPC` and
+    `DELTACHAT_DEBUG`, `0` and `false` included. Values such as `enabled` now
+    leave them off.
+- *`DELTACHAT_RAW_RPC_ALLOWLIST`* set to a value that names no method (for
+  example `,`) now allows nothing. It used to allow everything.
+- *Numbers.* A value that is not a number, or is out of range, in
+  `rate_limit_max`, `rate_limit_window`, `max_consecutive_replies` or
+  `max_bot_exchanges` falls back to the default with a warning. It used to
+  stop the adapter from starting.
+
+**Agent tools that now refuse**
+
+- *A chat token outside its own chat.* `dc_safe_rpc_call` and `dc_start_call`
+  answer `This chat_token belongs to a different conversation` when the token
+  was taken from another chat. Use `dc_send_message` to write to another
+  chat. `dc_end_call` only ends the call of the chat it is used in. Cron jobs
+  and CLI sessions are not affected.
+- *More RPC methods.* `forward_messages`, `add_contact_to_chat`,
+  `set_chat_ephemeral_timer`, `block_chat`, `set_chat_mute_duration`,
+  `set_chat_visibility`, `send_locations_to_chat`, `place_outgoing_call`,
+  `init_webxdc_integration` and the two SecureJoin QR methods are refused by
+  both RPC tools and no longer listed by the spec tools.
+- *File paths in `dc_safe_rpc_call`.* A path must pass Hermes' delivery policy
+  and must not lie in a Delta Chat data directory or in `logs/`.
+- *Image URLs on internal addresses.* `send_image_file` answers `Image URL
+  points at a private or internal address` for loopback, private and
+  link-local targets. If you serve images from your LAN, allow that in Hermes
+  (`security.allow_private_urls`).
+
+**Voice calls**
+
+- *A custom `DELTACHAT_CALL_PROMPT`* does not get the new hang-up instruction
+  by itself. Add it: the model must end its goodbye with `[[hangup]]`.
+  `dc_end_call` still works, but on Hermes 0.21.5 the model often misses it.
+- *Each call has its own session.* Inside a call the bot no longer sees
+  earlier calls. The text chat still gets a note when a call ends. With
+  `DELTACHAT_CALL_SHARED_HISTORY=true` nothing changes.
+- *Only the final reply of a turn is spoken* (Hermes 0.21.5 and newer).
+  Memory notices and tool progress are no longer read aloud.
+- *An outgoing call that nobody answers* no longer adds "call ended" notes to
+  the conversation.
+
+**Where the invite link is**
+
+- The `Bot address` log line and `get_status()["account_addr"]` now show the
+  email address. They used to show the SecureJoin invite link. The link is in
+  `invite.txt` (mode 0600) in the accounts directory, rewritten on every
+  connect, and in `get_status()["invite_link"]`.
+- **Gateway logs written by earlier versions still contain the invite link.**
+  Under `dm_policy: pairing`, anyone who can read them can pair with the bot.
+  Restrict or delete those logs.
+
+**Other things you may notice**
+
+- Rejected senders no longer get a read receipt.
+- Earlier versions left one `call_*.wav` recording per spoken sentence in
+  `<HERMES_HOME>/audio_cache/`. New ones are deleted after transcription. Old
+  ones stay until you delete them.
+- `setup.py` now creates the account in `DELTACHAT_DATA_DIR` when that is
+  set. It used to ignore it.
+- Tested with Hermes 0.21.5. On an older Hermes the chat-token binding and
+  the final-reply-only rule are inactive, because they rely on what newer
+  Hermes provides.
+
+Ports from upstream 2.0.0 (Simon-Laux/hermes-deltachat-platform).
+
+### Security
+- `dc_safe_rpc_call` validates file paths. `send_msg` (`data.file`),
+  `misc_send_msg`, `misc_set_draft`, `set_chat_profile_image` and
+  `send_sticker` used to hand any host path to core, so a steered agent could
+  send `~/.hermes/.env` or the account database into the chat — also from the
+  Docker sandbox, because the RPC server runs on the host. Paths now go
+  through Hermes' delivery policy; on top of that every Hermes profile's Delta
+  Chat data dir and `logs/` are refused, compared by inode. A path-shaped
+  parameter this code does not know refuses the call.
+- `dc_safe_rpc_call` binds parameters by name. `[accountId, chatId] + params`
+  assumed `chatId` is parameter 1; `search_messages` has it last.
+- The RPC tools refuse 11 more methods: `forward_messages` (copies out of any
+  other chat), the two SecureJoin QR methods (the QR text is the invite),
+  `add_contact_to_chat`, `set_chat_ephemeral_timer`, `block_chat`,
+  `set_chat_mute_duration`, `set_chat_visibility`, `send_locations_to_chat`,
+  `place_outgoing_call` (use `dc_start_call`), `init_webxdc_integration`.
+  `dc_rpc_spec` / `dc_chat_rpc_spec` no longer list refused methods.
+- `DELTACHAT_ENABLE_RAW_RPC=0`, `false`, `no` or `off` now disables
+  `dc_rpc_call`; any non-empty value used to enable it.
+  `DELTACHAT_RAW_RPC_ALLOWLIST` / `_BLOCKLIST` are read per call, and an
+  allowlist that is set but names nothing allows nothing. Every raw call is
+  logged at WARNING as ACCEPTED or REFUSED.
+- Incoming calls are declined unless the caller passes the sender rules a DM
+  gets (`allowed_users`, `dm_policy`) and Hermes' own authorization. Calls
+  used to be answered for anyone, loading STT first.
+- The adapter refuses to start on a Delta Chat database that isn't the one
+  this Hermes state was paired with. Hermes keys pairing approvals, sessions,
+  `DELTACHAT_HOME_CHANNEL` and cron targets on contact and chat IDs, which a
+  recreated database hands out again. A random ID is stored in the account
+  (`ui.hermes.db_id`) and in `<HERMES_HOME>/.deltachat-db-id`; on mismatch the
+  adapter stops with recovery steps. Existing installs adopt their current
+  database on first start. `hermes send` / headless cron run the same check.
+
+### Added
+- Exec-approval prompts can be answered by reacting 👍 (approve once) or 👎
+  (deny) to the prompt; `/approve` and `/deny` still work. A reaction only
+  answers the prompt it was given to, only from a key contact that passes the
+  adapter's sender rules and Hermes' authorization for that chat, and not
+  past `allow_admin_from`. Prompts arriving during a voice call are not
+  delivered.
+- `/cmd@<name>` command addressing. One addressed to this bot (display name
+  or a `mention_aliases` entry) reaches Hermes as a plain `/cmd`; in a group,
+  one addressed to another name is ignored. A bare `/cmd` still reaches every
+  bot.
+- `DELTACHAT_COMMANDS_BIO=1` (or `commands_bio: true`) lists the gateway's
+  slash commands in the bot's profile bio, below a `Hermes commands:` line;
+  text above that line is kept. Off by default: core sends the bio with every
+  message (~5 KB). Turning it off again removes the list.
+- Videos are sent as videos (`send_video`) instead of a "couldn't send video"
+  notice.
+- The SecureJoin invite link is written to `invite.txt` (mode 0600) in the
+  accounts dir on every connect; the log names the file.
+- Voice calls hang up on goodbye: the bot ends its goodbye with `[[hangup]]`,
+  which is stripped before TTS. A custom `DELTACHAT_CALL_PROMPT` must keep
+  that instruction. `dc_end_call` stays available.
+
+### Fixed
+- `DELTACHAT_CALL_MODEL` was ignored on Hermes 0.21.5 (the message handler is
+  a closure there, so the gateway runner lookup returned nothing). It is also
+  installed before the greeting turn now, and an unreachable runner logs a
+  WARNING.
+- Voice calls no longer read status sends aloud (memory notices, tool
+  progress, busy notices). Only the turn's final reply is spoken, on Hermes
+  cores that mark it.
+- Each voice call gets its own session (`call-<msg_id>`) instead of one
+  ever-growing `call` thread.
+- Replies to the internal "call ended" note are recognised by what they reply
+  to instead of a per-chat counter, which could leak the reply or swallow the
+  next real one. A non-numeric `reply_to` sends unquoted instead of failing.
+- Cron delivery to a chat token failed with `invalid literal for int()`. A
+  chat token is now accepted wherever an outbound chat id is, including
+  `hermes send`.
+
+Found by re-reading the fork:
+
+### Security
+- Senders without a key are dropped, silently and unread. A sender without
+  one is plain unencrypted mail, whose From address anyone can forge, and
+  `allowed_users` and the allowlists match on that address. Calls and
+  approval reactions refuse them too. A sender whose contact cannot be loaded
+  is dropped as well; under `dm_policy: open` it used to be let through.
+  **People who wrote to the bot by plain email, without Delta Chat, are no
+  longer answered.**
+- A chat token only works from the chat it belongs to. `dc_safe_rpc_call` and
+  `dc_start_call` refuse a token carried in from another conversation (the
+  agent could pick one up from memory or a cron listing), and `dc_end_call`
+  hangs up the calling chat's own call instead of the first active one. Cron
+  jobs and CLI sessions, which have no calling chat, are unaffected, and
+  `dc_send_message` stays cross-chat by design.
+- `send_image_file` no longer fetches URLs that resolve to loopback, private
+  or link-local addresses (cloud metadata endpoints included). Hermes' own
+  `is_safe_url` decides when available, so `allow_private_urls` is honoured.
+- The SecureJoin invite link was written to the gateway log at INFO on every
+  connect, as "Bot address". `get_my_address()` preferred the invite link over
+  the address, and under `dm_policy: pairing` whoever holds that link can
+  reach the agent. It now returns the email address; the link is only in
+  `invite.txt` and `get_status()["invite_link"]`.
+- An `allowlist` policy that named nobody admitted everybody. With
+  `dm_policy: allowlist` (or `group_policy: allowlist`) and neither the
+  scoped list nor `DELTACHAT_ALLOWED_USERS` set, every sender passed — and
+  Hermes core trusts an adapter under an `allowlist` policy without checking
+  again. It now admits nobody, and `validate_config` refuses to start.
+- `DELTACHAT_REQUIRE_MENTION=on` (and every other boolean setting given as
+  `on`) read as off.
+- A read receipt was sent before the access check, so a rejected sender still
+  learned the bot had read them, also with `send_rejection_replies: false`.
+  It is now sent only for accepted senders.
+- An existing account is only removed and reprovisioned when core itself
+  reports it as `Unconfigured`. A missing `addr` config key alone used to be
+  enough to delete the account, its keys and every pairing.
+- `setup.py` created the accounts directory world-readable (0755) until the
+  adapter's first connect tightened it. It also ignored `DELTACHAT_DATA_DIR`,
+  creating the account where the adapter would never look.
+- `DELTACHAT_DEBUG=0` enabled debug logging, which logs every RPC request and
+  response, passwords and invite links included.
+- One on/off rule for every setting: `1`, `true`, `yes` and `on` are on,
+  anything else is off. A typo no longer enables `dc_rpc_call` or debug
+  logging.
+
+### Fixed
+- v1.8.1 never reached `main` (it only exists on `upstream-pr-clean`). Its
+  three fixes are back: captionless images/files/voice no longer bypass the
+  mention gate; image/file/voice messages go through the bot-loop and
+  bot-exchange guards; the bot-exchange guard counts `is_bot` contacts, so
+  `DELTACHAT_HUMAN_USERS` is optional and an unlisted human resets the count.
+- Voice calls: a caller who hung up while the call was being answered left a
+  leaked peer connection, or a dead call that stayed "active" for the chat
+  until restart. The session is now registered before the SDP/ICE work and
+  torn down on any failure.
+- Voice calls: what was being said at hang-up ("bye") was transcribed after
+  the call ended and answered, and the answer arrived as a text message,
+  `[[hangup]]` marker included. Utterances for an ended call are dropped.
+- Voice calls: every utterance left a WAV recording of the caller in
+  `<HERMES_HOME>/audio_cache/` that nothing deleted. It is removed after STT.
+- Voice calls: an outgoing call that was never answered injected "call ended"
+  notes into the AI's history, contrary to docs/voice-calls.md. Only a call
+  that went live gets them now.
+- Voice calls: the dedicated call event loop was never closed on disconnect
+  (file descriptors leaked per reconnect); a peer connection leaked when an
+  outgoing call could not be placed.
+- RPC transport: a non-JSON line on the server's stdout killed the reader
+  thread, after which every call hung forever with the server still running.
+  Such lines are skipped; a dead reader or writer thread now counts as a dead
+  server, and the event listener escalates instead of retrying each second.
+  A reply written just before the server exits is no longer reported as a
+  failure. Request and response logging no longer formats every payload when
+  debug logging is off.
+- A typo in `rate_limit_max`, `rate_limit_window`, `max_consecutive_replies`
+  or `max_bot_exchanges` crashed adapter construction; `rate_limit_max: 0`
+  let one message through and then none. They fall back to the default with
+  a warning.
+- Fire-and-forget tasks (answering a call, speaking a reply) are now
+  referenced until done, so they cannot be garbage-collected mid-flight.
+- `dc_send_message` accepts a chat token in `DELTACHAT_HOME_CHANNEL`.
+- Two module-level `asyncio.Lock`s were shared between the gateway loop and
+  the separate event loops Hermes runs tool handlers on; under contention
+  that raises or leaves the waiter hanging. The token lock is a thread lock
+  now and the spec fetch needs none.
+- The rate limiter kept one bucket per sender address forever. Idle ones are
+  swept once more than 1024 are tracked.
+
 ## [1.10.0] - 2026-10-04
 
 ### Fixed

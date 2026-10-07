@@ -522,6 +522,15 @@ class TestBotExchangeGuard:
         should_process, _ = adapter._check_bot_exchange_guard("chat1", "bot-c@x")
         assert should_process is True
 
+    def test_unlisted_human_resets_via_is_bot_flag(self, platform_config):
+        # no human_users list at all: is_bot alone tells bots from humans
+        platform_config.extra = {"max_bot_exchanges": 2}
+        adapter = DeltaChatAdapter(platform_config)
+        g = adapter._check_bot_exchange_guard
+        assert [g("c", "b@x", True)[0] for _ in range(3)] == [True, True, False]
+        assert g("c", "unlisted-human@x", False)[0] is True
+        assert g("c", "b@x", True)[0] is True
+
     def test_should_warn_only_once_per_trip(self, platform_config):
         platform_config.extra = {
             "human_users": "tom@x",
@@ -722,13 +731,15 @@ class TestEnforcesOwnAccessPolicy:
 class TestSharedHelpers:
     """Helpers extracted from duplicated call sites."""
 
-    def test_is_destructive(self):
-        from adapter import _is_destructive
+    def test_is_blocked(self):
+        from adapter import _is_blocked
 
-        assert _is_destructive("delete_chat")
-        assert _is_destructive("remove_contact_from_chat")
-        assert _is_destructive("leave_group")
-        assert not _is_destructive("get_chat_contacts")
+        assert _is_blocked("delete_chat")
+        assert _is_blocked("remove_contact_from_chat")
+        assert _is_blocked("leave_group")
+        assert _is_blocked("forward_messages")
+        assert _is_blocked("get_chat_securejoin_qr_code")
+        assert not _is_blocked("get_chat_contacts")
 
     def test_bounded_int(self):
         from adapter import _bounded_int
@@ -928,3 +939,400 @@ class TestPairingWithoutIsVerified:
         mock_rpc.set_config = AsyncMock()
         await adapter._handle_dc_event({"kind": "SecurejoinInviterProgress", **event})
         mock_rpc.set_config.assert_not_called()
+
+
+class TestCallerAllowed:
+    """Incoming calls get the DM sender rules, without _gate_inbound's side effects."""
+
+    def _adapter(self, platform_config, mock_rpc, contact, paired=None, **extra):
+        platform_config.extra.update(extra)
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        mock_rpc.get_contact = AsyncMock(return_value=contact)
+        mock_rpc.get_config = AsyncMock(return_value=paired)
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_paired_contact_is_answered(self, platform_config, mock_rpc):
+        adapter = self._adapter(
+            platform_config, mock_rpc, {"address": "a@example.com"}, paired="1"
+        )
+        assert await adapter._caller_allowed(7, "12") is True
+
+    @pytest.mark.asyncio
+    async def test_unpaired_contact_is_declined_under_pairing(
+        self, platform_config, mock_rpc
+    ):
+        adapter = self._adapter(platform_config, mock_rpc, {"address": "a@example.com"})
+        assert await adapter._caller_allowed(7, "12") is False
+
+    @pytest.mark.asyncio
+    async def test_allowed_users_applies_to_calls(self, platform_config, mock_rpc):
+        adapter = self._adapter(
+            platform_config,
+            mock_rpc,
+            {"address": "eve@example.com", "is_verified": True},
+            allowed_users="alice@example.com",
+        )
+        assert await adapter._caller_allowed(7, "12") is False
+
+    @pytest.mark.asyncio
+    async def test_dm_policy_disabled_declines(self, platform_config, mock_rpc):
+        adapter = self._adapter(
+            platform_config,
+            mock_rpc,
+            {"address": "a@example.com", "is_verified": True},
+            dm_policy="disabled",
+        )
+        assert await adapter._caller_allowed(7, "12") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "verdict,expected", [(False, False), (True, True), (None, True)]
+    )
+    async def test_hermes_verdict_only_declines_on_false(
+        self, platform_config, mock_rpc, verdict, expected
+    ):
+        adapter = self._adapter(
+            platform_config, mock_rpc, {"address": "a@example.com", "is_verified": True}
+        )
+        adapter._is_sender_authorized = lambda *a: verdict
+        assert await adapter._caller_allowed(7, "12") is expected
+
+    @pytest.mark.asyncio
+    async def test_unknown_caller_fails_closed(self, platform_config, mock_rpc):
+        adapter = self._adapter(platform_config, mock_rpc, {})
+        mock_rpc.get_contact = AsyncMock(side_effect=RuntimeError("gone"))
+        assert await adapter._caller_allowed(None, "12") is False
+        assert await adapter._caller_allowed(7, "12") is False
+
+
+class TestAllowlistNamingNobody:
+    """An allowlist policy that names nobody admits nobody. It used to admit
+    everybody, and Hermes core trusts an adapter under an allowlist policy."""
+
+    def _adapter(self, platform_config, **extra):
+        platform_config.extra.update(extra)
+        return DeltaChatAdapter(platform_config)
+
+    def test_dm_allowlist_with_no_list_rejects(self, platform_config):
+        adapter = self._adapter(platform_config, dm_policy="allowlist")
+        assert adapter._check_dm("eve@example.com", True) is not None
+
+    def test_group_allowlist_with_no_list_rejects(self, platform_config):
+        adapter = self._adapter(platform_config, group_policy="allowlist")
+        assert adapter._check_group("eve@example.com") is not None
+
+    def test_scoped_list_decides(self, platform_config):
+        adapter = self._adapter(
+            platform_config, dm_policy="allowlist", dm_allowed_users="a@example.com"
+        )
+        assert adapter._check_dm("a@example.com", False) is None
+        assert adapter._check_dm("eve@example.com", False) is not None
+
+    def test_falls_back_to_global_allowed_users(self, platform_config):
+        """_gate_inbound has already enforced the global list by then."""
+        adapter = self._adapter(
+            platform_config, dm_policy="allowlist", allowed_users="a@example.com"
+        )
+        assert adapter._check_dm("a@example.com", False) is None
+
+    def test_allow_all_users_still_opens_it(self, platform_config):
+        adapter = self._adapter(
+            platform_config, dm_policy="allowlist", allow_all_users=True
+        )
+        assert adapter._check_dm("eve@example.com", False) is None
+
+    @pytest.mark.parametrize("key", ["dm_policy", "group_policy"])
+    def test_validate_config_refuses_it_at_startup(self, platform_config, key):
+        from unittest.mock import patch
+
+        from adapter import validate_config
+
+        platform_config.extra[key] = "allowlist"
+        with patch("adapter.check_requirements", return_value=True):
+            with pytest.raises(ValueError, match="names anyone"):
+                validate_config(platform_config)
+            platform_config.extra["allowed_users"] = "a@example.com"
+            assert validate_config(platform_config) is True
+
+
+class TestBotAddressIsNotTheInviteLink:
+    @pytest.mark.asyncio
+    async def test_address_comes_from_config_not_the_securejoin_qr(
+        self, platform_config, mock_rpc
+    ):
+        """The address is logged at INFO on connect; the invite link is a
+        credential under dm_policy=pairing and must not ride along."""
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        mock_rpc.get_config = AsyncMock(return_value="bot@example.com")
+        mock_rpc.get_chat_securejoin_qr_code = AsyncMock(
+            return_value="https://i.delta.chat/#SECRET"
+        )
+        assert await adapter.get_my_address() == "bot@example.com"
+        mock_rpc.get_chat_securejoin_qr_code.assert_not_called()
+
+
+class TestConfigParsing:
+    @pytest.mark.parametrize("value", ["on", "ON", " true ", "1", "yes"])
+    def test_on_spellings_enable_a_gate(self, platform_config, monkeypatch, value):
+        """DELTACHAT_REQUIRE_MENTION=on used to read as off — a gate left open."""
+        monkeypatch.setenv("DELTACHAT_REQUIRE_MENTION", value)
+        assert DeltaChatAdapter(platform_config)._require_mention is True
+
+    @pytest.mark.parametrize("value", ["off", "0", "false", "no", "nonsense"])
+    def test_everything_else_is_off(self, platform_config, monkeypatch, value):
+        monkeypatch.setenv("DELTACHAT_REQUIRE_MENTION", value)
+        assert DeltaChatAdapter(platform_config)._require_mention is False
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "rate_limit_max",
+            "rate_limit_window",
+            "max_consecutive_replies",
+            "max_bot_exchanges",
+        ],
+    )
+    def test_a_numeric_typo_falls_back_instead_of_crashing(self, platform_config, key):
+        platform_config.extra[key] = "3O"  # letter O
+        adapter = DeltaChatAdapter(platform_config)  # used to raise ValueError
+        assert adapter._rate_limiter.max_calls == 30
+        assert adapter._max_consecutive_replies == 20
+        assert adapter._max_bot_exchanges == 12
+
+    def test_zero_rate_limit_is_refused(self, platform_config):
+        """max 0 built a deque(maxlen=0): one message through, then none, ever."""
+        platform_config.extra["rate_limit_max"] = 0
+        assert DeltaChatAdapter(platform_config)._rate_limiter.max_calls == 30
+
+    def test_guards_can_still_be_disabled(self, platform_config):
+        platform_config.extra.update(max_consecutive_replies=0, max_bot_exchanges=-1)
+        adapter = DeltaChatAdapter(platform_config)
+        assert adapter._max_consecutive_replies == 0
+        assert adapter._max_bot_exchanges == -1
+
+
+class TestReadReceiptOnlyForAcceptedSenders:
+    def _adapter(self, platform_config, mock_rpc, accepted):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        adapter.handle_message = AsyncMock()
+        adapter._gate_inbound = AsyncMock(return_value=accepted)
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "hi",
+                "view_type": "Text",
+                "from_id": 11,
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Single", "name": "c"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "a@example.com"})
+        mock_rpc.get_config = AsyncMock(return_value="tok")
+        mock_rpc.markseen_msgs = AsyncMock()
+        return adapter
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("accepted", [True, False])
+    async def test_markseen_follows_the_gate(self, platform_config, mock_rpc, accepted):
+        adapter = self._adapter(platform_config, mock_rpc, accepted)
+        await adapter._handle_incoming_message({"chat_id": 1, "msg_id": 10})
+        assert mock_rpc.markseen_msgs.await_count == (1 if accepted else 0)
+
+
+class TestBackgroundTasks:
+    @pytest.mark.asyncio
+    async def test_spawned_task_is_referenced_until_done(self, platform_config):
+        import asyncio
+
+        adapter = DeltaChatAdapter(platform_config)
+        gate = asyncio.Event()
+        task = adapter._spawn(gate.wait())
+        assert task in adapter._background_tasks
+        gate.set()
+        await task
+        await asyncio.sleep(0)
+        assert adapter._background_tasks == set()
+
+
+class TestDeadTransportIsNotTransient:
+    @pytest.mark.asyncio
+    async def test_listener_stops_when_only_the_transport_died(self, platform_config):
+        """Reader/writer thread gone, subprocess still running: no exit code,
+        but no call can ever be answered. Used to retry once a second forever."""
+        from unittest.mock import MagicMock
+
+        adapter = DeltaChatAdapter(platform_config)
+        adapter._transport = MagicMock()
+        adapter._transport.process.poll.return_value = None
+        adapter._transport._server_dead.return_value = True
+        adapter._escalate_listener_death = MagicMock()
+        assert await adapter._handle_listener_error(RuntimeError("x")) is False
+        adapter._escalate_listener_death.assert_called_once()
+
+
+class TestSendersWithoutAKey:
+    """Plain unencrypted mail has a forgeable From address, and the allowlists
+    match on that address — so a sender without a key is not a sender."""
+
+    def _adapter(self, platform_config, mock_rpc, contact, **extra):
+        platform_config.extra.update(extra)
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        adapter.send = AsyncMock()
+        mock_rpc.get_contact = AsyncMock(return_value=contact)
+        mock_rpc.get_basic_chat_info = AsyncMock(return_value={"chat_type": "Single"})
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_forged_allowlisted_address_is_dropped_silently(
+        self, platform_config, mock_rpc
+    ):
+        adapter = self._adapter(
+            platform_config,
+            mock_rpc,
+            {"address": "alice@example.com", "is_key_contact": False},
+            dm_policy="allowlist",
+            dm_allowed_users="alice@example.com",
+        )
+        assert await adapter._gate_inbound(5, 10, 7) is False
+        adapter.send.assert_not_called()  # no rejection reply to a forged address
+        mock_rpc.get_basic_chat_info.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_key_contact_on_the_allowlist_passes(self, platform_config, mock_rpc):
+        adapter = self._adapter(
+            platform_config,
+            mock_rpc,
+            {"address": "alice@example.com", "is_key_contact": True},
+            dm_policy="allowlist",
+            dm_allowed_users="alice@example.com",
+        )
+        assert await adapter._gate_inbound(5, 10, 7) is True
+
+    @pytest.mark.asyncio
+    async def test_unloadable_sender_is_dropped_even_under_open_policy(
+        self, platform_config, mock_rpc
+    ):
+        adapter = self._adapter(platform_config, mock_rpc, {}, dm_policy="open")
+        mock_rpc.get_contact = AsyncMock(side_effect=RuntimeError("rpc"))
+        assert await adapter._gate_inbound(5, 10, 7) is False
+
+    @pytest.mark.asyncio
+    async def test_calls_and_reactions_refuse_them_too(self, platform_config, mock_rpc):
+        adapter = self._adapter(
+            platform_config,
+            mock_rpc,
+            {"address": "a@example.com", "is_key_contact": False, "is_verified": True},
+        )
+        assert await adapter._sender_allowed(7, "dm", "5") is False
+
+
+class TestImageUrlTargets:
+    """send_image_file fetches from the host; internal addresses are off limits."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.0.0.1:8080/x.png",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/x.png",
+            "http://[::1]/x.png",
+        ],
+    )
+    def test_internal_addresses_are_refused(self, url):
+        from adapter import _url_is_public
+
+        assert _url_is_public(url) is False
+
+    def test_public_address_is_allowed(self):
+        from adapter import _url_is_public
+
+        assert _url_is_public("https://93.184.216.34/x.png") is True
+
+    def test_unresolvable_host_fails_closed(self, monkeypatch):
+        import adapter as adapter_mod
+
+        def boom(*a, **k):
+            raise OSError("no such host")
+
+        monkeypatch.setattr(adapter_mod.socket, "getaddrinfo", boom)
+        assert adapter_mod._url_is_public("https://nope.invalid/x.png") is False
+
+    def test_hermes_own_check_decides_when_present(self, monkeypatch):
+        import sys
+        import types
+
+        from adapter import _url_is_public
+
+        fake = types.ModuleType("tools.url_safety")
+        fake.is_safe_url = lambda url: "allowed" in url
+        monkeypatch.setitem(sys.modules, "tools", types.ModuleType("tools"))
+        monkeypatch.setitem(sys.modules, "tools.url_safety", fake)
+        assert _url_is_public("http://127.0.0.1/allowed.png") is True  # operator's call
+        assert _url_is_public("https://93.184.216.34/x.png") is False
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_does_not_fetch_an_internal_url(
+        self, platform_config, mock_rpc
+    ):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        mock_rpc.send_msg = AsyncMock()
+        result = await adapter.send_image_file("7", "http://127.0.0.1:9/secret.png")
+        assert result.success is False
+        assert "private or internal" in result.error
+        mock_rpc.send_msg.assert_not_awaited()
+
+
+class TestOneOnOffRule:
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", " yes ", "on"])
+    def test_on(self, value):
+        from adapter import _is_on
+
+        assert _is_on(value) is True
+
+    @pytest.mark.parametrize(
+        "value", ["", "0", "false", "no", "off", "enabled", "2", None]
+    )
+    def test_everything_else_is_off(self, value):
+        """A typo must not turn on dc_rpc_call or debug logging."""
+        from adapter import _is_on
+
+        assert _is_on(value) is False
+
+    def test_call_handler_uses_the_same_words(self, monkeypatch):
+        pytest.importorskip("aiortc")  # call_handler needs the voice-call deps
+        import call_handler
+
+        from adapter import _is_on
+
+        for value in ("1", "true", "yes", "on", "0", "off", "enabled", ""):
+            monkeypatch.setenv("DC_TEST_FLAG", value)
+            assert call_handler._env_flag("DC_TEST_FLAG") is _is_on(value)
+
+
+class TestRateLimiterForgetsIdleSenders:
+    def test_idle_buckets_are_swept_once_many_are_tracked(self, monkeypatch):
+        import adapter as adapter_mod
+
+        clock = [0.0]
+        monkeypatch.setattr(adapter_mod.time, "monotonic", lambda: clock[0])
+        limiter = adapter_mod._RateLimiter(max_calls=2, window_seconds=60)
+        for i in range(limiter._SWEEP_ABOVE + 1):
+            limiter.is_allowed(f"spam{i}@example.com")
+        clock[0] = 30.0
+        limiter.is_allowed("active@example.com")
+        clock[0] = 61.0  # the spam senders have been idle for a whole window
+        limiter.is_allowed("new@example.com")
+        assert set(limiter._buckets) == {"active@example.com", "new@example.com"}
+
+    def test_an_active_sender_is_still_limited(self):
+        import adapter as adapter_mod
+
+        limiter = adapter_mod._RateLimiter(max_calls=2, window_seconds=60)
+        assert [limiter.is_allowed("a") for _ in range(3)] == [True, True, False]

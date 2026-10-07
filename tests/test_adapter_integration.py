@@ -941,9 +941,11 @@ class TestOnboarding:
     async def test_configure_account_recreates_incomplete_existing_account(
         self, platform_config, mock_rpc
     ):
-        """An account without a self address is removed and reprovisioned."""
+        """An account core reports as Unconfigured is removed and reprovisioned."""
         adapter = DeltaChatAdapter(platform_config)
-        mock_rpc.get_all_accounts = AsyncMock(return_value=[{"id": 7}])
+        mock_rpc.get_all_accounts = AsyncMock(
+            return_value=[{"id": 7, "kind": "Unconfigured"}]
+        )
         mock_rpc.get_config = AsyncMock(return_value="")
         mock_rpc.remove_account = AsyncMock()
         mock_rpc.add_account = AsyncMock(return_value=8)
@@ -959,6 +961,30 @@ class TestOnboarding:
         mock_rpc.add_transport_from_qr.assert_awaited_once_with(
             8, "DCACCOUNT:https://nine.testrun.org/new"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["Configured", None])
+    async def test_configure_account_never_removes_unless_core_says_unconfigured(
+        self, platform_config, mock_rpc, kind
+    ):
+        """Removing an account destroys its keys and pairings. A missing "addr"
+        config key alone (e.g. renamed on a newer core) must not trigger that."""
+        adapter = DeltaChatAdapter(platform_config)
+        account = {"id": 7} if kind is None else {"id": 7, "kind": kind}
+        mock_rpc.get_all_accounts = AsyncMock(return_value=[account])
+        mock_rpc.get_config = AsyncMock(return_value="")
+        mock_rpc.set_config = AsyncMock()
+        mock_rpc.remove_account = AsyncMock()
+        mock_rpc.add_account = AsyncMock(return_value=8)
+
+        if kind == "Configured":
+            assert await adapter._configure_account(mock_rpc) is True
+            assert adapter.account_id == 7
+        else:
+            with pytest.raises(RuntimeError, match="refusing to remove"):
+                await adapter._configure_account(mock_rpc)
+        mock_rpc.remove_account.assert_not_awaited()
+        mock_rpc.add_account.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_configure_account_manual_email_password(
@@ -1219,6 +1245,75 @@ class TestMentions:
         await adapter._handle_incoming_message(group_event)
 
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_require_mention_blocks_captionless_image(
+        self, platform_config, mock_rpc, group_event
+    ):
+        platform_config.extra = {"require_mention": "true", "display_name": "Bot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "",
+                "view_type": "Image",
+                "from_id": 11,
+                "file": "/tmp/photo.jpg",
+                "file_mime": "image/jpeg",
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        mock_rpc.get_contact = AsyncMock(return_value={"address": "user@example.com"})
+        adapter._resolve_blob_path = lambda x: x
+        adapter._copy_to_hermes_cache = lambda src, kind: src
+
+        await adapter._handle_incoming_message(group_event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bot_exchange_guard_applies_to_images(
+        self, platform_config, mock_rpc, group_event
+    ):
+        platform_config.extra = {"max_bot_exchanges": 1, "display_name": "Bot"}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        adapter._get_group_roster = AsyncMock(
+            return_value=[{"name": "a"}, {"name": "b"}]
+        )
+        adapter._resolve_blob_path = lambda x: x
+        adapter._copy_to_hermes_cache = lambda src, kind: src
+        mock_rpc.get_message = AsyncMock(
+            return_value={
+                "text": "",
+                "view_type": "Image",
+                "from_id": 11,
+                "file": "/tmp/photo.jpg",
+                "file_mime": "image/jpeg",
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "Test Group"}
+        )
+        contact = {"address": "x@example.com", "is_bot": True}
+        mock_rpc.get_contact = AsyncMock(side_effect=lambda *_: contact)
+
+        async def send(msg_id):
+            await adapter._handle_incoming_message({**group_event, "msg_id": msg_id})
+
+        await send(10)  # bot image 1: allowed
+        await send(11)  # bot image 2: exceeds max_bot_exchanges=1
+        assert adapter.handle_message.call_count == 1
+
+        contact = {"address": "human@example.com", "is_bot": False}
+        await send(12)  # human image resets the count and is processed
+        contact = {"address": "x@example.com", "is_bot": True}
+        await send(13)  # bot image counts as 1 again: allowed
+        assert adapter.handle_message.call_count == 3
 
     @pytest.mark.asyncio
     async def test_reply_to_own_message_is_implicit_mention_for_image(
@@ -1684,6 +1779,11 @@ class TestMetadata:
 
 class TestUrlImageSending:
     """Test send_image_file() with image URLs."""
+
+    @pytest.fixture(autouse=True)
+    def _no_dns(self, monkeypatch):
+        """_url_is_public resolves the host; keep the default run off the network."""
+        monkeypatch.setattr("adapter._url_is_public", lambda url: True)
 
     def _mock_httpx_stream(self, content_type, content, content_length=None):
         from unittest.mock import AsyncMock, MagicMock

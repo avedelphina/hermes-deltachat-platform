@@ -22,14 +22,18 @@ All Delta Chat platform settings are read from environment variables (or from `c
 
 ## Access control
 
+On/off settings: `1`, `true`, `yes` and `on` (any case) mean on. Every other value means off.
+
+The bot only answers senders that have a Delta Chat key. Plain email is dropped before any of the settings below apply.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DELTACHAT_ALLOW_ALL_USERS` | `false` | Set to `true` to allow anyone to use the bot. Overrides all per-sender checks. |
 | `DELTACHAT_ALLOWED_USERS` | — | Comma-separated email addresses allowed to use the bot. |
 | `DELTACHAT_DM_POLICY` | `pairing` | Direct-message policy: `open`, `allowlist`, `pairing` (verified contacts only), or `disabled`. |
-| `DELTACHAT_DM_ALLOWED_USERS` | — | Comma-separated emails allowed for `allowlist` DM policy. |
+| `DELTACHAT_DM_ALLOWED_USERS` | — | Comma-separated emails allowed for `allowlist` DM policy. If empty, `DELTACHAT_ALLOWED_USERS` applies. If that is empty too, nobody is allowed and the plugin refuses to start. |
 | `DELTACHAT_GROUP_POLICY` | `open` | Group-chat policy: `open`, `allowlist`, or `disabled`. |
-| `DELTACHAT_GROUP_ALLOWED_USERS` | — | Comma-separated emails allowed for `allowlist` group policy. |
+| `DELTACHAT_GROUP_ALLOWED_USERS` | — | Comma-separated emails allowed for `allowlist` group policy. Same fallback as `DELTACHAT_DM_ALLOWED_USERS`. |
 | `DELTACHAT_REQUIRE_MENTION` | `false` | In group chats, only respond to messages that mention the bot (`@DisplayName` or whole-word name). Applies to text and media captions. |
 | `DELTACHAT_FREE_RESPONSE_CHANNELS` | — | Comma-separated group chat IDs exempt from `DELTACHAT_REQUIRE_MENTION=true` — those groups always respond, no mention needed. |
 | `DELTACHAT_REQUIRE_MENTION_CHANNELS` | — | Comma-separated group chat IDs that stay mention-gated when `DELTACHAT_REQUIRE_MENTION=false` (the default) — inverse of `DELTACHAT_FREE_RESPONSE_CHANNELS`. Use this to keep most groups conversational while a specific noisy support/ops group requires `@DisplayName`. |
@@ -50,7 +54,9 @@ All Delta Chat platform settings are read from environment variables (or from `c
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DELTACHAT_ENABLE_RAW_RPC` | — | Set to `1`/`true` to unlock unrestricted `dc_rpc_call`. |
+| `DELTACHAT_ENABLE_RAW_RPC` | — | Set to `1`/`true` to unlock the account-wide `dc_rpc_call`. `0`/`false`/`no`/`off` leave it off. |
+| `DELTACHAT_RAW_RPC_ALLOWLIST` | — | Comma-separated methods `dc_rpc_call` may call. Set but naming nothing allows nothing. |
+| `DELTACHAT_COMMANDS_BIO` | `false` | Set to `1` to list the gateway's slash commands in the bot's profile bio, below a `Hermes commands:` line. The bio is sent with every message (~5 KB). |
 | `DELTACHAT_DEBUG` | — | Set to `1`/`true` to enable debug logs from `deltachat2`. |
 
 ## Environment examples

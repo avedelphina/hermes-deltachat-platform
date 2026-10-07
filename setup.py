@@ -331,13 +331,20 @@ if __name__ == "__main__":
     def _has_account_data(p):
         return os.path.isdir(p) and any(os.scandir(p))
 
-    if _has_account_data(old_accounts_path) and not _has_account_data(
+    # why the env var first: the adapter honours DELTACHAT_DATA_DIR, so an
+    # account created anywhere else is one it will never find.
+    if os.getenv("DELTACHAT_DATA_DIR"):
+        dc_accounts_path = os.path.expanduser(os.environ["DELTACHAT_DATA_DIR"])
+    elif _has_account_data(old_accounts_path) and not _has_account_data(
         new_accounts_path
     ):
         dc_accounts_path = old_accounts_path
     else:
         dc_accounts_path = new_accounts_path
-    os.makedirs(dc_accounts_path, exist_ok=True)
+    # 0700 like the adapter's _safe_data_dir: this directory holds the account
+    # database with the private key, and used to be created world-readable.
+    os.makedirs(dc_accounts_path, mode=0o700, exist_ok=True)
+    os.chmod(dc_accounts_path, 0o700)
     os.environ["DC_ACCOUNTS_PATH"] = dc_accounts_path
     os.environ["HERMES_HOME"] = hermes_home
 

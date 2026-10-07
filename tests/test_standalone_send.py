@@ -9,6 +9,7 @@ import adapter as adapter_mod
 def _rpc(state=26, accounts=({"id": 1},)):
     rpc = AsyncMock()
     rpc.get_all_accounts.return_value = list(accounts)
+    rpc.get_config.return_value = None  # real RPC returns str or None, never a mock
     rpc.send_msg.return_value = 7
     rpc.get_message.return_value = {"state": state}
     return rpc
