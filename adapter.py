@@ -1319,28 +1319,36 @@ class DeltaChatAdapter(BasePlatformAdapter):
             for _, roster in self._roster_cache.values()
         )
 
-    def _message_metadata(
-        self,
-        chat_id: Any,
-        msg_id: Any,
-        from_id: Any,
-        is_group: bool,
-        token: Optional[str] = None,
-        roster: Optional[list] = None,
-    ) -> Dict[str, Any]:
-        """Build metadata dict for an incoming MessageEvent."""
-        meta: Dict[str, Any] = {
-            "chat_id": str(chat_id),
-            "message_id": str(msg_id),
-            "is_group": is_group,
-        }
-        if from_id is not None:
-            meta["from_id"] = str(from_id)
-        if token:
-            meta["dc_token"] = token
-        if is_group and roster is not None:
-            meta["participants"] = roster
-        return meta
+    @staticmethod
+    def _group_context(is_group: bool, roster: Optional[list]) -> Optional[str]:
+        """Who else is in a group chat, for the agent's turn.
+
+        Returned as ``MessageEvent.channel_context``, which Hermes puts in
+        front of the message text. DMs get ``None``.
+        """
+        # why: inbound events carry no `metadata`. Hermes 0.22's native
+        # admission accepts only WhatsApp's keys there and refuses any other
+        # inbound event that has some ("refused this message
+        # (invalid_params)"), and 0.21 never showed metadata to the agent
+        # anyway. channel_context is the field both versions render. The
+        # chat token already travels in the text as [dc:chat=<token>].
+        if not is_group or not roster:
+            return None
+        members = []
+        for member in roster:
+            # why: context is a courtesy; a malformed roster entry must never
+            # cost the message itself.
+            if not isinstance(member, dict):
+                continue
+            name, address = member.get("name"), member.get("address")
+            members.append(
+                f"{name} <{address}>"
+                if name and address
+                else str(name or address or "?")
+            )
+        if not members:
+            return None
+        return f"[Delta Chat group. Other members: {', '.join(members)}]"
 
     def _send_result(
         self,
@@ -3306,9 +3314,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
                 message_type=MessageType.TEXT,
                 source=source,
                 message_id=str(msg_id),
-                metadata=self._message_metadata(
-                    chat_id, msg_id, from_id, chat_type == "group", token, roster
-                ),
+                channel_context=self._group_context(chat_type == "group", roster),
             )
             await self.handle_message(message_event)
 
@@ -3528,9 +3534,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
         if not should_process:
             return
 
-        meta = self._message_metadata(
-            chat_id, msg_id, from_id, chat_type == "group", token, roster
-        )
+        group_context = self._group_context(chat_type == "group", roster)
 
         async def forward(label: str, hermes_type, resolved: Optional[str], mime):
             text = f"[{label}]: {caption}" if caption else f"[{label}]"
@@ -3542,7 +3546,7 @@ class DeltaChatAdapter(BasePlatformAdapter):
                     message_id=str(msg_id),
                     media_urls=[resolved] if resolved else [],
                     media_types=[mime],
-                    metadata=meta,
+                    channel_context=group_context,
                 )
             )
 
