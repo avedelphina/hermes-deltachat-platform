@@ -1725,7 +1725,8 @@ class TestMetadata:
     """Test incoming/outgoing metadata enrichment."""
 
     @pytest.mark.asyncio
-    async def test_message_event_has_metadata(self, platform_config, mock_rpc):
+    async def test_inbound_event_carries_no_metadata(self, platform_config, mock_rpc):
+        """Hermes 0.22 refuses inbound events whose metadata has non-WhatsApp keys."""
         platform_config.extra = {"dm_policy": "open"}
         adapter = DeltaChatAdapter(platform_config)
         adapter.rpc = mock_rpc
@@ -1749,11 +1750,10 @@ class TestMetadata:
 
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.await_args.args[0]
-        assert event.metadata["chat_id"] == "7"
-        assert event.metadata["message_id"] == "42"
-        assert event.metadata["from_id"] == "11"
-        assert event.metadata["is_group"] is False
-        assert "dc_token" in event.metadata
+        assert event.metadata == {}
+        assert event.channel_context is None  # a DM: no group roster
+        assert event.message_id == "42"
+        assert "[dc:chat=" in event.text  # the chat token travels in the text
 
     @pytest.mark.asyncio
     async def test_send_result_includes_metadata(self, platform_config, mock_rpc):
@@ -1955,31 +1955,36 @@ class TestGroupRoster:
         assert roster == []
 
 
-class TestMessageMetadataRoster:
-    """Test that _message_metadata includes participants only for groups."""
+class TestGroupContext:
+    """The group roster reaches the agent as channel_context, not metadata."""
 
-    def test_group_metadata_includes_participants(self, platform_config):
-        adapter = DeltaChatAdapter(platform_config)
+    def test_group_lists_the_other_members(self):
+        roster = [
+            {"name": "Alice", "address": "alice@x.com"},
+            {"name": "", "address": "bob@x.com"},
+        ]
+
+        context = DeltaChatAdapter._group_context(True, roster)
+
+        assert (
+            context
+            == "[Delta Chat group. Other members: Alice <alice@x.com>, bob@x.com]"
+        )
+
+    def test_dm_has_no_group_context(self):
         roster = [{"name": "Alice", "address": "alice@x.com"}]
+        assert DeltaChatAdapter._group_context(False, roster) is None
 
-        meta = adapter._message_metadata("13", "5", "2", True, "tok", roster)
+    def test_no_roster_has_no_group_context(self):
+        assert DeltaChatAdapter._group_context(True, None) is None
+        assert DeltaChatAdapter._group_context(True, []) is None
 
-        assert meta["participants"] == roster
+    def test_incomplete_roster_entries_never_raise(self):
+        roster = [{"name": "Only Name"}, {"address": "only@x.com"}, {}, "not-a-dict"]
 
-    def test_dm_metadata_omits_participants(self, platform_config):
-        adapter = DeltaChatAdapter(platform_config)
-        roster = [{"name": "Alice", "address": "alice@x.com"}]
+        context = DeltaChatAdapter._group_context(True, roster)
 
-        meta = adapter._message_metadata("13", "5", "2", False, "tok", roster)
-
-        assert "participants" not in meta
-
-    def test_no_roster_omits_participants(self, platform_config):
-        adapter = DeltaChatAdapter(platform_config)
-
-        meta = adapter._message_metadata("13", "5", "2", True, "tok", None)
-
-        assert "participants" not in meta
+        assert context == "[Delta Chat group. Other members: Only Name, only@x.com, ?]"
 
 
 class TestRegisterPlatformAuthEnv:

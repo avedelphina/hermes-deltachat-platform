@@ -35,7 +35,7 @@ Delta Chat is a decentralized private messenger with end-to-end encryption, and 
 - Drop the agent into a **group chat** to assist everyone
 - Require `@DisplayName` mentions in groups so the bot only replies when addressed — or flip the default and gate only specific noisy groups
 - Send images by URL; the adapter downloads and forwards them safely
-- Rich metadata on every incoming/outgoing message for skills and downstream tooling
+- Group roster in the agent's context for group messages, and metadata on outgoing messages for skills and downstream tooling
 - Run **multiple independent agents** with their own Delta Chat accounts
 - Give the AI sandboxed access to the full **Delta Chat JSON-RPC API** to automate your messaging directly
 

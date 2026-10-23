@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.11.1] - 2026-10-23
+
+### Fixed
+
+- **Hermes 0.22 refused every Delta Chat message.** The user saw
+  "Hermes refused this message (invalid_params), so it was not saved or
+  answered", and the gateway log showed `Native admission refused:
+  invalid_params (metadata) platform=deltachat-platform`. Hermes 0.22
+  admits metadata on inbound events only from WhatsApp. This plugin put
+  `chat_id`, `message_id`, `is_group`, `from_id`, `dc_token`, and
+  `participants` there.
+
+### Changed
+
+- Incoming `MessageEvent`s no longer carry `metadata`. On Hermes 0.21 the
+  agent never saw that metadata, so nothing it read is lost. The chat
+  token still travels in the text as `[dc:chat=<token>]`.
+- For group messages, the other members now reach the agent as
+  `channel_context` (`[Delta Chat group. Other members: Name <address>,
+  ...]`). Both Hermes 0.21 and 0.22 put this in front of the message text.
+  Before, the roster sat in metadata, which no Hermes version showed to
+  the agent. A malformed roster entry is skipped and never drops the
+  message.
+- Outgoing `SendResult` metadata is unchanged.
+
 ## [1.11.0] - 2026-10-07
 
 ### Upgrade notes: what can change on a working install

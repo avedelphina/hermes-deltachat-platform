@@ -62,6 +62,7 @@ class MockMessageEvent:
     metadata: Dict[str, Any] = field(default_factory=dict)
     media_urls: list = field(default_factory=list)
     media_types: list = field(default_factory=list)
+    channel_context: Optional[str] = None
 
 
 class MockPlatform(Enum):
