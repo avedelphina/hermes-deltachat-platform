@@ -2,6 +2,14 @@
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that adds **Delta Chat** as a gateway channel — so you can reach your AI by text, voice message, or live voice call from a decentralized encrypted messenger that needs no phone number or sign-up.
 
+> **An independent continuation of [Simon Laux's hermes-deltachat-platform](https://github.com/Simon-Laux/hermes-deltachat-platform).**
+> This project started as a fork of it and became a separate project on 2026-10-26.
+> The two have diverged: this one has its own access control (`dm_policy`, `group_policy`,
+> allowlists), mention gate, bot-loop guards and support for newer Delta Chat cores.
+> Upstream releases are still reviewed and ported where they fit; the [changelog](CHANGELOG.md)
+> says which. Both install as the `deltachat-platform` plugin, so run one or the other, not
+> both. Report problems with this one [here](https://github.com/avedelphina/hermes-deltachat-platform/issues).
+
 ---
 
 ## Why Delta Chat?
@@ -245,7 +253,8 @@ The `deltachat2` Python package is vendored in `vendor/` to avoid a manual insta
 
 **`vendor/deltachat2/` has diverged from upstream — do not blindly overwrite it.** Local patches that a straight copy would silently drop:
 
-- `transport.py`: dead-RPC-server handling — `_fail_all_pending()` from both reader and writer loops, `_server_dead()` probe, and a polled `_Result.wait()` so a `deltachat-rpc-server` that dies mid-call raises instead of hanging the caller forever. Upstream has none of this.
+- `transport.py`: dead-RPC-server handling — `_fail_all_pending()` from both reader and writer loops, a `_server_dead()` probe that also counts a dead reader or writer thread, and a polled `_Result.wait()` so a `deltachat-rpc-server` that dies mid-call raises instead of hanging the caller forever. Upstream deltachat2 has none of this.
+- `transport.py`: a bounded `close()` (35 s for core's own shutdown, then kill) and `_call(..., timeout=)`; a reader that skips non-JSON and non-object lines, and kills the server when it dies so the adapter reconnects; lazy `%s` debug logging of requests and responses.
 - `transport.py`: `to_attrdict()` on RPC results (camelCase → snake_case, which `adapter.py` depends on) and `close()` guards for the never-started / already-dead cases.
 - `IOTransport.__init__` takes `rpc_server=`; upstream renamed this kwarg to `rpc_executable=`. `adapter.py` passes `rpc_server=`.
 
@@ -259,7 +268,9 @@ To update it:
 
 ## License
 
-Mozilla Public License 2.0 (MPL-2.0)
+Mozilla Public License 2.0 (MPL-2.0). Originally written by Simon Laux; this
+project is maintained by Tomas Kracmar. Code taken from the original project
+stays under the MPL-2.0 terms it was published with.
 
 ---
 

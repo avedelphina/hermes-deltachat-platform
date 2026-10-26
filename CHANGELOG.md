@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- This project is now independent of
+  [Simon-Laux/hermes-deltachat-platform](https://github.com/Simon-Laux/hermes-deltachat-platform):
+  it left that repository's fork network on 2026-10-26. Upstream releases are
+  still reviewed and ported where they fit. The README says what differs, and
+  `plugin.yaml` now names the maintainer as author, crediting the original.
+
 ## [1.12.0] - 2026-10-26
 
 Ports from upstream 2.1.0 (Simon-Laux/hermes-deltachat-platform).
