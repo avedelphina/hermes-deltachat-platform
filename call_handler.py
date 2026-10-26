@@ -125,6 +125,39 @@ def _contact_name(contact: dict, fallback: str) -> str:
     )
 
 
+# "OK", "Thanks", "Bye bye" and the like. Hermes' Whisper-hallucination filter
+# drops these because Whisper invents them on silent clips, but a call only
+# transcribes audio that passed the RMS gate (>= 0.3 s voiced), so here they are
+# real answers — and a dropped "bye" meant the caller could not say goodbye.
+_SHORT_REPLY_RE = _re.compile(
+    r"^(?:ok(?:ay)?|thanks|thank you|bye|[\s.,!])+$", _re.IGNORECASE
+)
+
+
+def _is_short_reply(transcript: str) -> bool:
+    t = transcript.strip()
+    return bool(_SHORT_REPLY_RE.match(t)) and any(c.isalpha() for c in t)
+
+
+def _spawn(coro, what: str) -> asyncio.Future:
+    """ensure_future that logs a crash instead of losing it.
+
+    why: a bare ensure_future keeps its exception until the task is garbage
+    collected, so a crashed receive loop (e.g. numpy missing) left a deaf call
+    with nothing in gateway.log.
+    """
+    task = asyncio.ensure_future(coro)
+
+    def _done(t: asyncio.Future) -> None:
+        if not t.cancelled() and t.exception() is not None:
+            logger.error(
+                "Call task %s crashed: %r", what, t.exception(), exc_info=t.exception()
+            )
+
+    task.add_done_callback(_done)
+    return task
+
+
 def _take_one(counter: Counter, key: str) -> bool:
     """Decrement *counter[key]* if positive; return whether it was."""
     if counter[key] <= 0:
@@ -158,6 +191,17 @@ if _env_flag("DELTACHAT_CALL_ICE_DEBUG"):
 # Default off → use the locally configured STT provider (e.g. faster-whisper),
 # which is much slower on CPU. Requires MISTRAL_API_KEY.
 _CALL_STT_VOXTRAL = _env_flag("DELTACHAT_CALL_STT_VOXTRAL")
+_DEFAULT_VOXTRAL_MODEL = "voxtral-mini-latest"
+
+
+def _voxtral_model(tt) -> str:
+    """Voxtral model for the fast path: stt.mistral.model, else Hermes' default."""
+    default = getattr(tt, "DEFAULT_MISTRAL_STT_MODEL", None) or _DEFAULT_VOXTRAL_MODEL
+    try:
+        return (tt._load_stt_config().get("mistral") or {}).get("model") or default
+    except Exception:
+        return default
+
 
 # Per-call system prompt — keeps spoken replies short. Applied via the
 # MessageEvent.channel_prompt field (ephemeral, never persisted to history).
@@ -245,6 +289,10 @@ class HermesAudioTrack(AudioStreamTrack):
     @property
     def played_count(self) -> int:
         return self._played_count
+
+    @property
+    def queued_count(self) -> int:
+        return self._queue.qsize()
 
     def is_speaking(self) -> bool:
         """True if there are queued TTS frames still to play."""
@@ -365,7 +413,7 @@ class IncomingAudioBuffer:
 
     def start(self, track) -> None:
         self._running = True
-        self._task = asyncio.ensure_future(self._receive_loop(track))
+        self._task = _spawn(self._receive_loop(track), "audio receive loop")
 
     def stop(self) -> None:
         self._running = False
@@ -402,7 +450,7 @@ class IncomingAudioBuffer:
                     voiced_s,
                     len(speech_buf) // 1024,
                 )
-                asyncio.ensure_future(self._process_utterance(bytes(speech_buf)))
+                _spawn(self._process_utterance(bytes(speech_buf)), "utterance STT")
             speech_buf, capturing, voiced_s, barge_signaled = (
                 bytearray(),
                 False,
@@ -499,11 +547,6 @@ class IncomingAudioBuffer:
         async with self._stt_lock:  # one at a time — avoids concurrent CPU contention
             try:
                 result = await asyncio.to_thread(self._transcribe, wav_path)
-                transcript = (
-                    result.get("transcript", "").strip()
-                    if result.get("success")
-                    else ""
-                )
             except (OSError, ValueError) as e:
                 logger.error("STT failed: %s", e)
                 return
@@ -513,12 +556,25 @@ class IncomingAudioBuffer:
                 with contextlib.suppress(OSError):
                     os.unlink(wav_path)
         stt_s = time.monotonic() - t0
-        if transcript:
-            logger.info(
-                "perf STT=%.1fs (%s) → %r",
+        if not result.get("success"):
+            # why ERROR: on a fresh install this is "No STT provider available"
+            # or a failed model download, and the caller just gets no answer.
+            # Hermes' error text, never the transcript.
+            logger.error(
+                "STT failed after %.1fs (%s): %s",
                 stt_s,
                 result.get("provider", "?"),
-                transcript[:120],
+                result.get("error", "no error given"),
+            )
+            return
+        transcript = (result.get("transcript") or "").strip()
+        if transcript:
+            # The length, not the words: INFO lands in gateway.log on disk.
+            logger.info(
+                "perf STT=%.1fs (%s) → %d chars",
+                stt_s,
+                result.get("provider", "?"),
+                len(transcript),
             )
             self._on_utterance(transcript, wav_path)
         else:
@@ -529,10 +585,13 @@ class IncomingAudioBuffer:
         """Transcribe a WAV. Runs in a worker thread.
 
         With DELTACHAT_CALL_STT_VOXTRAL enabled (and MISTRAL_API_KEY set) we use
-        Voxtral cloud Transcribe (~1-2s, accurate) — local Whisper medium on CPU
-        is ~15-30x slower than realtime (30s for a 2s clip), unusable for a live
-        call. On any Voxtral failure we fall back to the configured provider.
-        When the flag is off, the locally configured STT provider is used.
+        Voxtral cloud Transcribe (~1-2s, accurate) — local Whisper on CPU can be
+        far slower than realtime, unusable for a live call. On any Voxtral
+        failure we fall back to the configured provider.
+        Otherwise Hermes picks provider *and* model from the ``stt`` section of
+        config.yaml, as for voice messages. why no model argument: "medium" is
+        only valid for local faster-whisper and broke every cloud provider
+        ("Invalid model: medium").
         """
         from tools import transcription_tools as tt
 
@@ -542,7 +601,7 @@ class IncomingAudioBuffer:
             and hasattr(tt, "_transcribe_mistral")
         ):
             try:
-                result = tt._transcribe_mistral(wav_path, "voxtral-mini-latest")
+                result = tt._transcribe_mistral(wav_path, _voxtral_model(tt))
                 if result.get("success"):
                     return result
                 logger.warning(
@@ -551,7 +610,7 @@ class IncomingAudioBuffer:
             except Exception as e:
                 logger.warning("Voxtral STT error (%s) — falling back", e)
 
-        return tt.transcribe_audio(wav_path, "medium")
+        return tt.transcribe_audio(wav_path)
 
     def _pcm_to_wav(self, pcm: bytes) -> Optional[str]:
         """Write 16 kHz mono s16le PCM buffer to a WAV file for STT."""
@@ -655,6 +714,8 @@ class CallManager:
         )  # msg_id → answer-SDP future (outgoing)
         # chat_id → suppress the agent's post-dc_start_call line
         self._drop_call_ack: Counter = Counter()
+        self._dialing: set = set()  # chat_ids with an outgoing call being set up
+        self._speak_locks: Dict[str, asyncio.Lock] = {}  # one reply's TTS at a time
 
         # _sessions, _chat_to_msg, _pending_answers and the drop counters are
         # accessed from both the gateway loop (adapter.send(), tool handlers) and
@@ -774,7 +835,9 @@ class CallManager:
         # answer and load STT for them.
         if not await self._adapter._caller_allowed(from_id, chat_id):
             logger.info(
-                "Declining call %s from unauthorized contact %s", msg_id, caller_id
+                "Declining call %s: contact %s not authorized (or the check failed)",
+                msg_id,
+                caller_id,
             )
             with contextlib.suppress(Exception):
                 await self._adapter.rpc.end_call(self._adapter.account_id, msg_id)
@@ -782,7 +845,7 @@ class CallManager:
 
         # Start warming up Whisper NOW — before ICE gathering and SDP exchange
         # which take ~5-10 s, giving the model time to load into memory.
-        asyncio.ensure_future(self._warmup_stt())
+        _spawn(self._warmup_stt(), "STT warmup")
 
         try:
             await self._answer_call(msg_id, chat_id, sdp_offer, caller_id, caller_name)
@@ -840,14 +903,29 @@ class CallManager:
         """
         ice_json = await self._adapter.rpc.ice_servers(self._adapter.account_id)
         ice_servers = []
+        dropped_ipv6 = 0
         for s in json.loads(ice_json) or []:
             urls = s.get("urls", [])
             if isinstance(urls, str):
                 urls = [urls]
             ipv4_urls = [u for u in urls if "[" not in u]
+            dropped_ipv6 += len(urls) - len(ipv4_urls)
             if ipv4_urls:
                 ice_servers.append(RTCIceServer(**{**s, "urls": ipv4_urls}))
-        logger.info("Using %d ICE server(s)", len(ice_servers))
+        logger.info(
+            "Using %d ICE server(s), dropped %d IPv6 URL(s)",
+            len(ice_servers),
+            dropped_ipv6,
+        )
+        if not any(
+            u.startswith(("turn:", "turns:")) for srv in ice_servers for u in srv.urls
+        ):
+            # why ERROR: behind NAT (most VPS and containers) a call without a
+            # relay connects nowhere and is hung up about 30 s later.
+            logger.error(
+                "No usable TURN server among Delta Chat's ICE servers — calls from "
+                "behind NAT will not connect (aiortc cannot use IPv6-only TURN)"
+            )
         return RTCConfiguration(iceServers=ice_servers)
 
     @staticmethod
@@ -857,10 +935,21 @@ class CallManager:
         return " ".join(f"{t}:{n}" for t, n in c.items()) or "none"
 
     @classmethod
-    def _log_sdp(cls, label: str, sdp: str) -> None:
-        """Log an SDP's candidate and media summaries."""
-        logger.info("%s candidates: %s", label, cls._sdp_candidates(sdp))
+    def _log_sdp(cls, label: str, sdp: str, ours: bool = False) -> None:
+        """Log an SDP's candidate and media summaries.
+
+        For our own SDP (*ours*), no relay candidate is logged at ERROR: then
+        the call only connects if the peer can reach us directly.
+        """
+        candidates = cls._sdp_candidates(sdp)
+        logger.info("%s candidates: %s", label, candidates)
         logger.info("%s media: %s", label, cls._sdp_media(sdp))
+        if ours and "relay:" not in candidates:
+            logger.error(
+                "%s has no relay candidate — TURN allocation failed or there is no "
+                "TURN server; the call only connects if the peer can reach us directly",
+                label,
+            )
 
     @staticmethod
     def _sdp_media(sdp: str) -> str:
@@ -1017,8 +1106,9 @@ class CallManager:
         """Build the incoming-audio buffer wired to STT + barge-in for a call."""
         return IncomingAudioBuffer(
             hermes_home=self._get_hermes_home(),
-            on_utterance=lambda transcript, wav: asyncio.ensure_future(
-                self._on_utterance(msg_id, chat_id, transcript, caller_id, caller_name)
+            on_utterance=lambda transcript, wav: _spawn(
+                self._on_utterance(msg_id, chat_id, transcript, caller_id, caller_name),
+                "utterance to Hermes",
             ),
             on_speech_confirmed=lambda: self._handle_barge_in(msg_id),
         )
@@ -1071,7 +1161,36 @@ class CallManager:
         with self._state_lock:
             self._sessions[msg_id] = session
             self._chat_to_msg[chat_id] = msg_id
+
+        # why: a peer that vanishes (network lost, app killed) never sends
+        # CallEnded. aioice's consent checks expire after ~30 s and aiortc closes
+        # the pc itself ("closed"; "failed" if ICE never connected). Without this
+        # the session lingered forever, holding the chat's call routing, the
+        # model override and dc_end_call. Our own teardown pops the session
+        # before pc.close(), so _end_dead_call ignores the "closed" that causes.
+        @pc.on("connectionstatechange")
+        def _on_dead():
+            if pc.connectionState in ("failed", "closed"):
+                _spawn(self._end_dead_call(msg_id), "dead call hang-up")
+
+        # A pc that died before the hook was attached fires nothing more.
+        _on_dead()
         return session
+
+    async def _end_dead_call(self, msg_id: int) -> None:
+        with self._state_lock:
+            session = self._sessions.get(msg_id)
+        if session is None:
+            return
+        logger.info(
+            "Call %s: connection %s, hanging up", msg_id, session.pc.connectionState
+        )
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                self._adapter.rpc.end_call(self._adapter.account_id, msg_id),
+                timeout=5.0,
+            )
+        await self._teardown_session(msg_id)
 
     # ------------------------------------------------------------------ #
     # Internal — incoming call setup                                       #
@@ -1121,7 +1240,7 @@ class CallManager:
         if self._sessions.get(msg_id) is not session:
             logger.info("Call %s ended while it was being answered", msg_id)
             return
-        self._log_sdp("Our answer", pc.localDescription.sdp)
+        self._log_sdp("Our answer", pc.localDescription.sdp, ours=True)
 
         await self._adapter.rpc.accept_incoming_call(
             self._adapter.account_id,
@@ -1133,13 +1252,11 @@ class CallManager:
 
         # Diagnostic baseline: a working (incoming) call's RTP counters, to diff
         # against the silent outgoing call.
-        asyncio.ensure_future(self._log_media_stats(pc, msg_id, "incoming"))
+        _spawn(self._log_media_stats(pc, msg_id, "incoming"), "media stats")
 
         # Greet the caller — inject a system event so the AI generates the
         # first greeting based on conversation history.
-        asyncio.ensure_future(
-            self._play_greeting(msg_id, chat_id, caller_id, caller_name)
-        )
+        _spawn(self._play_greeting(msg_id, chat_id, caller_id, caller_name), "greeting")
 
     # ------------------------------------------------------------------ #
     # Internal — outgoing call setup                                       #
@@ -1180,6 +1297,19 @@ class CallManager:
         return []
 
     async def _start_call(self, chat_id: str, opening: str = "") -> int:
+        # why: a session is registered only after ICE gathering and
+        # place_outgoing_call, so two calls for one chat started together both
+        # got through, and the second took over the chat's routing. Runs on
+        # the single call loop, so the check and the add cannot interleave.
+        if chat_id in self._chat_to_msg or chat_id in self._dialing:
+            raise RuntimeError("already on a call in this chat")
+        self._dialing.add(chat_id)
+        try:
+            return await self._dial(chat_id, opening)
+        finally:
+            self._dialing.discard(chat_id)
+
+    async def _dial(self, chat_id: str, opening: str = "") -> int:
         """Place an outgoing voice call to *chat_id*; return the call msg_id.
 
         Blocks until the other party answers (or raises on timeout/decline).
@@ -1201,7 +1331,7 @@ class CallManager:
         # Our offer out (ICE gathered) → place the call to get the msg_id.
         await pc.setLocalDescription(await pc.createOffer())
         await self._gather_ice(pc)
-        self._log_sdp("Our offer", pc.localDescription.sdp)
+        self._log_sdp("Our offer", pc.localDescription.sdp, ours=True)
         try:
             msg_id = int(
                 await self._adapter.rpc.place_outgoing_call(
@@ -1243,7 +1373,7 @@ class CallManager:
             caller_id,
             caller_name,
         )
-        asyncio.ensure_future(self._warmup_stt())
+        _spawn(self._warmup_stt(), "STT warmup")
 
         # Pre-render the opening line in parallel with ringing — by pickup the
         # audio is ready, so there's zero post-pickup latency and no AI call.
@@ -1276,9 +1406,19 @@ class CallManager:
             raise
 
         self._log_sdp("Remote answer", sdp_answer)
-        await pc.setRemoteDescription(
-            RTCSessionDescription(type="answer", sdp=sdp_answer)
-        )
+        try:
+            await pc.setRemoteDescription(
+                RTCSessionDescription(type="answer", sdp=sdp_answer)
+            )
+        except Exception:
+            # why: the pc never leaves "new", so no state hook tears it down and
+            # the chat would stay "on a call" until the peer ends it.
+            if opening_task:
+                opening_task.cancel()
+            with contextlib.suppress(Exception):
+                await self._adapter.rpc.end_call(self._adapter.account_id, msg_id)
+            await self._teardown_session(msg_id)
+            raise
         with self._state_lock:
             live = self._sessions.get(msg_id)
         if live is not None:
@@ -1300,7 +1440,7 @@ class CallManager:
             pc.connectionState,
         )
 
-        asyncio.ensure_future(
+        _spawn(
             self._finalize_outgoing_call(
                 pc,
                 msg_id,
@@ -1311,7 +1451,8 @@ class CallManager:
                 audio_buf,
                 opening,
                 opening_task,
-            )
+            ),
+            "outgoing call setup",
         )
         return msg_id
 
@@ -1345,6 +1486,18 @@ class CallManager:
             msg_id,
             pc.connectionState,
         )
+        # why: if the pc died during the wait, _end_dead_call tore the call
+        # down, and the greeting fallback below would go out as a text message
+        # (adapter.send sees no active call).
+        with self._state_lock:
+            gone = msg_id not in self._sessions
+        if gone or pc.connectionState in ("failed", "closed"):
+            logger.info(
+                "Outgoing call %s ended before the opening, skipping it", msg_id
+            )
+            if opening_task:
+                opening_task.cancel()
+            return
 
         # Fallback: if on_track didn't fire, attach the remote audio track
         # from the negotiated transceiver.
@@ -1364,7 +1517,7 @@ class CallManager:
         )
 
         # Diagnostic: is RTP actually flowing each way? (connected != media)
-        asyncio.ensure_future(self._log_media_stats(pc, msg_id, "outgoing"))
+        _spawn(self._log_media_stats(pc, msg_id, "outgoing"), "media stats")
 
         # Connected. Play the pre-rendered opening immediately, or fall back to
         # an AI greeting if no opening was given (or its TTS failed).
@@ -1387,8 +1540,8 @@ class CallManager:
                 len(frames),
             )
         else:
-            asyncio.ensure_future(
-                self._play_greeting(msg_id, chat_id, caller_id, caller_name)
+            _spawn(
+                self._play_greeting(msg_id, chat_id, caller_id, caller_name), "greeting"
             )
 
     # ------------------------------------------------------------------ #
@@ -1514,33 +1667,42 @@ class CallManager:
     # ------------------------------------------------------------------ #
 
     async def _warmup_stt(self) -> None:
-        """Pre-load the Whisper model right after call acceptance.
+        """Pre-load the local Whisper model right after call acceptance.
 
         Without this, the first utterance waits ~10 s for model load before
-        transcription even starts. Running a silent dummy clip now means the
-        model is hot in memory by the time the caller finishes their first sentence.
-
-        Skipped entirely when cloud STT (Voxtral) is enabled — there's no local
-        model to warm, and loading whisper would waste CPU and time.
+        transcription even starts. Only for the local provider: with Voxtral or
+        any cloud provider there is no model to warm, and a silent clip would
+        just be a wasted request.
         """
         if _CALL_STT_VOXTRAL:
             return
         try:
-            from tools.transcription_tools import transcribe_audio
-
-            tmp_path = os.path.join(
-                self._get_hermes_home(), "audio_cache", "_warmup.wav"
-            )
-            with wave.open(tmp_path, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(_BYTES_PER_SAMPLE)
-                wf.setframerate(_STT_RATE)
-                wf.writeframes(b"\x00" * (_STT_BYTES_PER_SEC // 2))  # 0.5 s of silence
-            logger.info("Pre-warming Whisper medium model...")
-            await asyncio.to_thread(transcribe_audio, tmp_path, "medium")
-            logger.info("Whisper model ready")
+            # why a thread for all of it: Hermes' _get_provider can pip-install
+            # faster-whisper when it is missing — minutes on the call loop,
+            # which would stall ICE and RTP for every call.
+            await asyncio.to_thread(self._warmup_stt_sync, self._get_hermes_home())
         except Exception as e:
-            logger.debug("STT warmup failed (non-fatal): %s", e)
+            logger.warning("STT warmup failed (non-fatal): %s", e)
+
+    @staticmethod
+    def _warmup_stt_sync(hermes_home: str) -> None:
+        from tools import transcription_tools as tt
+
+        if tt._get_provider(tt._load_stt_config()) != "local":
+            return
+        # why mkdir: on incoming calls this runs before IncomingAudioBuffer
+        # creates the directory, so on a fresh HERMES_HOME it always failed.
+        cache = Path(hermes_home) / "audio_cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        tmp_path = str(cache / "_warmup.wav")
+        with wave.open(tmp_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(_BYTES_PER_SAMPLE)
+            wf.setframerate(_STT_RATE)
+            wf.writeframes(b"\x00" * (_STT_BYTES_PER_SEC // 2))  # 0.5 s of silence
+        logger.info("Pre-warming local Whisper model...")
+        tt.transcribe_audio(tmp_path)
+        logger.info("Whisper model ready")
 
     # ------------------------------------------------------------------ #
     # Per-call LLM model override (opt-in via DELTACHAT_CALL_MODEL)        #
@@ -1622,7 +1784,7 @@ class CallManager:
         try:
             from tools.voice_mode import is_whisper_hallucination
 
-            if is_whisper_hallucination(transcript):
+            if not _is_short_reply(transcript) and is_whisper_hallucination(transcript):
                 logger.debug("Discarding Whisper hallucination: %r", transcript[:60])
                 return
         except ImportError:
@@ -1682,6 +1844,12 @@ class CallManager:
         await self._to_hermes(event)
 
     async def _play_response(self, chat_id: str, text: str) -> None:
+        # why: one turn can speak twice (a line before a tool, then the answer);
+        # queued at once, their sentences would interleave in the one track.
+        async with self._speak_locks.setdefault(chat_id, asyncio.Lock()):
+            await self._speak_response(chat_id, text)
+
+    async def _speak_response(self, chat_id: str, text: str) -> None:
         """Called from adapter.send() when an active call intercepts a response.
 
         TTS is done sentence-by-sentence: the first chunk is synthesized and
@@ -1709,7 +1877,8 @@ class CallManager:
         session.interrupted = False
         session.hangup_cancelled = False
         session.is_responding = True
-        session.resp_start_frames = track.played_count
+        # The previous reply may still be queued; this one starts playing after it.
+        session.resp_start_frames = track.played_count + track.queued_count
         session.tts_checkpoints = []
 
         # Spoken-goodbye hangup: the marker rides in the reply text, so ending a
@@ -1874,7 +2043,21 @@ class CallManager:
                 session.caller_id,
                 session.caller_name,
             )
-            self._chat_to_msg.pop(chat_id, None)
+            # why: a redial can register a new call in this chat before the old
+            # one is torn down; don't take the new call's routing with us.
+            if self._chat_to_msg.get(chat_id) == msg_id:
+                self._chat_to_msg.pop(chat_id)
+            newer = self._sessions.get(self._chat_to_msg.get(chat_id))
+        if newer is not None and _call_thread_id(newer.msg_id) == _call_thread_id(
+            msg_id
+        ):
+            # why: in shared-history mode both calls share one gateway session,
+            # so clearing "our" override and noting "call ended" would hit the
+            # live redialled call. Hand the override over instead.
+            if newer.model_override_key is None:
+                newer.model_override_key = session.model_override_key
+            session.model_override_key = None
+            notify_ai = False
         self._clear_model_override(session)
         session.audio_buffer.stop()
         # pc.close() can hang if ICE is in a bad state — don't let it block shutdown
@@ -1885,9 +2068,22 @@ class CallManager:
         # why `answered`: a call that never went live (declined, unanswered,
         # hung up while ringing) had no "call started" turn to close.
         if notify_ai and session.answered:
-            asyncio.ensure_future(
-                self._note_call_ended(chat_id, caller_id, caller_name, msg_id)
+            _spawn(
+                self._note_call_ended(chat_id, caller_id, caller_name, msg_id),
+                "call-ended note",
             )
+
+    def _call_session_id(self, source) -> Optional[str]:
+        """Hermes session_id behind a call's session source, or None."""
+        gw = self._gateway()
+        try:
+            return (
+                gw.session_store.peek_session_id(gw._session_key_for_source(source))
+                or None
+            )
+        except Exception as e:
+            logger.debug("Could not resolve call session id: %s", e)
+            return None
 
     async def _note_call_ended(
         self, chat_id: str, caller_id: str, caller_name: str, msg_id: int
@@ -1924,13 +2120,28 @@ class CallManager:
             main_source = self._call_source(
                 chat_id, caller_id, caller_name, thread_id=None
             )
+            # Point at the call's session, so the text-chat AI can read what was
+            # said instead of telling the user it has no record of the call.
+            call_sid = self._call_session_id(source)
+            if call_sid:
+                text = (
+                    "[A voice call with the user has just ended (transcript: session "
+                    f'{call_sid}; read it with session_search(session_id="{call_sid}") '
+                    "if the user asks about the call). Do not call back right now.]"
+                )
+            else:
+                text = "[A voice call with the user has just ended. Do not call back right now.]"
             main_event = MessageEvent(
-                text="[A voice call with the user has just ended. Do not call back right now.]",
+                text=text,
                 message_type=MessageType.TEXT,
                 source=main_source,
                 message_id=f"{CALL_END_NOTE_PREFIX}main-{int(time.monotonic() * 1000)}",
             )
-            logger.info("Notifying main thread that call ended (chat=%s)", chat_id)
+            logger.info(
+                "Notifying main thread that call ended (chat=%s, call session=%s)",
+                chat_id,
+                call_sid,
+            )
             with contextlib.suppress(Exception):
                 await self._to_hermes(main_event)
 

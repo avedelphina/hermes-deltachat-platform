@@ -27,6 +27,8 @@ class MockMessageType(Enum):
     VOICE = "voice"
     STICKER = "sticker"
     GIF = "gif"
+    VIDEO = "video"
+    DOCUMENT = "document"
 
 
 @dataclass
@@ -222,6 +224,28 @@ class MockBasePlatformAdapter:
     def filter_local_delivery_paths(file_paths, session_key: str = ""):
         """Mock base local filter — pass through unchanged."""
         return list(file_paths or [])
+
+    async def send_clarify(
+        self, chat_id, question, choices, clarify_id, session_key, metadata=None
+    ):
+        """The real base's numbered-text clarify, minus the multi-select hint."""
+        if choices:
+            numbered = [f"  {i}. {choice}" for i, choice in enumerate(choices, start=1)]
+            text = "\n".join(
+                [
+                    f"❓ {question}",
+                    "",
+                    *numbered,
+                    "",
+                    "Reply with the number, the option text, or your own answer.",
+                ]
+            )
+            from tools.clarify_gateway import mark_awaiting_text
+
+            mark_awaiting_text(clarify_id)
+        else:
+            text = f"❓ {question}"
+        return await self.send(chat_id=chat_id, content=text, metadata=metadata)
 
 
 class MockGatewayBase:

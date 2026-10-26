@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from abc import ABC, abstractmethod
 from queue import Queue
 from threading import Event, Thread
@@ -96,20 +97,56 @@ class IOTransport:
         self.writer_thread = Thread(target=self._writer_loop)
         self.writer_thread.start()
 
-    def close(self) -> None:
-        """Terminate RPC server process and wait until the reader loop finishes."""
+    def close(self, timeout: float = 5.0, stop_io_timeout: float = 35.0) -> None:
+        """Stop the RPC server process and wait for the transport threads to finish.
+
+        Blocking: callers on an event loop must run it in a thread (the adapter
+        does). Every wait is bounded — a wedged server used to freeze the whole
+        gateway in the stop_io call or the reader join. stop_io gets
+        *stop_io_timeout*, above core's own 30 s IMAP/SMTP shutdown budget, so a
+        slow but healthy server is not killed mid-shutdown; each later step
+        gets *timeout*. A server that ignores stdin EOF is killed.
+        """
         if not hasattr(self, "process"):
             return  # start() was never called or failed before process was created
         self.closing = True
         try:
-            self.call("stop_io_for_all_accounts")
+            self._call("stop_io_for_all_accounts", (), timeout=stop_io_timeout)
         except Exception:
             pass
         assert self.process.stdin
-        self.process.stdin.close()
-        self.reader_thread.join()
         self.request_queue.put(None)
-        self.writer_thread.join()
+        # The writer only flushes what is queued; it can only stay blocked if
+        # the server stopped reading, and then the kill below breaks the pipe.
+        self.writer_thread.join(timeout)
+        if not self.writer_thread.is_alive():
+            try:
+                self.process.stdin.close()  # EOF asks the server to exit
+            except OSError:
+                # why: a writer that died on EPIPE leaves its data buffered, so
+                # close() re-flushes and raises BrokenPipeError; letting that
+                # escape skipped the kill below and left the server running.
+                pass
+        try:
+            self.process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            # why no SIGTERM step: rpc-server cancels the same token on stdin
+            # EOF and on SIGTERM, so after EOF a SIGTERM changes nothing.
+            self.logger.warning("deltachat-rpc-server did not exit within %ss, killing it", timeout)
+            self.process.kill()
+            try:
+                self.process.wait(timeout)
+            except subprocess.TimeoutExpired:
+                # SIGKILL cannot take effect in uninterruptible sleep (D state).
+                self.logger.error(
+                    "deltachat-rpc-server (pid %s) still alive %ss after SIGKILL", self.process.pid, timeout
+                )
+        self.writer_thread.join(timeout)
+        self.reader_thread.join(timeout)
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
 
     def __enter__(self):
         self.start()
@@ -165,17 +202,30 @@ class IOTransport:
                     # and with no reader every later call would hang.
                     self.logger.warning("Ignoring non-JSON line from RPC server: %r", line[:200])
                     continue
-                if "id" in response:
+                # why: valid JSON need not be an object; `in` on a number or a
+                # list would raise and kill the reader.
+                is_obj = isinstance(response, dict)
+                if is_obj and "id" in response:
                     # The caller may already have given up on a dead server
                     # (see call()); dropping its reply must not kill the reader.
                     pending = self.pending_results.pop(response["id"], None)
                     if pending is not None:
                         pending.set(response)
                 else:
-                    self.logger.warning("Got a response without ID: %s", response)
+                    # Not the whole response at WARNING: a result can carry
+                    # message text or addresses. The error object explains it.
+                    self.logger.warning(
+                        "Got a response without ID: %s",
+                        response.get("error", sorted(response)) if is_obj else type(response).__name__,
+                    )
+                    self.logger.debug("Response without ID: %s", response)
         except Exception:
             # Log an exception if the reader loop dies.
             self.logger.exception("Exception in the reader loop")
+            # why: no reply can be read any more, but a live process passes the
+            # adapter's exit-code probe. Retire it so the gateway reconnects.
+            if not self.closing:
+                self.process.kill()
         finally:
             self._fail_all_pending()
 
@@ -200,6 +250,15 @@ class IOTransport:
 
     def call(self, method: str, *args) -> Any:
         """Request the RPC server to call a function and return its return value if any."""
+        return self._call(method, args)
+
+    def _call(self, method: str, args: tuple, timeout: Optional[float] = None) -> Any:
+        """call() with an optional deadline; only close() sets one.
+
+        Ordinary calls stay unbounded on purpose: get_next_event long-polls,
+        and configuring a transport can legitimately take minutes. A dead
+        server is caught by the polling below instead.
+        """
         if self._server_dead():
             raise JsonRpcError(_DISCONNECTED_ERROR["error"])
 
@@ -220,7 +279,11 @@ class IOTransport:
         # call (network round-trip) keeps waiting as long as the server is
         # alive, but a server that dies mid-call surfaces as an error within a
         # slice instead of hanging this thread forever.
-        while not result.wait(timeout=1.0):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not result.wait(timeout=1.0 if deadline is None else min(1.0, max(0.0, deadline - time.monotonic()))):
+            if deadline is not None and time.monotonic() >= deadline:
+                self.pending_results.pop(request_id, None)
+                raise JsonRpcError({"code": -1, "message": f"RPC call {method} timed out after {timeout}s"})
             if self._server_dead():
                 # A reply the server wrote just before exiting can still be in
                 # the pipe; give the reader one more slice to deliver it (or to

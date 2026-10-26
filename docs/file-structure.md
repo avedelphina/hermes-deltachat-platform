@@ -19,11 +19,8 @@ Delta Chat plugin for Hermes Agent.
 └── skills/
     └── webxdc-converter/
         ├── SKILL.md              # Webxdc conversion skill
-        ├── references/
-        │   └── webxdc-api.md      # Webxdc API documentation
-        └── scripts/
-            ├── package_xdc.py      # XDC packaging script
-            └── generate_icon.py     # Icon generation script
+        └── references/
+            └── webxdc-api.md      # Webxdc API reference (checked against the spec)
 ```
 
 ## Hermes Profile Directory Structure
@@ -100,4 +97,4 @@ The default Hermes profile uses `~/.hermes/` directly:
 ### `skills/webxdc-converter/`
 - Bundled with the plugin
 - Provides Webxdc conversion capability
-- Accessible via: `skill_view("plugin:deltachat-platform:webxdc-converter")`
+- Accessible via: `skill_view("deltachat-platform:webxdc-converter")`

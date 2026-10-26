@@ -988,16 +988,27 @@ class TestCallerAllowed:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "verdict,expected", [(False, False), (True, True), (None, True)]
+        "verdict,expected", [(False, False), (True, True), (None, False)]
     )
-    async def test_hermes_verdict_only_declines_on_false(
+    async def test_only_an_explicit_yes_from_hermes_answers(
         self, platform_config, mock_rpc, verdict, expected
     ):
+        """None means Hermes' check raised or returned junk: unknown, not a yes."""
         adapter = self._adapter(
             platform_config, mock_rpc, {"address": "a@example.com", "is_verified": True}
         )
         adapter._is_sender_authorized = lambda *a: verdict
         assert await adapter._caller_allowed(7, "12") is expected
+
+    @pytest.mark.asyncio
+    async def test_older_core_without_the_check_uses_our_policy(
+        self, platform_config, mock_rpc
+    ):
+        adapter = self._adapter(
+            platform_config, mock_rpc, {"address": "a@example.com", "is_verified": True}
+        )
+        assert not hasattr(adapter, "_is_sender_authorized")  # the test mock's base
+        assert await adapter._caller_allowed(7, "12") is True
 
     @pytest.mark.asyncio
     async def test_unknown_caller_fails_closed(self, platform_config, mock_rpc):
@@ -1336,3 +1347,64 @@ class TestRateLimiterForgetsIdleSenders:
 
         limiter = adapter_mod._RateLimiter(max_calls=2, window_seconds=60)
         assert [limiter.is_allowed("a") for _ in range(3)] == [True, True, False]
+
+
+class TestQuoteReplies:
+    def _adapter(self, platform_config, mock_rpc):
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc, adapter.account_id = mock_rpc, 1
+        mock_rpc.get_message = AsyncMock(return_value={"from_id": 1})  # ours
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_our_message_quoted_from_another_chat_is_not_a_reply_to_us(
+        self, platform_config, mock_rpc
+    ):
+        """The quote names its message by a sender-settable Message-ID; it must
+        not open the mention gate in a chat the bot never wrote in."""
+        adapter = self._adapter(platform_config, mock_rpc)
+        quote = {"kind": "WithMessage", "message_id": 9, "chat_id": 77}
+        assert await adapter._quote_is_self_authored(quote, "12") is False
+        mock_rpc.get_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_our_message_quoted_in_the_same_chat_is_a_reply_to_us(
+        self, platform_config, mock_rpc
+    ):
+        adapter = self._adapter(platform_config, mock_rpc)
+        quote = {"kind": "WithMessage", "message_id": 9, "chat_id": 12}
+        assert await adapter._quote_is_self_authored(quote, "12") is True
+
+    @pytest.mark.asyncio
+    async def test_media_reply_carries_the_quoted_message(
+        self, platform_config, mock_rpc, tmp_path
+    ):
+        """Text replies had the quote; photo/file/voice replies did not."""
+        blob = tmp_path / "p.png"
+        blob.write_bytes(b"png")
+        adapter = self._adapter(platform_config, mock_rpc)
+        adapter.handle_message = AsyncMock()
+        adapter._copy_to_hermes_cache = lambda src, kind: src
+        mock_rpc.get_message = AsyncMock(return_value={"from_id": 30})
+        mock_rpc.get_contact = AsyncMock(return_value={"name": "Ann"})
+        mock_rpc.get_basic_chat_info = AsyncMock(return_value={"chat_type": "Single"})
+        mock_rpc.get_config = AsyncMock(return_value="tok")
+        msg = {
+            "text": "",
+            "view_type": "Image",
+            "file": str(blob),
+            "file_mime": "image/png",
+            "from_id": 11,
+            "quote": {
+                "kind": "WithMessage",
+                "message_id": 9,
+                "chat_id": 12,
+                "text": "which one is it?",
+                "author_display_name": "Bob",
+            },
+        }
+        await adapter._handle_non_text_message(msg, "12", "10")
+        text = adapter.handle_message.await_args.args[0].text
+        assert text.startswith(
+            '[replying to Bob: "which one is it?"]\n[Image from Ann]'
+        )

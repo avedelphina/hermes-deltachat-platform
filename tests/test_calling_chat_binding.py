@@ -45,6 +45,7 @@ def connected(monkeypatch):
     fake._call_manager.start_call = AsyncMock(return_value=77)
     fake._call_manager.request_hangup = AsyncMock(return_value=True)
     fake._call_manager.active_chat_ids.return_value = ["9", "42"]
+    fake._call_manager.has_active_call.return_value = False
     monkeypatch.setattr(adapter, "_active_adapter", fake)
     monkeypatch.setattr(adapter, "_spec_cache", SPEC)
     monkeypatch.setattr(
@@ -183,3 +184,41 @@ class TestSharedAcrossEventLoops:
 
         shared = [n for n, v in vars(adapter).items() if isinstance(v, asyncio.Lock)]
         assert shared == []
+
+
+class TestCallMe:
+    """ "Call me" works without the agent copying a token over."""
+
+    @pytest.mark.asyncio
+    async def test_no_token_calls_the_chat_you_are_talking_in(
+        self, handlers, connected, session
+    ):
+        session("deltachat-platform", "42")
+        result = json.loads(await handlers["dc_start_call"]({"opening": "Hi"}))
+        assert result["success"] is True
+        connected._call_manager.start_call.assert_awaited_once_with("42", opening="Hi")
+
+    @pytest.mark.asyncio
+    async def test_no_token_and_no_chat_behind_the_turn_errors(
+        self, handlers, connected, session
+    ):
+        session("", "")  # e.g. a cron job: it must pass the token
+        result = json.loads(await handlers["dc_start_call"]({"opening": "Hi"}))
+        assert "No Delta Chat chat behind this turn" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_chat_already_on_a_call_is_not_dialled_again(
+        self, handlers, connected, session
+    ):
+        """'Can we talk about X' on a call used to dial the same chat again."""
+        session("deltachat-platform", "42")
+        connected._call_manager.has_active_call.return_value = True
+        result = json.loads(await handlers["dc_start_call"]({"opening": "Hi"}))
+        assert "Already on a call" in result["error"]
+        connected._call_manager.start_call.assert_not_awaited()
+
+
+def test_hermes_does_not_stream_into_delta_chat():
+    """Hermes treats a missing flag as True and streams with a cursor it
+    then cannot remove: this adapter never edits messages."""
+    assert adapter.DeltaChatAdapter.SUPPORTS_MESSAGE_EDITING is False
