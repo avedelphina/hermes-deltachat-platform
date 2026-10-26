@@ -5,8 +5,10 @@ outgoing** ones, holding a spoken conversation either way: audio →
 speech-to-text → Hermes AI → text-to-speech → spoken reply, all over the live
 WebRTC call.
 
-Requires `aiortc` (see [nixos-installation.md](nixos-installation.md) for the
-NixOS setup). Incoming calls are auto-answered when the caller passes the same
+Requires `aiortc`, `av` and `numpy` (see
+[nixos-installation.md](nixos-installation.md) for the NixOS setup). Without
+them calls are disabled with an ERROR in `gateway.log`; text messaging keeps
+working. Incoming calls are auto-answered when the caller passes the same
 sender rules as a direct message (`allowed_users`, `dm_policy`, Hermes'
 authorization); other calls are declined. Hang up from your Delta Chat client, or
 say goodbye: the bot ends its goodbye with a `[[hangup]]` marker (stripped before
@@ -15,7 +17,18 @@ speech) and the call ends once the goodbye has played. If you set a custom
 
 Each call runs in its own session (`call-<msg_id>`), so earlier calls do not
 pile up in the context. Only the final reply of a turn is spoken; status
-messages are not.
+messages are not. When a call ends, the text chat gets a note naming the call's
+session, so the agent can read the transcript if asked.
+
+Ask in a chat "call me" and the agent rings that chat (`dc_start_call` without
+a `chat_token`). To call later, it schedules a cron job whose prompt includes
+the chat token. It never starts a second call into a chat that is already on
+one. A peer that vanishes without hanging up (lost network, app killed) is hung
+up after about 30 s.
+
+Calls transcribe with the STT provider and model configured in the `stt`
+section of `config.yaml`, like voice messages. For local Whisper that is
+`stt.local.model`; set it to `medium` to keep the size calls used to force.
 
 ## Outgoing calls (the bot calls you)
 
@@ -101,7 +114,7 @@ All optional. Set in `~/.hermes/.env`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `DELTACHAT_CALL_STT_VOXTRAL` | off | When `true`, route call audio to **Mistral Voxtral** cloud STT (~1-2s, accurate). Requires `MISTRAL_API_KEY`. **Strongly recommended** — local Whisper `medium` on CPU is ~15-30x slower than realtime (≈30s for a 2s clip), unusable for live calls. When off, the locally configured STT provider is used. |
+| `DELTACHAT_CALL_STT_VOXTRAL` | off | When `true`, route call audio to **Mistral Voxtral** cloud STT (~1-2s, accurate). Requires `MISTRAL_API_KEY`. **Strongly recommended** — local Whisper `medium` on CPU is ~15-30x slower than realtime (≈30s for a 2s clip), unusable for live calls. When off, the configured `stt` provider and model are used. With Voxtral on, the model is `stt.mistral.model` or Hermes' default. |
 
 ```bash
 DELTACHAT_CALL_STT_VOXTRAL=true

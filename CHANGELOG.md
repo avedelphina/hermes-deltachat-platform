@@ -2,6 +2,88 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.12.0] - 2026-10-26
+
+Ports from upstream 2.1.0 (Simon-Laux/hermes-deltachat-platform).
+
+### Upgrade notes: what can change on a working install
+
+- **NixOS with voice calls: rebuild `~/.hermes/aiortc-env`.** It now needs
+  `numpy`, and its Python must match Hermes's: 3.14 since Hermes 0.21.6, 3.12
+  for 0.21.5. With the old env calls stay disabled and `gateway.log` shows
+  `Voice calls disabled: ...`; text messaging keeps working. See
+  [docs/nixos-installation.md](docs/nixos-installation.md).
+- **Calls use your configured STT provider and model** (the `stt` section of
+  `config.yaml`), like voice messages. They used to force Whisper `medium`,
+  which made every cloud provider fail with `Invalid model: medium`. To keep
+  `medium` for local Whisper, set `stt.local.model: medium`.
+- **Replies arrive as one message.** Hermes no longer streams into Delta Chat:
+  it used to send a first message with a `▉` cursor that this adapter could
+  never edit away.
+- **A bare `.xdc` path in a reply is only sent if the file exists on the
+  host.** A path mentioned in prose stays text. In the Docker sandbox the agent
+  must send apps with a `MEDIA:` tag; a bare `/workspace/…` mention is no longer
+  sent (it was re-sent on every later reply that mentioned it).
+- **Incoming calls need Hermes' explicit yes.** When Hermes' authorization
+  check fails or returns no verdict, the call is now declined instead of
+  answered.
+- **The webxdc skill is registered as `deltachat-platform:webxdc-converter`**
+  (the agent was told a name with a `plugin:` prefix that never resolved), and
+  its unused `scripts/` were removed.
+
+### New
+- **"Call me" works.** `dc_start_call` without a `chat_token` rings the chat
+  the request came from, and the agent is told it can phone the user. It
+  refuses a chat that is already on a call or still dialling one.
+- **Answer with reactions:** 👍 approves and 👎 cancels slash-command
+  confirmations (`/reset`, `/new`, …), and 1️⃣–9️⃣ picks an option when the
+  agent asks a multiple-choice question. Same authorization as approval
+  reactions.
+- **Quote-replies with a photo, file or voice message** carry the quoted
+  message to the agent, as text replies already did.
+- **The text chat can look up what was said on a call:** the "call ended"
+  note names the call's session.
+- **Videos arrive as videos** (Hermes `MessageType.VIDEO`), not documents.
+- **Hermes' inbound size cap (`gateway.max_inbound_media_bytes`) applies to
+  every attachment.** An oversized one reaches the agent as a note.
+- **The bundled webxdc skill was reworked** (upstream): one script packages and
+  checks the `.xdc`, the API reference matches the spec, and the skill lists
+  Delta Chat's limits and pitfalls.
+- **CI**: GitHub Actions run the test suite (Python 3.12 and 3.14), `black`
+  and `flake8` on every push and pull request.
+
+### Fixed
+- Calls whose peer vanished (network lost, app killed) are hung up after about
+  30 s instead of staying "active" forever.
+- An outgoing call that died while connecting no longer sends its greeting as
+  a text message; a bad answer SDP ends the call instead of leaving the chat
+  "on a call".
+- Two replies in one turn (a line before a tool, then the answer) are spoken
+  one after the other instead of interleaved.
+- "OK", "Thanks" and "Bye" spoken on a call are no longer dropped as Whisper
+  hallucinations.
+- The first call on a fresh install gets its Whisper warm-up; the warm-up runs
+  off the call loop and only for local STT.
+- STT failures, a missing TURN server and crashes of call background tasks are
+  logged at ERROR instead of leaving a silent, deaf call.
+- A missing `aiortc`, `av` or `numpy` disables calls only; it used to make
+  connect() fail and take text messaging down.
+- Redialling a chat no longer loses the new call's routing or (in
+  shared-history mode) its `DELTACHAT_CALL_MODEL` when the old call is torn
+  down.
+- A hung `deltachat-rpc-server` no longer freezes the gateway: the transport
+  closes in a worker thread with bounded waits (35 s for core's own shutdown,
+  then a kill), and connect() waits for a previous server to exit. A reader
+  that dies retires the server so the gateway reconnects; a JSON line that is
+  not an object no longer kills the reader. No more fixed 1 s startup sleep.
+- Each attachment is sent once, however many times and spellings a reply
+  names it; removing a path from the reply no longer removes the same path in
+  a code sample.
+- A quote of the bot's message from another chat no longer counts as a reply
+  to the bot (it opened the mention gate).
+- Message content stays out of INFO logs: captions, transcripts and cached
+  file names are logged at DEBUG only.
+
 ## [1.11.2] - 2026-10-26
 
 ### Fixed

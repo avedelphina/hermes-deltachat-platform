@@ -197,9 +197,21 @@ file /path/to/your/file.xdc
 
 See [voice-calls.md](voice-calls.md) for setup. Voice calls need `aiortc`.
 
-**Symptom:** the bot declines an incoming call. Log: `Declining call N from unauthorized contact M`.
+**Symptom:** the bot declines an incoming call. Log: `Declining call N: contact M not authorized (or the check failed)`.
 
-**Cause:** since v1.11.0 a call is only answered when the caller may also message the bot: `allowed_users`, `dm_policy` and Hermes' own authorization all apply.
+**Cause:** a call is only answered when the caller may also message the bot: `allowed_users`, `dm_policy` and Hermes' own authorization all apply. Hermes must say yes; a check that fails or gives no verdict declines the call.
+
+**Symptom:** calls are never answered and the log shows `Voice calls disabled: ...`.
+
+**Cause:** `aiortc`, `av` or `numpy` cannot be imported. On NixOS, rebuild `~/.hermes/aiortc-env` with `numpy` and for Hermes's Python ([nixos-installation.md](nixos-installation.md)).
+
+**Symptom:** a call connects but the bot never answers; the log shows `STT failed after ...`.
+
+**Cause:** the configured STT provider failed (no provider, a failed model download, a wrong model name). The error text is in the log line.
+
+**Symptom:** calls drop after about 30 s; the log shows `No usable TURN server` or `has no relay candidate`.
+
+**Cause:** behind NAT a call needs a TURN relay. aiortc cannot use IPv6-only TURN servers.
 
 **Symptom:** the log shows `DELTACHAT_CALL_MODEL=... is set but the gateway runner is not reachable`.
 

@@ -1,3 +1,5 @@
+import pytest
+
 """Tests for workspace/agent path handling in the Delta Chat adapter.
 
 Covers the container->host mapping (with traversal containment) and the
@@ -56,32 +58,100 @@ class TestContainerWorkspaceToHost:
 
 
 class TestExtractLocalFiles:
-    """Generalized bare-.xdc extractor: Docker /workspace/ and non-Docker cwd paths."""
+    """Bare .xdc paths: taken only when the file exists on the host (upstream 2.1.0)."""
 
-    def test_extracts_bare_absolute_non_workspace_xdc(self, platform_config):
+    def test_extracts_an_existing_absolute_xdc(self, platform_config, tmp_path):
+        app = tmp_path / "app.xdc"
+        app.write_bytes(b"zip")
         adapter = _make_adapter(platform_config)
-        content = "Here is your app at /home/user/proj/app.xdc for you."
 
-        files, _remaining = adapter.extract_local_files(content)
+        files, remaining = adapter.extract_local_files(
+            f"Here is your app at {app} for you."
+        )
 
-        assert "/home/user/proj/app.xdc" in files
+        assert files == [str(app)]
+        assert str(app) not in remaining
 
-    def test_extracts_bare_home_relative_xdc(self, platform_config):
+    def test_home_relative_path_is_expanded(
+        self, platform_config, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / "app.xdc").write_bytes(b"zip")
         adapter = _make_adapter(platform_config)
-        content = "Built it: ~/projects/app.xdc done."
 
-        files, _remaining = adapter.extract_local_files(content)
+        files, _ = adapter.extract_local_files("Built it: ~/app.xdc done.")
 
-        assert "~/projects/app.xdc" in files
+        assert files == [str(tmp_path / "app.xdc")]
 
-    def test_still_extracts_workspace_xdc(self, platform_config):
-        """Regression: Docker /workspace/ paths must still be picked up."""
+    @pytest.mark.parametrize(
+        "path", ["/home/user/proj/missing.xdc", "/workspace/app.xdc"]
+    )
+    def test_path_that_is_not_on_the_host_stays_text(self, platform_config, path):
+        """A path only mentioned in prose used to be cut out and pushed as an
+        attachment; a bare /workspace/ one was re-sent on every later mention.
+        The agent sends sandbox files with a MEDIA: tag."""
         adapter = _make_adapter(platform_config)
-        content = "Built it: /workspace/app.xdc done."
 
-        files, _remaining = adapter.extract_local_files(content)
+        files, remaining = adapter.extract_local_files(f"See {path} for details.")
 
-        assert "/workspace/app.xdc" in files
+        assert files == []
+        assert path in remaining
+
+    def test_only_the_extracted_occurrence_is_removed(
+        self, platform_config, tmp_path, monkeypatch
+    ):
+        """str.replace() also stripped the same path inside a code sample."""
+        import adapter as adapter_mod
+
+        app = tmp_path / "app.xdc"
+        app.write_bytes(b"zip")
+        text = f"Sent {app}.\n```\ncp build {app}\n```"
+        # stand-in for Hermes' masker: blank out the fenced block
+        start = text.index("```")
+        # the base class adapter.py really uses (conftest may be imported twice)
+        monkeypatch.setattr(
+            adapter_mod.BasePlatformAdapter,
+            "_mask_protected_spans",
+            staticmethod(lambda t: t[:start] + " " * (len(t) - start)),
+            raising=False,
+        )
+        adapter = _make_adapter(platform_config)
+
+        files, remaining = adapter.extract_local_files(text)
+
+        assert files == [str(app)]
+        assert f"cp build {app}" in remaining
+
+
+class TestDeliverEachFileOnce:
+    @pytest.mark.asyncio
+    async def test_media_tag_and_bare_mention_send_one_file(
+        self, platform_config, tmp_path
+    ):
+        from unittest.mock import AsyncMock, patch
+
+        app = tmp_path / "app.xdc"
+        app.write_bytes(b"zip")
+        adapter = _make_adapter(platform_config)
+        base = AsyncMock()
+        import adapter as adapter_mod
+
+        with patch.object(
+            adapter_mod.BasePlatformAdapter,
+            "_deliver_media_attachments",
+            base,
+            create=True,
+        ):
+            await adapter._deliver_media_attachments(
+                "evt",
+                [(str(app), False)],
+                [str(app), str(tmp_path / "." / "app.xdc")],
+                metadata={},
+            )
+        kwargs = base.await_args.kwargs
+        assert kwargs["media_files"] == [(str(app), False)]
+        assert kwargs["local_files"] == []
+        assert kwargs["metadata"] == {}
 
 
 class TestExtractMedia:
@@ -218,3 +288,37 @@ class TestNoHardcodedWorkspace:
                 in_code = not in_code
             elif in_code and "MEDIA:" not in line:
                 assert "/workspace/" not in line, line
+
+
+class TestWebxdcSkillRegistration:
+    def test_skill_is_registered_with_its_description(self, monkeypatch):
+        """Hermes lists plugin skills with the description given here; it does
+        not read SKILL.md's frontmatter for them."""
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        import adapter
+
+        utils = types.ModuleType("agent.skill_utils")
+        utils.parse_frontmatter = lambda text: (
+            {"description": "Webxdc for Delta Chat"},
+            text,
+        )
+        monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
+        monkeypatch.setitem(sys.modules, "agent.skill_utils", utils)
+        ctx = MagicMock()
+        adapter.register_platform(ctx)
+        _, kwargs = ctx.register_skill.call_args
+        assert kwargs["description"] == "Webxdc for Delta Chat"
+
+    def test_platform_hint_uses_the_name_hermes_registers(self):
+        from unittest.mock import MagicMock
+
+        import adapter
+
+        ctx = MagicMock()
+        adapter.register_platform(ctx)
+        hint = ctx.register_platform.call_args.kwargs["platform_hint"]
+        assert "skill_view('deltachat-platform:webxdc-converter')" in hint
+        assert "plugin:deltachat-platform" not in hint

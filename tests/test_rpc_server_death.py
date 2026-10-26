@@ -115,13 +115,64 @@ class TestCleanupReportsStatus:
         assert adapter._disconnected is False
 
     def test_cleanup_closes_the_transport(self, adapter):
+        """Off the gateway loop: _cleanup() returns the close's future."""
         transport = MagicMock()
         adapter._transport = transport
-        adapter._cleanup()
+        closing = adapter._cleanup()
 
-        transport.close.assert_called_once()
-        assert adapter._transport is None
+        assert adapter._transport is None  # state is reset before the close runs
         assert adapter.rpc is None
+        closing.result(timeout=5)
+        transport.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_slow_close_does_not_block_the_event_loop(self, adapter):
+        """close() can take ~30 s (core's stop_io); the gateway loop must keep running."""
+        import threading
+
+        release = threading.Event()
+        transport = MagicMock()
+        transport.close.side_effect = lambda: release.wait(5)
+        adapter._transport = transport
+        closing = adapter._cleanup()  # returns at once
+        await asyncio.sleep(0.05)  # the loop is free while close() blocks
+        assert not closing.done()
+        release.set()
+        closing.result(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_connect_waits_for_the_previous_close(self, adapter, monkeypatch):
+        """The old server holds accounts.lock until it exits."""
+        import concurrent.futures
+
+        import adapter as adapter_mod
+
+        pending = concurrent.futures.Future()
+        monkeypatch.setattr(adapter_mod, "_last_transport_close", pending)
+        monkeypatch.setattr(adapter_mod, "_check_dc2_available", lambda: True)
+        started = []
+
+        class FakeTransport:
+            def __init__(self, **kw):
+                started.append(pending.done())
+
+            def start(self):
+                raise RuntimeError("stop here")
+
+            def close(self):
+                pass
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "deltachat2.transport",
+            type("m", (), {"IOTransport": FakeTransport}),
+        )
+        task = asyncio.ensure_future(adapter.connect())
+        await asyncio.sleep(0.05)
+        assert started == []  # still waiting for the old server
+        pending.set_result(None)
+        await task
+        assert started == [True]
 
 
 class TestDisconnectIsResilient:
