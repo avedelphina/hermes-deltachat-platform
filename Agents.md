@@ -8,6 +8,15 @@ This is a [Hermes Agent](https://github.com/NousResearch/hermes-agent) platform 
 
 The project is a pure-Python plugin (no compiled extensions of its own). It is loaded by Hermes at runtime from `~/.hermes/plugins/deltachat-platform/` and communicates with the Delta Chat core through the `deltachat-rpc-server` binary via line-delimited JSON-RPC.
 
+### Relationship to the original project
+
+This repository (`avedelphina/hermes-deltachat-platform`) is an independent continuation of [Simon-Laux/hermes-deltachat-platform](https://github.com/Simon-Laux/hermes-deltachat-platform). It was detached from that fork network on 2026-10-26; the histories diverged long before (a trial merge conflicts in most files), so upstream work is **ported by hand**, never merged:
+
+- The `upstream` git remote points at Simon-Laux. At each upstream release, review `git log <last ported tag>..upstream/main`, port what fits, and say in `CHANGELOG.md` which upstream version an entry comes from (v1.11.0 ← 2.0.0, v1.12.0 ← 2.1.0).
+- Upstream's design differs on purpose in places (it relies on Hermes pairing instead of `dm_policy`; it caps `deltachat-rpc-server` below 2.61; it has opt-in message editing, which this project keeps off — see the 1.12.0 notes). Check those before porting a change that touches them.
+- `gh` resolves the `upstream` remote first unless a default is set: this checkout has `gh repo set-default avedelphina/hermes-deltachat-platform`. Still pass `-R avedelphina/hermes-deltachat-platform` to `gh pr` / `gh release` in scripts.
+- Both projects ship as the `deltachat-platform` plugin, so they are drop-in alternatives; version numbers are separate (this one 1.x, upstream 2.x).
+
 ## Technology Stack
 
 - **Language**: Python 3 (targeted for the Hermes environment, commonly Python 3.12)
