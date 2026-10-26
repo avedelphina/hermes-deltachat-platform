@@ -1509,14 +1509,18 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self._bump_stat("messages_rejected")
         return False
 
-    def _check_loop_guard(self, chat_id, from_id) -> tuple[bool, bool]:
+    def _check_loop_guard(
+        self, chat_id, from_id, is_human: bool = False
+    ) -> tuple[bool, bool]:
         """Cap consecutive auto-replies to the same sender in one chat.
 
         Two (or more) agents in a shared group can end up replying to each
         other forever. If the same from_id sends more than
         DELTACHAT_MAX_CONSECUTIVE_REPLIES messages in a row in a chat with no
         other participant chiming in between, stop processing further
-        messages from them until someone else speaks.
+        messages from them until someone else speaks. A human sender (same
+        rule as _check_bot_exchange_guard) never counts, but still ends
+        another sender's streak.
 
         Returns (should_process, should_warn) — should_warn is True only the
         first time a given streak trips, so we don't send a notice per message.
@@ -1526,6 +1530,12 @@ class DeltaChatAdapter(BasePlatformAdapter):
         key = str(chat_id)
         sender = str(from_id)
         with self._lock:
+            # why: one human working through a long back-and-forth with the bot
+            # in a busy group is a conversation, not a loop — tripping it there
+            # silenced a support chat mid-session.
+            if is_human:
+                self._reply_streak.pop(key, None)
+                return True, False
             last_sender, count, warned = self._reply_streak.get(key, (None, 0, False))
             if last_sender == sender:
                 count += 1
@@ -3325,7 +3335,8 @@ class DeltaChatAdapter(BasePlatformAdapter):
         self, chat_id, from_id, sender_email: str, is_bot: Optional[bool] = None
     ) -> bool:
         """Run the loop and bot-exchange guards. Return True to keep processing."""
-        should_process, should_warn = self._check_loop_guard(chat_id, from_id)
+        is_human = sender_email in self._human_users or is_bot is False
+        should_process, should_warn = self._check_loop_guard(chat_id, from_id, is_human)
         if not should_process:
             return await self._guard_tripped(
                 chat_id,

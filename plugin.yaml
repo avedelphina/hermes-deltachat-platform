@@ -1,7 +1,7 @@
 name: deltachat-platform
 label: Delta Chat
 kind: platform
-version: 1.11.1
+version: 1.11.2
 description: Delta Chat messaging platform adapter for Hermes Agent. Supports text, webxdc mini apps, voice messages, images, and videos.
 author: Simon Laux
 requires_env:
@@ -101,11 +101,11 @@ optional_env:
     prompt: "Rate limit window"
     password: false
   - name: DELTACHAT_MAX_CONSECUTIVE_REPLIES
-    description: "Stop auto-replying to the same sender in a chat after this many messages in a row with no one else chiming in — guards against bot-to-bot loops (default: 20, <=0 disables)"
+    description: "Stop auto-replying to the same sender in a chat after this many messages in a row with no one else chiming in — guards against bot-to-bot loops. Human senders (not is_bot, or in DELTACHAT_HUMAN_USERS) never count (default: 20, <=0 disables)"
     prompt: "Max consecutive replies to same sender"
     password: false
   - name: DELTACHAT_HUMAN_USERS
-    description: "Comma-separated addresses always treated as human check-ins for the bot-exchange guard (see DELTACHAT_MAX_BOT_EXCHANGES). Optional: any contact not flagged is_bot already counts as human"
+    description: "Comma-separated addresses always treated as human for both bot guards (see DELTACHAT_MAX_BOT_EXCHANGES, DELTACHAT_MAX_CONSECUTIVE_REPLIES). Optional: any contact not flagged is_bot already counts as human"
     prompt: "Extra human addresses for bot-exchange guard (optional)"
     password: false
   - name: DELTACHAT_MAX_BOT_EXCHANGES

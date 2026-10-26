@@ -1718,6 +1718,43 @@ class TestLoopGuardChatScope:
         await self._send_n_messages(adapter, chat_id=13, n=10)
 
         assert adapter.handle_message.await_count == 10
+
+    @pytest.mark.asyncio
+    async def test_loop_guard_ignores_human_but_human_breaks_bot_streak(
+        self, platform_config, mock_rpc
+    ):
+        """A human (is_bot False) on a long run with the bot in a busy group
+        must not trip, and their message must still reset a bot's streak.
+        Regression: OCEAN Support paused after 20 messages from one human."""
+        platform_config.extra = {"max_consecutive_replies": 2}
+        adapter = DeltaChatAdapter(platform_config)
+        adapter.rpc = mock_rpc
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock()
+        # 11 = human, 12 = bot. Without the reset, bot 12's third message trips.
+        senders = iter([11] * 5 + [12] * 2 + [11] + [12] * 2)
+        mock_rpc.get_message = AsyncMock(
+            side_effect=lambda *_: {
+                "text": "hello there",
+                "view_type": "Text",
+                "from_id": next(senders),
+                "file": None,
+            }
+        )
+        mock_rpc.get_basic_chat_info = AsyncMock(
+            return_value={"chat_type": "Group", "name": "OCEAN Support"}
+        )
+        mock_rpc.get_contact = AsyncMock(
+            side_effect=lambda _acc, cid: {
+                "address": f"u{cid}@x.org",
+                "is_bot": cid == 12,
+            }
+        )
+        mock_rpc.get_chat_contacts = AsyncMock(return_value=[1, 11, 12])
+
+        await self._send_n_messages(adapter, chat_id=15, n=10)
+
+        assert adapter.handle_message.await_count == 10
         adapter.send.assert_not_called()
 
 

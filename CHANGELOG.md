@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.11.2] - 2026-10-26
+
+### Fixed
+
+- **A human's long conversation with the bot in a group paused replies.**
+  The bot-loop guard (`DELTACHAT_MAX_CONSECUTIVE_REPLIES`, default 20)
+  counted every run of messages from one sender, so one person who sent 20
+  messages in a row to the bot in a multi-member group got "Pausing
+  replies in this chat — 20 in a row from the same sender". The gateway
+  log showed `loop_guard tripped in chat <id>: sender <id> hit
+  max_consecutive_replies=20`. Now a human sender never counts toward a
+  run. A message from a human still ends the run of another sender. The
+  rule for "human" is the same as for the bot-exchange guard: a contact
+  that is not flagged `is_bot`, or an address in `DELTACHAT_HUMAN_USERS`.
+
 ## [1.11.1] - 2026-10-23
 
 ### Fixed
