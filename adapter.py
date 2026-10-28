@@ -2211,7 +2211,13 @@ class DeltaChatAdapter(BasePlatformAdapter):
             # why: a missing aiortc/av/numpy used to fail connect() and take
             # text messaging down with it; only calls need them.
             try:
-                from call_handler import CallManager
+                # The gateway loads this adapter as a package; use the package
+                # import so call_handler sees the same runtime namespace.
+                if __package__:
+                    from .call_handler import CallManager
+                else:
+                    # Keep compatibility with older standalone plugin loading.
+                    from call_handler import CallManager
             except ImportError as e:
                 logger.error(
                     "Voice calls disabled: %s (install aiortc, av and numpy)", e
