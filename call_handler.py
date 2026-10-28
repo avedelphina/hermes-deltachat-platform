@@ -24,6 +24,19 @@ import re as _re
 from collections import Counter
 from dataclasses import dataclass, field
 
+# The gateway plugin loader can remove PYTHONPATH and the interpreter's own
+# site-packages from sys.path. Restore only paths owned by this interpreter so
+# bundled WebRTC wheels remain importable without accepting arbitrary paths.
+try:
+    import site as _site_module
+
+    _runtime_sites = list(_site_module.getsitepackages())
+except Exception:
+    _runtime_sites = []
+for _site in _runtime_sites:
+    if os.path.isdir(_site) and _site not in sys.path:
+        sys.path.insert(0, _site)
+
 # On NixOS the gateway process does not inherit PYTHONPATH from ~/.hermes/.env
 # (that only applies to agent subprocesses).  If the user created the aiortc
 # GC-root symlink at ~/.hermes/aiortc-env (see docs/nixos-installation.md),
